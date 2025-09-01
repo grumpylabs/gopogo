@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"time"
 
 	"github.com/grumpylabs/gopogo/internal/cache"
 	"github.com/grumpylabs/gopogo/internal/server"
@@ -37,6 +38,8 @@ func init() {
 	rootCmd.PersistentFlags().Int("shards", 16, "Number of cache shards")
 	rootCmd.PersistentFlags().String("maxmemory", "0", "Maximum memory (e.g., 1GB, 512MB)")
 	rootCmd.PersistentFlags().String("evict", "2random", "Eviction policy (noevict, 2random, lru)")
+	rootCmd.PersistentFlags().Bool("autosweep", true, "Enable automatic background sweeping of evicted entries")
+	rootCmd.PersistentFlags().Duration("sweepinterval", 10*time.Second, "Interval for automatic background sweeping")
 
 	rootCmd.PersistentFlags().Int("tlsport", 0, "TLS listening port")
 	rootCmd.PersistentFlags().String("tlscert", "", "TLS certificate file")
@@ -102,7 +105,9 @@ func runServer(cmd *cobra.Command, args []string) {
 		Redis:    viper.GetBool("redis"),
 		Quiet:    viper.GetBool("quiet"),
 		Verbose:  viper.GetBool("verbose"),
-		Cache:    c,
+		Cache:        c,
+		AutoSweep:    viper.GetBool("autosweep"),
+		SweepInterval: viper.GetDuration("sweepinterval"),
 	})
 
 	if !viper.GetBool("quiet") {

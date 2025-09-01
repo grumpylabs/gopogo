@@ -138,11 +138,24 @@ func (m *Map) randomEntries(n int) []*Entry {
 	}
 	
 	entries := make([]*Entry, 0, n)
+	
+	// Simple case: return all entries if we have fewer items than requested
+	if n >= m.numItems {
+		for i := range m.buckets {
+			if m.buckets[i].entry != nil {
+				entries = append(entries, m.buckets[i].entry)
+			}
+		}
+		return entries
+	}
+	
+	// Sampling case: select every nth item approximately
+	step := (m.numItems / n) + 1
 	seen := 0
 	
 	for i := 0; i < len(m.buckets) && len(entries) < n; i++ {
 		if m.buckets[i].entry != nil {
-			if seen%((m.numItems/n)+1) == 0 {
+			if seen%step == 0 {
 				entries = append(entries, m.buckets[i].entry)
 			}
 			seen++

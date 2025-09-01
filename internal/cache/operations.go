@@ -59,6 +59,13 @@ func (c *Cache) Load(key []byte) (*Entry, bool) {
 		return nil, false
 	}
 	
+	// Check if entry was evicted
+	if entry.IsEvicted() {
+		c.Delete(key)
+		atomic.AddUint64(&shard.numMisses, 1)
+		return nil, false
+	}
+	
 	if entry.IsExpired() {
 		c.Delete(key)
 		atomic.AddUint64(&shard.numExpired, 1)
@@ -104,27 +111,28 @@ func (c *Cache) CompareAndSwap(key, value []byte, cas uint64, opts *StoreOptions
 		return false, nil
 	}
 	
-	entry := &Entry{
-		key:   key,
-		value: value,
-		cas:   existing.CAS(),
-	}
-	
+	// Calculate new expiration and flags
+	var newExpireAt int64
+	var newFlags uint32
 	if opts != nil {
 		if opts.TTL > 0 {
-			entry.expireAt = time.Now().Add(opts.TTL).UnixNano()
+			newExpireAt = time.Now().Add(opts.TTL).UnixNano()
 		}
-		entry.flags = opts.Flags
+		newFlags = opts.Flags
 	}
 	
-	c.evictIfNeeded(shard, entry.Size()-existing.Size())
+	// Calculate size difference with new value
+	sizeDelta := int64(len(value) - len(existing.value))
 	
+	c.evictIfNeeded(shard, sizeDelta)
+	
+	// Update the existing entry
 	existing.value = value
-	existing.expireAt = entry.expireAt
-	existing.flags = entry.flags
+	existing.expireAt = newExpireAt
+	existing.flags = newFlags
 	existing.IncrementCAS()
 	
-	shard.addMemUsed(entry.Size() - existing.Size())
+	shard.addMemUsed(sizeDelta)
 	
 	return true, nil
 }
@@ -193,6 +201,43 @@ func (c *Cache) Sweep() int {
 	return expired
 }
 
+// SweepEvicted removes evicted entries to free memory
+// Ensures no more than 10% of cache memory is used by evicted entries
+func (c *Cache) SweepEvicted() int {
+	evicted := 0
+	
+	for _, shard := range c.shards {
+		shard.mu.Lock()
+		
+		// Calculate how much memory is used by evicted entries
+		evictedMemory := int64(0)
+		totalMemory := shard.MemUsed()
+		toDelete := make([][]byte, 0)
+		
+		shard.m.iter(func(e *Entry) bool {
+			if e.IsEvicted() {
+				evictedMemory += e.Size()
+				toDelete = append(toDelete, e.key)
+			}
+			return true
+		})
+		
+		// If evicted entries use more than 10% of memory, clean them up
+		if evictedMemory > totalMemory/10 {
+			for _, key := range toDelete {
+				if entry := shard.m.delete(key, hashKey(key)); entry != nil {
+					shard.addMemUsed(-entry.Size())
+					evicted++
+				}
+			}
+		}
+		
+		shard.mu.Unlock()
+	}
+	
+	return evicted
+}
+
 func (c *Cache) Iterate(fn func(*Entry) bool) {
 	for _, shard := range c.shards {
 		shard.mu.RLock()
@@ -227,6 +272,10 @@ func (c *Cache) Clear() {
 }
 
 func (c *Cache) evictIfNeeded(shard *Shard, requiredSpace int64) {
+	// Don't evict if there's no memory limit
+	if shard.maxMemory <= 0 {
+		return
+	}
 	for shard.MemUsed()+requiredSpace > shard.maxMemory && shard.m.numItems > 0 {
 		entries := shard.m.randomEntries(2)
 		if len(entries) == 0 {
@@ -237,23 +286,41 @@ func (c *Cache) evictIfNeeded(shard *Shard, requiredSpace int64) {
 		if len(entries) == 1 {
 			toEvict = entries[0]
 		} else {
-			if entries[0].ExpireAt() > 0 && entries[1].ExpireAt() > 0 {
+			// Enhanced 2-random eviction: prefer expired entries first
+			entry0Expired := entries[0].IsExpired()
+			entry1Expired := entries[1].IsExpired()
+			
+			if entry0Expired && !entry1Expired {
+				toEvict = entries[0]
+			} else if !entry0Expired && entry1Expired {
+				toEvict = entries[1]
+			} else if entry0Expired && entry1Expired {
+				// Both expired, pick the one expiring soonest
 				if entries[0].ExpireAt() < entries[1].ExpireAt() {
 					toEvict = entries[0]
 				} else {
 					toEvict = entries[1]
 				}
-			} else if rand.Intn(2) == 0 {
-				toEvict = entries[0]
 			} else {
-				toEvict = entries[1]
+				// Neither expired, use original 2-random with TTL consideration
+				if entries[0].ExpireAt() > 0 && entries[1].ExpireAt() > 0 {
+					if entries[0].ExpireAt() < entries[1].ExpireAt() {
+						toEvict = entries[0]
+					} else {
+						toEvict = entries[1]
+					}
+				} else if rand.Intn(2) == 0 {
+					toEvict = entries[0]
+				} else {
+					toEvict = entries[1]
+				}
 			}
 		}
 		
-		if entry := shard.m.delete(toEvict.key, hashKey(toEvict.key)); entry != nil {
-			shard.addMemUsed(-entry.Size())
-			atomic.AddUint64(&shard.numEvicted, 1)
-		}
+		// Mark as evicted and reduce memory usage immediately
+		toEvict.SetEvicted(true)
+		shard.addMemUsed(-toEvict.Size())
+		atomic.AddUint64(&shard.numEvicted, 1)
 	}
 }
 
