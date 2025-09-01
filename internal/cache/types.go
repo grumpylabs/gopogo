@@ -14,6 +14,7 @@ type Entry struct {
 	flags      uint32
 	cas        uint64
 	metadata   unsafe.Pointer
+	evicted    bool
 }
 
 func (e *Entry) Key() []byte {
@@ -55,6 +56,14 @@ func (e *Entry) CAS() uint64 {
 
 func (e *Entry) IncrementCAS() uint64 {
 	return atomic.AddUint64(&e.cas, 1)
+}
+
+func (e *Entry) IsEvicted() bool {
+	return e.evicted
+}
+
+func (e *Entry) SetEvicted(evicted bool) {
+	e.evicted = evicted
 }
 
 func (e *Entry) Size() int64 {

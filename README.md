@@ -61,6 +61,8 @@ gopogo --tlsport 6380 --tlscert cert.pem --tlskey key.pem
 | `--shards` | `GOPOGO_SHARDS` | `16` | Number of cache shards |
 | `--maxmemory` | `GOPOGO_MAXMEMORY` | `0` | Maximum memory (e.g., 1GB) |
 | `--evict` | `GOPOGO_EVICT` | `2random` | Eviction policy |
+| `--autosweep` | `GOPOGO_AUTOSWEEP` | `true` | Enable automatic background sweeping |
+| `--sweepinterval` | `GOPOGO_SWEEPINTERVAL` | `10s` | Interval for background sweeping |
 | `--tlsport` | `GOPOGO_TLSPORT` | `0` | TLS listening port |
 | `--tlscert` | `GOPOGO_TLSCERT` | | TLS certificate file |
 | `--tlskey` | `GOPOGO_TLSKEY` | | TLS key file |
@@ -141,7 +143,8 @@ Gopogo is optimized for high performance with:
 - **Sharded Architecture**: Reduces lock contention
 - **Zero-copy Operations**: Where possible
 - **Optimized Memory Layout**: Compact entry storage
-- **Efficient Eviction**: 2-random algorithm balances speed and quality
+- **Enhanced Eviction**: 2-random algorithm with TTL awareness and automatic sweeping
+- **Automatic Background Sweeping**: Removes evicted entries to maintain <10% memory overhead
 
 ## Building from Source
 

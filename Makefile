@@ -60,7 +60,10 @@ local: build ## Build and start the server
 docker: .docker-build-$(VERSION) ## Build Docker image
 
 run: .docker-build-$(VERSION) ## Run server in Docker container
-	@docker run -p 6379:6379 -p 8080:8080 $(IMAGE_REPO)/$(IMAGE_NAME):$(VERSION) $(RUN_ARGS)
+	@docker run --net=host $(IMAGE_REPO)/$(IMAGE_NAME):$(VERSION) $(RUN_ARGS)
+
+run-ports: .docker-build-$(VERSION) ## Run server in Docker container with port mapping
+	@docker run -p 6379:6379 -p 8080:8080 -p 11211:11211 -p 5432:5432 $(IMAGE_REPO)/$(IMAGE_NAME):$(VERSION) $(RUN_ARGS)
 
 push: .docker-build-$(VERSION) ## Push Docker image to registry
 	@docker push $(IMAGE_REPO)/$(IMAGE_NAME):$(VERSION)

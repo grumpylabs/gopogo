@@ -17,21 +17,23 @@ import (
 )
 
 type Config struct {
-	Host     string
-	Port     int
-	Socket   string
-	Auth     string
-	Threads  int
-	TLSPort  int
-	TLSCert  string
-	TLSKey   string
-	HTTP     bool
-	Memcache bool
-	Postgres bool
-	Redis    bool
-	Quiet    bool
-	Verbose  bool
-	Cache    *cache.Cache
+	Host          string
+	Port          int
+	Socket        string
+	Auth          string
+	Threads       int
+	TLSPort       int
+	TLSCert       string
+	TLSKey        string
+	HTTP          bool
+	Memcache      bool
+	Postgres      bool
+	Redis         bool
+	Quiet         bool
+	Verbose       bool
+	Cache         *cache.Cache
+	AutoSweep     bool
+	SweepInterval time.Duration
 }
 
 type Server struct {
@@ -79,7 +81,9 @@ func (s *Server) Start() error {
 		return err
 	}
 	
-	s.startSweeper()
+	if s.config.AutoSweep {
+		s.startSweeper()
+	}
 	
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -228,7 +232,7 @@ func (s *Server) startSweeper() {
 	go func() {
 		defer s.wg.Done()
 		
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(s.config.SweepInterval)
 		defer ticker.Stop()
 		
 		for {
@@ -237,8 +241,9 @@ func (s *Server) startSweeper() {
 				return
 			case <-ticker.C:
 				expired := s.cache.Sweep()
-				if expired > 0 && s.config.Verbose {
-					log.Printf("Swept %d expired entries", expired)
+				evicted := s.cache.SweepEvicted()
+				if (expired > 0 || evicted > 0) && s.config.Verbose {
+					log.Printf("Swept %d expired and %d evicted entries", expired, evicted)
 				}
 			}
 		}
