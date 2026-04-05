@@ -180,6 +180,26 @@ func (h *RedisHandler) Handle(conn net.Conn) {
 			
 		case "DBSIZE":
 			h.writeInteger(writer, int64(h.cache.NumItems()))
+
+		case "TOUCH":
+			if len(cmd) < 2 {
+				h.writeError(writer, "ERR wrong number of arguments for 'touch' command")
+			} else {
+				touched := int64(0)
+				for _, k := range cmd[1:] {
+					if _, found := h.cache.LoadWithOptions([]byte(k), nil); found {
+						touched++
+					}
+				}
+				h.writeInteger(writer, touched)
+			}
+
+		case "PTTL":
+			if len(cmd) != 2 {
+				h.writeError(writer, "ERR wrong number of arguments for 'pttl' command")
+			} else {
+				h.handlePTTL(writer, cmd[1])
+			}
 			
 		case "INFO":
 			h.handleInfo(writer)
@@ -335,20 +355,42 @@ func (h *RedisHandler) handleSet(writer *bufio.Writer, args []string) {
 				}
 				i++
 			}
+		case "EXAT":
+			if i+1 < len(args) {
+				ts, err := strconv.ParseInt(args[i+1], 10, 64)
+				if err == nil {
+					dur := time.Until(time.Unix(ts, 0))
+					if dur > 0 {
+						opts.TTL = dur
+					}
+				}
+				i++
+			}
+		case "PXAT":
+			if i+1 < len(args) {
+				tsMs, err := strconv.ParseInt(args[i+1], 10, 64)
+				if err == nil {
+					dur := time.Until(time.Unix(0, tsMs*int64(time.Millisecond)))
+					if dur > 0 {
+						opts.TTL = dur
+					}
+				}
+				i++
+			}
 		case "NX":
-			if entry, _ := h.cache.Load([]byte(key)); entry != nil {
-				h.writeNil(writer)
-				return
-			}
+			opts.NX = true
 		case "XX":
-			if entry, _ := h.cache.Load([]byte(key)); entry == nil {
-				h.writeNil(writer)
-				return
-			}
+			opts.XX = true
+		case "KEEPTTL":
+			opts.KeepTTL = true
 		}
 	}
-	
-	h.cache.Store([]byte(key), []byte(value), opts)
+
+	result, _ := h.cache.Store([]byte(key), []byte(value), opts)
+	if result == cache.NotStored {
+		h.writeNil(writer)
+		return
+	}
 	h.writeSimpleString(writer, "OK")
 }
 
@@ -486,6 +528,26 @@ func (h *RedisHandler) handleInfo(writer *bufio.Writer) {
 		formatMemory(stats["mem_used"].(int64)))
 	
 	h.writeBulkString(writer, info)
+}
+
+func (h *RedisHandler) handlePTTL(writer *bufio.Writer, key string) {
+	entry, found := h.cache.Load([]byte(key))
+	if !found {
+		h.writeInteger(writer, -2)
+		return
+	}
+
+	expireAt := entry.ExpireAt()
+	if expireAt == 0 {
+		h.writeInteger(writer, -1)
+		return
+	}
+
+	pttl := (expireAt - time.Now().UnixNano()) / 1e6
+	if pttl < 0 {
+		pttl = 0
+	}
+	h.writeInteger(writer, pttl)
 }
 
 func matchPattern(pattern, key string) bool {

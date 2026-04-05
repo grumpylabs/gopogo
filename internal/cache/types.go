@@ -1,23 +1,26 @@
 package cache
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 )
 
 type Entry struct {
-	key        []byte
+	key        []byte // stored key (may be sixpack-compressed)
+	origKeyLen int    // original key length (before compression), 0 = not compressed
 	value      []byte
 	expireAt   int64
+	accessedAt int64
 	flags      uint32
 	cas        uint64
-	metadata   unsafe.Pointer
-	evicted    bool
 }
 
 func (e *Entry) Key() []byte {
+	if e.origKeyLen > 0 {
+		return Unsixpack(e.key)
+	}
 	return e.key
 }
 
@@ -42,6 +45,14 @@ func (e *Entry) IsExpired() bool {
 	return expireAt > 0 && expireAt < time.Now().UnixNano()
 }
 
+func (e *Entry) AccessedAt() int64 {
+	return atomic.LoadInt64(&e.accessedAt)
+}
+
+func (e *Entry) touch(now int64) {
+	atomic.StoreInt64(&e.accessedAt, now)
+}
+
 func (e *Entry) Flags() uint32 {
 	return atomic.LoadUint32(&e.flags)
 }
@@ -58,16 +69,12 @@ func (e *Entry) IncrementCAS() uint64 {
 	return atomic.AddUint64(&e.cas, 1)
 }
 
-func (e *Entry) IsEvicted() bool {
-	return e.evicted
-}
-
-func (e *Entry) SetEvicted(evicted bool) {
-	e.evicted = evicted
-}
-
 func (e *Entry) Size() int64 {
-	return int64(len(e.key) + len(e.value) + 24)
+	// Account for: slice headers (24 bytes each for key, value),
+	// int64 fields (expireAt, accessedAt, cas = 24), uint32 flags (4),
+	// origKeyLen int (8), plus the actual key and value data.
+	// Total fixed overhead: 24+24+24+4+8 = 84 bytes, rounded to 80 for alignment.
+	return int64(len(e.key) + len(e.value) + 80)
 }
 
 type Bucket struct {
@@ -77,42 +84,47 @@ type Bucket struct {
 }
 
 type Map struct {
-	buckets  []Bucket
-	numItems int
-	mask     uint64
-	growAt   int
-	shrinkAt int
+	buckets     []Bucket
+	numItems    int
+	mask        uint64
+	growAt      int
+	shrinkAt    int
+	loadFactor  float64
+	allowShrink bool
 }
 
-func NewMap(initialSize int) *Map {
+func NewMap(initialSize int, loadFactor float64, allowShrink bool) *Map {
 	size := 16
 	for size < initialSize {
 		size *= 2
 	}
-	
+
 	return &Map{
-		buckets:  make([]Bucket, size),
-		mask:     uint64(size - 1),
-		growAt:   int(float64(size) * 0.75),
-		shrinkAt: int(float64(size) * 0.10),
+		buckets:     make([]Bucket, size),
+		mask:        uint64(size - 1),
+		loadFactor:  loadFactor,
+		allowShrink: allowShrink,
+		growAt:      int(float64(size) * loadFactor),
+		shrinkAt:    int(float64(size) * 0.10),
 	}
 }
 
 type Shard struct {
-	mu          sync.RWMutex
-	m           *Map
-	memUsed     int64
-	maxMemory   int64
-	numOps      uint64
-	numHits     uint64
-	numMisses   uint64
-	numEvicted  uint64
-	numExpired  uint64
+	mu         sync.RWMutex
+	m          *Map
+	memUsed    int64
+	maxMemory  int64
+	numOps     uint64
+	numHits    uint64
+	numMisses  uint64
+	numEvicted uint64
+	numExpired uint64
+	sweepPos   int // current position for incremental sweep
 }
 
-func NewShard(maxMemory int64) *Shard {
+func newShard(maxMemory int64, loadFactor float64, allowShrink bool) *Shard {
 	return &Shard{
-		m:         NewMap(16),
+		m:         NewMap(16, loadFactor, allowShrink),
 		maxMemory: maxMemory,
 	}
 }
@@ -145,34 +157,128 @@ func (s *Shard) NumExpired() uint64 {
 	return atomic.LoadUint64(&s.numExpired)
 }
 
-type Cache struct {
-	shards    []*Shard
-	numShards int
-	maxMemory int64
+// EvictionReason indicates why an entry was evicted.
+type EvictionReason int
+
+const (
+	ReasonExpired EvictionReason = iota + 1 // TTL elapsed
+	ReasonLowMem                            // evicted to free memory
+	ReasonCleared                           // cache was cleared
+)
+
+// EvictedFunc is called when an entry is evicted from the cache.
+// The entry data is valid only for the duration of the call.
+type EvictedFunc func(reason EvictionReason, key, value []byte, expires int64, flags uint32, cas uint64)
+
+// NotifyFunc is called on every mutation to the cache.
+// For inserts: newEntry is set, oldEntry is nil.
+// For replaces: both are set.
+// For deletes: newEntry is nil, oldEntry is set.
+type NotifyFunc func(newEntry, oldEntry *Entry)
+
+// Options configures a new Cache instance.
+type Options struct {
+	NumShards   int     // default 256
+	MaxMemory   int64   // default 0 (unlimited)
+	LoadFactor  float64 // 0.55–0.95, default 0.75
+	NoSixpack   bool    // disable sixpack key compression (enabled by default)
+	NoEvict     bool    // disable eviction (Store fails when memory is full)
+	AllowShrink bool    // allow hash map shrinking on delete (default: always shrink)
+
+	// Evicted is called for every entry evicted due to expiration, low memory,
+	// or when the cache is cleared. Matching the C implementation's evicted callback.
+	Evicted EvictedFunc
+
+	// Notify is called for every change to the cache (insert, replace, delete).
+	// Matching the C implementation's notify callback.
+	Notify NotifyFunc
 }
 
-func New(numShards int, maxMemory int64) *Cache {
-	if numShards <= 0 {
-		numShards = 16
+// MetricsRecorder is the interface the cache uses to record telemetry.
+// This avoids a direct dependency on the telemetry package.
+type MetricsRecorder interface {
+	RecordStore(ctx context.Context, result string, durationMs float64)
+	RecordLoad(ctx context.Context, hit bool, durationMs float64)
+	RecordDelete(ctx context.Context, found bool, durationMs float64)
+	RecordEviction(ctx context.Context, count int64)
+	RecordExpiration(ctx context.Context, count int64)
+	RecordSave(ctx context.Context, success bool, durationMs float64)
+	RecordLoadFile(ctx context.Context, success bool, durationMs float64)
+	RecordSweep(ctx context.Context, expired int64, durationMs float64)
+}
+
+type Cache struct {
+	shards      []*Shard
+	numShards   int
+	maxMemory   int64
+	metrics     MetricsRecorder
+	evicted     EvictedFunc
+	notify      NotifyFunc
+	noSixpack   bool
+	noEvict     bool
+	allowShrink bool
+}
+
+// New creates a new Cache. Pass nil for defaults.
+func New(opts *Options) *Cache {
+	numShards := 256
+	var maxMemory int64
+	loadFactor := 0.75
+	allowShrink := true
+
+	if opts != nil {
+		if opts.NumShards > 0 {
+			numShards = opts.NumShards
+		}
+		maxMemory = opts.MaxMemory
+		allowShrink = opts.AllowShrink
+		if opts.LoadFactor > 0 {
+			loadFactor = opts.LoadFactor
+			if loadFactor < 0.55 {
+				loadFactor = 0.55
+			} else if loadFactor > 0.95 {
+				loadFactor = 0.95
+			}
+		}
 	}
-	
+
 	shards := make([]*Shard, numShards)
 	shardMaxMem := maxMemory / int64(numShards)
-	
+
 	for i := 0; i < numShards; i++ {
-		shards[i] = NewShard(shardMaxMem)
+		shards[i] = newShard(shardMaxMem, loadFactor, allowShrink)
 	}
-	
-	return &Cache{
+
+	c := &Cache{
 		shards:    shards,
 		numShards: numShards,
 		maxMemory: maxMemory,
 	}
+	if opts != nil {
+		c.evicted = opts.Evicted
+		c.notify = opts.Notify
+		c.noSixpack = opts.NoSixpack
+		c.noEvict = opts.NoEvict
+		c.allowShrink = opts.AllowShrink
+	}
+	return c
 }
 
 func (c *Cache) getShard(key []byte) *Shard {
 	h := hashKey(key)
-	return c.shards[h%uint64(c.numShards)]
+	// Use upper bits for shard selection to decorrelate from bucket placement
+	// which uses lower bits. This matches the C implementation's approach.
+	return c.shards[(h>>32)%uint64(c.numShards)]
+}
+
+// SetMetrics attaches a metrics recorder to the cache.
+func (c *Cache) SetMetrics(m MetricsRecorder) {
+	c.metrics = m
+}
+
+// NumShards returns the number of shards in the cache.
+func (c *Cache) NumShards() int {
+	return c.numShards
 }
 
 func (c *Cache) MemUsed() int64 {
@@ -183,6 +289,14 @@ func (c *Cache) MemUsed() int64 {
 	return total
 }
 
+// ShardMemUsed returns memory used by a single shard.
+func (c *Cache) ShardMemUsed(shardIdx int) int64 {
+	if shardIdx < 0 || shardIdx >= c.numShards {
+		return 0
+	}
+	return c.shards[shardIdx].MemUsed()
+}
+
 func (c *Cache) NumItems() int {
 	var total int
 	for _, shard := range c.shards {
@@ -191,6 +305,18 @@ func (c *Cache) NumItems() int {
 		shard.mu.RUnlock()
 	}
 	return total
+}
+
+// ShardNumItems returns the item count for a single shard.
+func (c *Cache) ShardNumItems(shardIdx int) int {
+	if shardIdx < 0 || shardIdx >= c.numShards {
+		return 0
+	}
+	shard := c.shards[shardIdx]
+	shard.mu.RLock()
+	n := shard.m.numItems
+	shard.mu.RUnlock()
+	return n
 }
 
 func (c *Cache) Stats() map[string]interface{} {

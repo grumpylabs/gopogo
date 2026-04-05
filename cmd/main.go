@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"runtime"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/grumpylabs/gopogo/internal/cache"
 	"github.com/grumpylabs/gopogo/internal/server"
+	"github.com/grumpylabs/gopogo/internal/telemetry"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -55,6 +57,12 @@ func init() {
 	rootCmd.PersistentFlags().Bool("verbose", false, "Verbose output")
 	rootCmd.PersistentFlags().Bool("version", false, "Show version")
 
+	rootCmd.PersistentFlags().Bool("telemetry", false, "Enable OpenTelemetry metrics")
+	rootCmd.PersistentFlags().String("telemetry-exporter", "otlp", "Telemetry exporter (otlp, stdout)")
+	rootCmd.PersistentFlags().String("otlp-endpoint", "localhost:4317", "OTLP gRPC endpoint")
+	rootCmd.PersistentFlags().Bool("noevict", false, "Disable eviction (reject writes when full)")
+	rootCmd.PersistentFlags().Bool("nosixpack", false, "Disable sixpack key compression")
+
 	viper.BindPFlags(rootCmd.PersistentFlags())
 }
 
@@ -85,9 +93,29 @@ func runServer(cmd *cobra.Command, args []string) {
 
 	maxMemory := parseMemorySize(viper.GetString("maxmemory"))
 
-	c := cache.New(
-		viper.GetInt("shards"),
-		maxMemory,
+	c := cache.New(&cache.Options{
+		NumShards: viper.GetInt("shards"),
+		MaxMemory: maxMemory,
+		NoSixpack: viper.GetBool("nosixpack"),
+		NoEvict:   viper.GetBool("noevict"),
+	})
+
+	// Initialize telemetry
+	metrics, err := telemetry.NewMetrics(context.Background(), &telemetry.Config{
+		Enabled:        viper.GetBool("telemetry"),
+		ExporterType:   viper.GetString("telemetry-exporter"),
+		OTLPEndpoint:   viper.GetString("otlp-endpoint"),
+		ServiceName:    "gopogo",
+		ServiceVersion: version,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize telemetry: %v\n", err)
+		os.Exit(1)
+	}
+	c.SetMetrics(metrics)
+	metrics.RegisterGauges(
+		func() int64 { return c.MemUsed() },
+		func() int64 { return int64(c.NumItems()) },
 	)
 
 	srv := server.New(&server.Config{

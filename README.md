@@ -1,16 +1,23 @@
 # Gopogo - High-Performance Cache Server
 
-Gopogo is a fast caching software built from scratch with a focus on low latency and CPU efficiency. It's a Go implementation inspired by pogocache, supporting multiple wire protocols and optimized for performance.
+Gopogo is a fast caching server built from scratch with a focus on low latency and CPU efficiency. It's a Go port of [pogocache](https://github.com/tidwall/pogocache), supporting multiple wire protocols and optimized for concurrent workloads.
 
 ## Features
 
-- **Multiple Protocol Support**: Redis, HTTP, Memcache, and PostgreSQL wire protocols
-- **High Performance**: Robin Hood hashing with optimized memory layout
-- **Thread-Safe**: Sharded architecture for concurrent access
-- **Memory Management**: Configurable memory limits with 2-random eviction
+- **Multiple Protocol Support**: Redis, HTTP, Memcache, and PostgreSQL wire protocols with auto-detection
+- **Robin Hood Hashing**: Cache-friendly open addressing with configurable load factor (55-95%)
+- **Sharded Architecture**: 256 shards by default with upper-bit hash decorrelation for concurrent access
+- **2-Random LRU Eviction**: Access-time-based eviction matching pogocache's algorithm
+- **Sixpack Key Compression**: 6-bit encoding saves ~25% memory on typical KV keys (enabled by default)
+- **LZ4 Persistence**: Atomic save/load with CRC32-verified compressed blocks
+- **Batch Transactions**: Lock multiple shards atomically for multi-key operations
+- **Eviction & Notify Callbacks**: Observe all cache mutations and eviction events with reason codes
+- **OpenTelemetry Metrics**: Counters, histograms, and gauges for all operations
+- **NX/XX/KeepTTL**: Conditional store operations at the engine level
+- **Compare-and-Swap**: Optimistic concurrency control with per-entry CAS tokens
+- **Incremental Sweep**: Background and on-demand expiration cleanup without full scans
 - **TLS Support**: Secure connections with TLS/SSL
 - **Authentication**: Password-based authentication across all protocols
-- **Flexible Configuration**: CLI flags, environment variables, and config files
 
 ## Installation
 
@@ -30,8 +37,6 @@ go install github.com/grumpylabs/gopogo/cmd/gopogo@latest
 
 ## Quick Start
 
-### Basic Usage
-
 ```bash
 # Start with default settings (Redis protocol on port 6379)
 gopogo
@@ -42,14 +47,17 @@ gopogo -h 0.0.0.0 -p 6380 --maxmemory 1GB
 # Enable multiple protocols
 gopogo --redis --http --memcache
 
-# With authentication
-gopogo --auth mypassword
+# With authentication and TLS
+gopogo --auth mypassword --tlsport 6380 --tlscert cert.pem --tlskey key.pem
 
-# With TLS
-gopogo --tlsport 6380 --tlscert cert.pem --tlskey key.pem
+# With telemetry
+gopogo --telemetry --telemetry-exporter otlp --otlp-endpoint localhost:4317
+
+# Disable eviction (reject writes when full) and key compression
+gopogo --noevict --nosixpack
 ```
 
-### Configuration Options
+## Configuration
 
 | Flag | Environment | Default | Description |
 |------|-------------|---------|-------------|
@@ -60,9 +68,13 @@ gopogo --tlsport 6380 --tlscert cert.pem --tlskey key.pem
 | `--threads` | `GOPOGO_THREADS` | CPU count | Number of threads |
 | `--shards` | `GOPOGO_SHARDS` | `16` | Number of cache shards |
 | `--maxmemory` | `GOPOGO_MAXMEMORY` | `0` | Maximum memory (e.g., 1GB) |
-| `--evict` | `GOPOGO_EVICT` | `2random` | Eviction policy |
-| `--autosweep` | `GOPOGO_AUTOSWEEP` | `true` | Enable automatic background sweeping |
-| `--sweepinterval` | `GOPOGO_SWEEPINTERVAL` | `10s` | Interval for background sweeping |
+| `--noevict` | `GOPOGO_NOEVICT` | `false` | Disable eviction |
+| `--nosixpack` | `GOPOGO_NOSIXPACK` | `false` | Disable sixpack key compression |
+| `--autosweep` | `GOPOGO_AUTOSWEEP` | `true` | Enable background sweeping |
+| `--sweepinterval` | `GOPOGO_SWEEPINTERVAL` | `10s` | Sweep interval |
+| `--telemetry` | `GOPOGO_TELEMETRY` | `false` | Enable OpenTelemetry metrics |
+| `--telemetry-exporter` | `GOPOGO_TELEMETRY_EXPORTER` | `otlp` | Exporter type (otlp, stdout) |
+| `--otlp-endpoint` | `GOPOGO_OTLP_ENDPOINT` | `localhost:4317` | OTLP gRPC endpoint |
 | `--tlsport` | `GOPOGO_TLSPORT` | `0` | TLS listening port |
 | `--tlscert` | `GOPOGO_TLSCERT` | | TLS certificate file |
 | `--tlskey` | `GOPOGO_TLSKEY` | | TLS key file |
@@ -71,53 +83,116 @@ gopogo --tlsport 6380 --tlscert cert.pem --tlskey key.pem
 | `--postgres` | `GOPOGO_POSTGRES` | `false` | Enable Postgres protocol |
 | `--redis` | `GOPOGO_REDIS` | `true` | Enable Redis protocol |
 
+## Cache Library API
+
+Gopogo's cache engine can be used as an embedded Go library:
+
+```go
+import "github.com/grumpylabs/gopogo/internal/cache"
+
+// Create a cache with options
+c := cache.New(&cache.Options{
+    NumShards:  256,
+    MaxMemory:  1024 * 1024 * 512, // 512MB
+    LoadFactor: 0.75,
+    Evicted: func(reason cache.EvictionReason, key, value []byte, expires int64, flags uint32, cas uint64) {
+        log.Printf("evicted %s (reason: %d)", key, reason)
+    },
+    Notify: func(newEntry, oldEntry *cache.Entry) {
+        // observe all mutations
+    },
+})
+
+// Store with TTL, NX/XX, KeepTTL
+c.Store([]byte("key"), []byte("value"), &cache.StoreOptions{
+    TTL:     5 * time.Minute,
+    NX:      true,  // only if not exists
+    KeepTTL: true,  // preserve existing TTL on update
+})
+
+// Load with options
+entry, found := c.LoadWithOptions([]byte("key"), &cache.LoadOptions{
+    NoTouch: true, // don't update LRU access time
+    Entry: func(key, value []byte, expires int64, flags uint32, cas uint64) *cache.LoadUpdate {
+        // atomically update during load
+        return &cache.LoadUpdate{Value: []byte("new-value")}
+    },
+})
+
+// Delete with cancel callback
+c.DeleteWithOptions([]byte("key"), &cache.DeleteOptions{
+    Entry: func(key, value []byte, expires int64, flags uint32, cas uint64) bool {
+        return true // return false to cancel delete
+    },
+})
+
+// Compare-and-swap
+success, _ := c.CompareAndSwap([]byte("key"), []byte("new"), casToken, nil)
+
+// Atomic increment with overflow detection
+val, err := c.Increment([]byte("counter"), 1)
+
+// Batch transaction (holds locks across operations)
+b := c.Begin()
+b.Store([]byte("k1"), []byte("v1"), nil)
+b.Store([]byte("k2"), []byte("v2"), nil)
+entry, _ := b.Load([]byte("k1"))
+b.Delete([]byte("k3"))
+b.End() // releases all locks
+
+// Persistence
+c.Save("/tmp/cache.pogo")
+stats, _ := c.LoadFromFile("/tmp/cache.pogo")
+
+// Incremental sweep (non-blocking)
+c.SweepPoll(20) // check 20 entries per shard
+
+// Per-shard operations
+c.SweepShard(0)
+c.ClearShard(0)
+c.IterateShard(0, func(e *cache.Entry) bool { return true })
+```
+
 ## Protocol Examples
 
 ### Redis Protocol
 
+Supported commands: GET, SET (EX/PX/EXAT/PXAT/NX/XX/KEEPTTL), DEL, EXISTS, MGET, MSET, INCR, DECR, INCRBY, DECRBY, EXPIRE, TTL, PTTL, TOUCH, KEYS, SCAN, DBSIZE, FLUSHDB, FLUSHALL, INFO, PING, QUIT, SELECT, ECHO, AUTH.
+
 ```bash
-# Using redis-cli
 redis-cli -p 6379
-> SET key value
+> SET user:123 '{"name":"alice"}' EX 3600 NX
 OK
-> GET key
-"value"
-> DEL key
+> GET user:123
+"{\"name\":\"alice\"}"
+> TOUCH user:123
 (integer) 1
+> PTTL user:123
+(integer) 3599842
 ```
 
 ### HTTP Protocol
 
 ```bash
-# Enable HTTP protocol
 gopogo --http -p 8080
 
-# Store a value
-curl -X PUT http://localhost:8080/mykey -d "myvalue"
-
-# Retrieve a value
+curl -X PUT http://localhost:8080/mykey -d "myvalue" -H "X-TTL: 3600"
 curl http://localhost:8080/mykey
-
-# Delete a value
 curl -X DELETE http://localhost:8080/mykey
-
-# Get stats
 curl http://localhost:8080/stats
 ```
 
 ### Memcache Protocol
 
 ```bash
-# Enable Memcache protocol
 gopogo --memcache -p 11211
 
-# Using telnet
 telnet localhost 11211
-> set key 0 0 5
+> set key 0 3600 5
 > value
 STORED
-> get key
-VALUE key 0 5
+> gets key
+VALUE key 0 5 1
 value
 END
 ```
@@ -125,75 +200,60 @@ END
 ### PostgreSQL Protocol
 
 ```bash
-# Enable Postgres protocol
 gopogo --postgres -p 5432
 
-# Using psql
 psql -h localhost -p 5432 -U user dbname
 > INSERT INTO cache VALUES ('key', 'value');
-INSERT 0 1
 > SELECT * FROM cache WHERE key = 'key';
 ```
 
-## Performance
+## Telemetry
 
-Gopogo is optimized for high performance with:
+When enabled, Gopogo exports OpenTelemetry metrics:
 
-- **Robin Hood Hashing**: Minimizes probe distances for cache-friendly access
-- **Sharded Architecture**: Reduces lock contention
-- **Zero-copy Operations**: Where possible
-- **Optimized Memory Layout**: Compact entry storage
-- **Enhanced Eviction**: 2-random algorithm with TTL awareness and automatic sweeping
-- **Automatic Background Sweeping**: Removes evicted entries to maintain <10% memory overhead
+| Metric | Type | Description |
+|--------|------|-------------|
+| `cache.store.count` | Counter | Store operations (with `result` attribute) |
+| `cache.store.duration` | Histogram | Store latency (ms) |
+| `cache.load.count` | Counter | Load operations |
+| `cache.load.duration` | Histogram | Load latency (ms) |
+| `cache.delete.count` | Counter | Delete operations |
+| `cache.delete.duration` | Histogram | Delete latency (ms) |
+| `cache.hit.count` | Counter | Cache hits |
+| `cache.miss.count` | Counter | Cache misses |
+| `cache.memory.used` | Gauge | Current memory usage (bytes) |
+| `cache.items.count` | Gauge | Current item count |
+| `cache.eviction.count` | Counter | Evictions |
+| `cache.expiration.count` | Counter | Expirations |
+| `cache.sweep.duration` | Histogram | Sweep latency (ms) |
+| `cache.save.duration` | Histogram | Persistence save latency (ms) |
+| `cache.loadfile.duration` | Histogram | Persistence load latency (ms) |
 
-## Building from Source
+## Architecture
+
+1. **Shards**: Cache divided into N shards (default 256) with RWMutex per shard. Upper 32 bits of hash select shard, lower bits select bucket (decorrelated).
+2. **Robin Hood Hashing**: Open addressing with linear probing. Configurable load factor (55-95%, default 75%). Optional shrinking on delete.
+3. **Sixpack Compression**: 6-bit encoding for keys using the character set `-.0123456789:ABCDEFGHIJKLMNOPRSTUVWXY_abcdefghijklmnopqrstuvwxy`. Transparent: `Entry.Key()` always returns the original key.
+4. **2-Random LRU Eviction**: Samples 2 random entries (skipping the inserting entry's hash), prefers expired entries, falls back to oldest access time.
+5. **Persistence**: LZ4-compressed blocks with 16-byte headers (`POGO` magic + CRC32 + sizes). One block per shard. Atomic writes via temp file + rename.
+6. **Callbacks**: Eviction callback with reason codes (expired, lowmem, cleared). Notify callback for all mutations (insert, replace, delete). Load-with-update and delete-with-cancel callbacks.
+
+## Building
 
 ```bash
-# Build binary
-make build
-
-# Run tests
-make test
-
-# Run benchmarks
-make bench
-
-# Build with race detector
-make build-race
-
-# Generate test coverage
-make test-coverage
+make build          # Build binary
+make test           # Run tests
+make bench          # Run benchmarks
+make build-race     # Build with race detector
+make test-coverage  # Generate test coverage
 ```
 
 ## Docker
 
 ```bash
-# Build Docker image
 docker build -t gopogo .
-
-# Run container
-docker run -p 6379:6379 gopogo
-
-# With custom settings
-docker run -p 6379:6379 \
-  -e GOPOGO_AUTH=mypassword \
-  -e GOPOGO_MAXMEMORY=512MB \
-  gopogo
+docker run -p 6379:6379 -e GOPOGO_MAXMEMORY=512MB gopogo
 ```
-
-## Architecture
-
-Gopogo uses a sharded cache architecture where:
-
-1. **Shards**: The cache is divided into multiple shards for concurrent access
-2. **Robin Hood Hashing**: Each shard uses Robin Hood hashing for O(1) operations
-3. **Memory Management**: Per-shard memory tracking with global limits
-4. **Eviction**: 2-random eviction when memory limits are reached
-5. **Protocol Detection**: Automatic protocol detection for multi-protocol support
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
@@ -201,4 +261,4 @@ MIT License - see LICENSE file for details
 
 ## Acknowledgments
 
-Inspired by [pogocache](https://github.com/tidwall/pogocache) by Josh Baker
+Go port of [pogocache](https://github.com/tidwall/pogocache) by Josh Baker / Polypoint Labs.

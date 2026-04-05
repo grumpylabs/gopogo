@@ -77,6 +77,11 @@ profile-mem: ## Profile memory usage and open pprof
 	@go test -memprofile=mem.prof -bench=. ./internal/cache
 	@go tool pprof mem.prof
 
+install: build ## Install the binary to /usr/local/bin
+	@install -d /usr/local/bin
+	@install -m 755 bin/gopogo /usr/local/bin/gopogo
+	@echo "gopogo installed to /usr/local/bin/gopogo"
+
 help: ## Show help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}' | \
