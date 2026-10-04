@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
+	"strconv"
+	"strings"
 	"runtime"
 	"time"
 
 	"github.com/grumpylabs/gopogo/internal/cache"
 	"github.com/grumpylabs/gopogo/internal/protocol"
 	"github.com/grumpylabs/gopogo/internal/server"
+	"github.com/grumpylabs/gopogo/internal/sysmem"
 	"github.com/grumpylabs/gopogo/internal/telemetry"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -41,7 +45,7 @@ func init() {
 
 	rootCmd.PersistentFlags().Int("threads", runtime.NumCPU(), "Number of threads")
 	rootCmd.PersistentFlags().Int("shards", 16, "Number of cache shards")
-	rootCmd.PersistentFlags().String("maxmemory", "0", "Maximum memory (e.g., 1GB, 512MB)")
+	rootCmd.PersistentFlags().String("maxmemory", "0", "Maximum memory: bytes with k/m/g/t suffix (e.g. 1GB), a percentage of available memory (e.g. 80%), or 0 for unlimited")
 	rootCmd.PersistentFlags().String("evict", "2random", "Eviction policy (noevict, 2random, lru)")
 	rootCmd.PersistentFlags().Bool("autosweep", true, "Enable automatic background sweeping of evicted entries")
 	rootCmd.PersistentFlags().Duration("sweepinterval", 10*time.Second, "Interval for automatic background sweeping")
@@ -89,6 +93,9 @@ func initConfig() {
 	}
 
 	viper.SetEnvPrefix("GOPOGO")
+	// Flags with hyphens read GOPOGO_ variables with underscores, e.g.
+	// --telemetry-exporter from GOPOGO_TELEMETRY_EXPORTER.
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 	viper.AutomaticEnv()
 
 	if err := viper.ReadInConfig(); err == nil && !viper.GetBool("quiet") {
@@ -106,7 +113,11 @@ func runServer(cmd *cobra.Command, args []string) {
 	validateFlags()
 	protocol.ConnStats.Max = int64(viper.GetInt("maxconns"))
 	viper.Set("loadfactor", loadFactorPercent())
-	maxMemory := parseMemorySize(viper.GetString("maxmemory"))
+	maxMemory, err := parseMemorySize(viper.GetString("maxmemory"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Option --maxmemory is invalid: %v\n", err)
+		os.Exit(1)
+	}
 
 	c := cache.New(&cache.Options{
 		NumShards:  viper.GetInt("shards"),
@@ -260,28 +271,37 @@ func loadPersist(c *cache.Cache, path string) {
 	}
 }
 
-func parseMemorySize(s string) int64 {
-	if s == "" || s == "0" {
-		return 0
+// parseMemorySize parses --maxmemory like pogocache: a number of bytes with an
+// optional k, m, g or t suffix (an optional trailing b, any case), a
+// percentage of available memory such as "80%", or "unlimited". 0 means
+// unlimited. Available memory is the container memory limit when one is set.
+func parseMemorySize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "0" || strings.EqualFold(s, "unlimited") {
+		return 0, nil
 	}
-
-	var size int64
-	var unit string
-
-	fmt.Sscanf(s, "%d%s", &size, &unit)
-
-	switch unit {
-	case "KB", "kb", "K", "k":
-		return size * 1024
-	case "MB", "mb", "M", "m":
-		return size * 1024 * 1024
-	case "GB", "gb", "G", "g":
-		return size * 1024 * 1024 * 1024
-	case "TB", "tb", "T", "t":
-		return size * 1024 * 1024 * 1024 * 1024
-	default:
-		return size
+	i := 0
+	for i < len(s) && (s[i] >= '0' && s[i] <= '9' || s[i] == '.') {
+		i++
 	}
+	n, err := strconv.ParseFloat(s[:i], 64)
+	if err != nil || n <= 0 || math.IsInf(n, 0) {
+		return 0, fmt.Errorf("invalid maxmemory %q", s)
+	}
+	unit := strings.ToLower(strings.TrimSpace(s[i:]))
+	if unit == "%" {
+		avail := sysmem.Available()
+		if avail == 0 {
+			return 0, fmt.Errorf("maxmemory %q: cannot determine available memory", s)
+		}
+		return int64(n / 100 * float64(avail)), nil
+	}
+	unit = strings.TrimSuffix(unit, "b")
+	mult := map[string]float64{"": 1, "k": 1 << 10, "m": 1 << 20, "g": 1 << 30, "t": 1 << 40}[unit]
+	if mult == 0 {
+		return 0, fmt.Errorf("invalid maxmemory %q", s)
+	}
+	return int64(n * mult), nil
 }
 
 func printStartupBanner(c *cache.Cache, maxMemory int64) {

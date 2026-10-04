@@ -1,4 +1,4 @@
-.PHONY: all build clean test integration integration-run bench install run help docker
+.PHONY: all build clean test integration integration-run helm-lint bench install run help docker
 
 VERSION := 1.0.0
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "dev")
@@ -34,6 +34,9 @@ integration: build integration-run ## Run pogocache's protocol tests against a l
 
 integration-run: ## Run the integration tests without rebuilding (GOPOGO_BIN overrides the binary)
 	@test/integration/run.sh -timeout 5m -run '$(INTEGRATION_RUN)' $(if $(INTEGRATION_SKIP),-skip '$(INTEGRATION_SKIP)')
+
+helm-lint: ## Lint the Helm chart
+	@helm lint --strict deploy/helm/gopogo
 
 test-coverage: ## Run tests and generate coverage report
 	@go test -v -race -coverprofile=coverage.out ./...

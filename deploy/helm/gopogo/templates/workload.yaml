@@ -1,0 +1,133 @@
+{{- if and .Values.auth.enabled (not .Values.auth.existingSecret) (not .Values.auth.password) }}
+{{- fail "auth.enabled requires auth.password or auth.existingSecret" }}
+{{- end }}
+{{- if and .Values.tls.enabled (not .Values.tls.secretName) }}
+{{- fail "tls.enabled requires tls.secretName" }}
+{{- end }}
+{{- if not (or .Values.protocols.redis .Values.protocols.http .Values.protocols.memcache .Values.protocols.postgres) }}
+{{- fail "enable at least one protocol" }}
+{{- end }}
+apiVersion: apps/v1
+kind: {{ if .Values.persistence.enabled }}StatefulSet{{ else }}Deployment{{ end }}
+metadata:
+  name: {{ include "gopogo.fullname" . }}
+  labels:
+    {{- include "gopogo.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  {{- if .Values.persistence.enabled }}
+  serviceName: {{ include "gopogo.fullname" . }}-headless
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "gopogo.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- if and .Values.auth.enabled (not .Values.auth.existingSecret) }}
+        checksum/auth: {{ .Values.auth.password | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "gopogo.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "gopogo.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: gopogo
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            {{- include "gopogo.args" . | nindent 12 }}
+          env:
+            {{- if .Values.auth.enabled }}
+            - name: GOPOGO_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gopogo.authSecretName" . }}
+                  key: {{ include "gopogo.authSecretKey" . }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: gopogo
+              containerPort: {{ .Values.port }}
+              protocol: TCP
+            {{- if .Values.tls.enabled }}
+            - name: gopogo-tls
+              containerPort: {{ .Values.tls.port }}
+              protocol: TCP
+            {{- end }}
+          startupProbe:
+            tcpSocket:
+              port: gopogo
+            {{- toYaml .Values.startupProbe | nindent 12 }}
+          livenessProbe:
+            tcpSocket:
+              port: gopogo
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            tcpSocket:
+              port: gopogo
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if or .Values.tls.enabled .Values.persistence.enabled }}
+          volumeMounts:
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/gopogo/tls
+              readOnly: true
+            {{- end }}
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: /data
+            {{- end }}
+          {{- end }}
+      {{- if .Values.tls.enabled }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}

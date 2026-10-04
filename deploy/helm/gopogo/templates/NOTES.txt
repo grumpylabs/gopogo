@@ -1,0 +1,29 @@
+gopogo is listening on {{ include "gopogo.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.port }}
+{{- if .Values.tls.enabled }} (TLS on port {{ .Values.tls.port }}){{ end }}.
+
+Protocols on that port:
+{{- if .Values.protocols.redis }}
+  redis     redis-cli -h {{ include "gopogo.fullname" . }} -p {{ .Values.port }}{{ if .Values.auth.enabled }} -a <password>{{ end }}
+{{- end }}
+{{- if .Values.protocols.http }}
+  http      curl http://{{ include "gopogo.fullname" . }}:{{ .Values.port }}/<key>{{ if .Values.auth.enabled }}?auth=<password>{{ end }}
+{{- end }}
+{{- if .Values.protocols.memcache }}
+  memcache  {{ include "gopogo.fullname" . }}:{{ .Values.port }}
+{{- end }}
+{{- if .Values.protocols.postgres }}
+  postgres  psql -h {{ include "gopogo.fullname" . }} -p {{ .Values.port }}
+{{- end }}
+
+To try it from your machine:
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "gopogo.fullname" . }} {{ .Values.port }}
+
+{{- if gt (int .Values.replicaCount) 1 }}
+
+Note: the {{ .Values.replicaCount }} replicas are independent caches behind one Service.
+{{- end }}
+{{- if .Values.persistence.enabled }}
+
+Data is saved to /data/{{ .Values.persistence.fileName }} on shutdown. Saving must finish
+within terminationGracePeriodSeconds ({{ .Values.terminationGracePeriodSeconds }}s).
+{{- end }}

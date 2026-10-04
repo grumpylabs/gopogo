@@ -1,0 +1,132 @@
+# Default values for gopogo.
+
+image:
+  repository: grumpylabs/gopogo
+  # Defaults to the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Each replica is an independent cache; gopogo does not replicate or shard
+# between instances.
+replicaCount: 1
+
+# Every enabled protocol is served on the same port; gopogo detects the
+# protocol of each connection.
+protocols:
+  redis: true
+  http: false
+  memcache: false
+  postgres: false
+
+port: 6379
+
+cache:
+  # Bytes with a k/m/g/t suffix (e.g. 1GB), a percentage of the container
+  # memory limit (e.g. 80%), or 0 for unlimited. With a percentage, set
+  # resources.limits.memory so the cache evicts before the pod is OOM-killed.
+  maxMemory: "80%"
+  # Evict entries when full; false rejects writes instead.
+  evict: true
+  shards: 16
+  # Hashmap load factor percent, 55-95.
+  loadFactor: 75
+  # Assign compare-and-swap tokens on every write (memcache cas, HTTP cas).
+  cas: false
+  sixpack: true
+  autoSweep: true
+  sweepInterval: 10s
+
+maxConns: 1024
+
+auth:
+  # Require a password on every protocol. The password is stored in a Secret
+  # created by the chart, unless existingSecret names one to use.
+  enabled: false
+  password: ""
+  existingSecret: ""
+  existingSecretKey: password
+
+tls:
+  # Serve TLS on tls.port in addition to the plain port. The Secret must hold
+  # tls.crt and tls.key, and ca.crt to verify client certificates when
+  # verifyClients is true.
+  enabled: false
+  port: 6380
+  secretName: ""
+  verifyClients: false
+
+persistence:
+  # Load the cache from a file at startup and save it at shutdown. Enabling
+  # this deploys a StatefulSet with a PersistentVolumeClaim per replica.
+  enabled: false
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+  # Saving on shutdown must finish within terminationGracePeriodSeconds.
+  fileName: gopogo.pogo
+
+telemetry:
+  enabled: false
+  # otlp or stdout
+  exporter: otlp
+  otlpEndpoint: localhost:4317
+
+# Extra command-line flags, e.g. ["--tcpnodelay=false"].
+extraArgs: []
+extraEnv: []
+
+terminationGracePeriodSeconds: 60
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  annotations: {}
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# Loading a large persistence file happens before gopogo listens, so the
+# startup probe allows up to failureThreshold * periodSeconds for it.
+startupProbe:
+  periodSeconds: 5
+  failureThreshold: 60
+livenessProbe:
+  periodSeconds: 10
+  failureThreshold: 3
+readinessProbe:
+  periodSeconds: 5
+  failureThreshold: 3
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

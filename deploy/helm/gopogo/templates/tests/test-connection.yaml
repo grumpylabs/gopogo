@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "gopogo.fullname" . }}-test
+  labels:
+    {{- include "gopogo.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: ping
+      image: busybox:1.37
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      env:
+        - name: HOST
+          value: {{ include "gopogo.fullname" . }}
+        - name: PORT
+          value: {{ .Values.port | quote }}
+        {{- if .Values.auth.enabled }}
+        - name: PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "gopogo.authSecretName" . }}
+              key: {{ include "gopogo.authSecretKey" . }}
+        {{- end }}
+      command:
+        - sh
+        - -c
+        {{- if .Values.protocols.redis }}
+        # Inline (telnet-style) RESP: authenticate if needed, then PING.
+        - |
+          { [ -n "$PASSWORD" ] && printf 'AUTH %s\r\n' "$PASSWORD"; printf 'PING\r\n'; } |
+            nc -w 3 "$HOST" "$PORT" | grep -q '+PONG'
+        {{- else }}
+        - nc -z -w 3 "$HOST" "$PORT"
+        {{- end }}

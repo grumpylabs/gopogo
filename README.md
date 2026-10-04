@@ -71,7 +71,7 @@ gopogo --persist /var/lib/gopogo/data.pogo
 | `--persist` | `GOPOGO_PERSIST` | | Persistence file loaded at startup and saved at shutdown |
 | `--threads` | `GOPOGO_THREADS` | CPU count | Number of threads |
 | `--shards` | `GOPOGO_SHARDS` | `16` | Number of cache shards |
-| `--maxmemory` | `GOPOGO_MAXMEMORY` | `0` | Maximum memory (e.g., 1GB) |
+| `--maxmemory` | `GOPOGO_MAXMEMORY` | `0` | Maximum memory: bytes with a k/m/g/t suffix (e.g. 1GB), a percentage of available memory (e.g. 80%; the container memory limit when set), or 0 for unlimited |
 | `--noevict` | `GOPOGO_NOEVICT` | `false` | Disable eviction |
 | `--nosixpack` | `GOPOGO_NOSIXPACK` | `false` | Disable sixpack key compression |
 | `--loadfactor` | `GOPOGO_LOADFACTOR` | `75` | Hashmap load factor percent (55-95) |
@@ -278,6 +278,20 @@ make integration    # Run pogocache's protocol tests against a live server
 docker build -t gopogo .
 docker run -p 6379:6379 -e GOPOGO_MAXMEMORY=512MB gopogo
 ```
+
+## Kubernetes
+
+A Helm chart is in `deploy/helm/gopogo`. It runs a Deployment, or a StatefulSet with a PersistentVolumeClaim per replica when persistence is enabled (the cache is loaded at startup and saved on shutdown). By default `--maxmemory` is 80% of the container memory limit, so set `resources.limits.memory`. Each replica is an independent cache.
+
+```bash
+helm install cache deploy/helm/gopogo \
+  --set protocols.http=true \
+  --set auth.enabled=true --set auth.password=s3cret \
+  --set persistence.enabled=true
+helm test cache
+```
+
+See `deploy/helm/gopogo/values.yaml` for all options. The chart uses the `grumpylabs/gopogo` image, tagged with the chart's `appVersion`; override `image.repository` and `image.tag` to use your own registry.
 
 ## License
 

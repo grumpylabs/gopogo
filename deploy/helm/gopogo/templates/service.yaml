@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "gopogo.fullname" . }}
+  labels:
+    {{- include "gopogo.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "gopogo.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: gopogo
+      port: {{ .Values.port }}
+      targetPort: gopogo
+      protocol: TCP
+    {{- if .Values.tls.enabled }}
+    - name: gopogo-tls
+      port: {{ .Values.tls.port }}
+      targetPort: gopogo-tls
+      protocol: TCP
+    {{- end }}
+{{- if .Values.persistence.enabled }}
+---
+# Governing Service for the StatefulSet: one DNS name per replica.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "gopogo.fullname" . }}-headless
+  labels:
+    {{- include "gopogo.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "gopogo.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: gopogo
+      port: {{ .Values.port }}
+      targetPort: gopogo
+      protocol: TCP
+{{- end }}
