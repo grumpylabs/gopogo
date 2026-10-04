@@ -65,6 +65,8 @@ func init() {
 	rootCmd.PersistentFlags().String("otlp-endpoint", "localhost:4317", "OTLP gRPC endpoint")
 	rootCmd.PersistentFlags().Bool("noevict", false, "Disable eviction (reject writes when full)")
 	rootCmd.PersistentFlags().Bool("nosixpack", false, "Disable sixpack key compression")
+	rootCmd.PersistentFlags().Int("loadfactor", 75, "Hashmap load factor percent (55-95)")
+	rootCmd.PersistentFlags().Bool("cas", false, "Assign compare-and-swap tokens on every write")
 
 	viper.BindPFlags(rootCmd.PersistentFlags())
 }
@@ -95,13 +97,17 @@ func runServer(cmd *cobra.Command, args []string) {
 	}
 
 	protocol.Version = version
+	validateFlags()
+	viper.Set("loadfactor", loadFactorPercent())
 	maxMemory := parseMemorySize(viper.GetString("maxmemory"))
 
 	c := cache.New(&cache.Options{
-		NumShards: viper.GetInt("shards"),
-		MaxMemory: maxMemory,
-		NoSixpack: viper.GetBool("nosixpack"),
-		NoEvict:   viper.GetBool("noevict"),
+		NumShards:  viper.GetInt("shards"),
+		MaxMemory:  maxMemory,
+		LoadFactor: float64(viper.GetInt("loadfactor")) / 100,
+		NoSixpack:  viper.GetBool("nosixpack"),
+		NoEvict:    viper.GetBool("noevict"),
+		UseCAS:     viper.GetBool("cas"),
 	})
 
 	// Initialize telemetry
@@ -168,6 +174,39 @@ func runServer(cmd *cobra.Command, args []string) {
 	}
 }
 
+// validateFlags exits with a message for flag values the server cannot start
+// with, matching pogocache's startup checks.
+func validateFlags() {
+	for _, name := range []string{"port", "tlsport"} {
+		if p := viper.GetInt(name); p < 0 || p > 65535 {
+			fmt.Fprintf(os.Stderr, "Option --%s is invalid\n", name)
+			os.Exit(1)
+		}
+	}
+	if viper.GetInt("port") == 0 && viper.GetInt("tlsport") == 0 && viper.GetString("socket") == "" {
+		fmt.Fprintln(os.Stderr, "Need to specify at least one valid port, tlsport or socket option")
+		os.Exit(1)
+	}
+	if viper.GetInt("tlsport") > 0 && (viper.GetString("tlscert") == "" || viper.GetString("tlskey") == "") {
+		fmt.Fprintln(os.Stderr, "Option --tlsport requires --tlscert and --tlskey")
+		os.Exit(1)
+	}
+}
+
+// loadFactorPercent returns --loadfactor clamped to 55-95, as pogocache does.
+func loadFactorPercent() int {
+	lf := viper.GetInt("loadfactor")
+	switch {
+	case lf < 55:
+		lf = 55
+		fmt.Println("loadfactor minimum set to 55")
+	case lf > 95:
+		lf = 95
+		fmt.Println("loadfactor maximum set to 95")
+	}
+	return lf
+}
+
 // loadPersist removes stale work files and loads path into c if it exists.
 // Any failure is fatal so a bad file is never overwritten at shutdown.
 func loadPersist(c *cache.Cache, path string) {
@@ -231,6 +270,7 @@ func printStartupBanner(c *cache.Cache, maxMemory int64) {
 	fmt.Printf("Host: %s:%d\n", viper.GetString("host"), viper.GetInt("port"))
 	fmt.Printf("Threads: %d\n", viper.GetInt("threads"))
 	fmt.Printf("Shards: %d\n", viper.GetInt("shards"))
+	fmt.Printf("Load factor: %d%%, CAS: %v\n", viper.GetInt("loadfactor"), viper.GetBool("cas"))
 	if p := viper.GetString("persist"); p != "" {
 		fmt.Printf("Persist: %s\n", p)
 	}

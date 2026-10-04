@@ -12,7 +12,25 @@ import (
 var (
 	ErrOverflow   = errors.New("increment or decrement would overflow")
 	ErrNotInteger = errors.New("value is not an integer or out of range")
+	ErrNotFound   = errors.New("not found")
 )
+
+// nextCAS returns the CAS token for a new write to shard, or 0 when CAS is
+// disabled. A non-zero want (e.g. restored from a save file) is kept and the
+// shard counter advanced past it. The caller must hold shard.mu for writing.
+func (c *Cache) nextCAS(shard *Shard, want uint64) uint64 {
+	if !c.useCAS {
+		return 0
+	}
+	if want != 0 {
+		if want > shard.cas {
+			shard.cas = want
+		}
+		return want
+	}
+	shard.cas++
+	return shard.cas
+}
 
 // StoreResult indicates the outcome of a Store operation.
 type StoreResult int
@@ -51,7 +69,6 @@ func (c *Cache) Store(key, value []byte, opts *StoreOptions) (StoreResult, error
 			entry.expireAt = time.Now().Add(opts.TTL).UnixNano()
 		}
 		entry.flags = opts.Flags
-		entry.cas = opts.CAS
 	}
 
 	shard.mu.Lock()
@@ -75,6 +92,12 @@ func (c *Cache) Store(key, value []byte, opts *StoreOptions) (StoreResult, error
 		if opts.KeepTTL && alive {
 			entry.expireAt = existing.expireAt
 		}
+	}
+
+	if opts != nil {
+		entry.cas = c.nextCAS(shard, opts.CAS)
+	} else {
+		entry.cas = c.nextCAS(shard, 0)
 	}
 
 	c.evictIfNeeded(shard, entry.Size(), hashKey(storeKey))
@@ -217,7 +240,7 @@ func (c *Cache) loadWithWrite(start time.Time, shard *Shard, lk []byte, opts *Lo
 			expireAt:   update.Expires,
 			flags:      update.Flags,
 			accessedAt: entry.accessedAt,
-			cas:        entry.cas + 1,
+			cas:        c.nextCAS(shard, 0),
 		}
 		oldEntry := entry
 		shard.m.buckets[idx].entry = newEntry
@@ -290,18 +313,21 @@ func (c *Cache) CompareAndSwap(key, value []byte, cas uint64, opts *StoreOptions
 	atomic.AddUint64(&shard.numOps, 1)
 
 	existing, idx := shard.m.getWithIndex(lk)
-	if existing == nil {
-		return false, nil
+	if existing == nil || existing.IsExpired() {
+		return false, ErrNotFound
 	}
 
-	if existing.CAS() != cas {
+	// With CAS disabled every compare-and-swap fails, as in pogocache.
+	if !c.useCAS || existing.CAS() != cas {
 		return false, nil
 	}
 
 	newEntry := &Entry{
-		key:   existing.key,
-		value: value,
-		cas:   existing.cas + 1,
+		key:        existing.key,
+		origKeyLen: existing.origKeyLen,
+		value:      value,
+		accessedAt: time.Now().UnixNano(),
+		cas:        c.nextCAS(shard, 0),
 	}
 	if opts != nil {
 		if opts.TTL > 0 {
@@ -402,7 +428,7 @@ func (c *Cache) Update(key []byte, fn func(cur []byte, found bool) ([]byte, erro
 			expireAt:   existing.expireAt,
 			accessedAt: now,
 			flags:      existing.flags,
-			cas:        existing.cas + 1,
+			cas:        c.nextCAS(shard, 0),
 		}
 		// Replace entry pointer in bucket
 		shard.m.buckets[idx].entry = newEntry
@@ -419,6 +445,7 @@ func (c *Cache) Update(key []byte, fn func(cur []byte, found bool) ([]byte, erro
 		origKeyLen: origLen,
 		value:      val,
 		accessedAt: now,
+		cas:        c.nextCAS(shard, 0),
 	}
 	c.evictIfNeeded(shard, entry.Size(), hashKey(storeKey))
 	if old := shard.m.insert(entry); old != nil {

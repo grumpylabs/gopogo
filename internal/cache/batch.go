@@ -71,7 +71,6 @@ func (b *Batch) Store(key, value []byte, opts *StoreOptions) StoreResult {
 			entry.expireAt = time.Now().Add(opts.TTL).UnixNano()
 		}
 		entry.flags = opts.Flags
-		entry.cas = opts.CAS
 	}
 
 	if opts != nil && (opts.NX || opts.XX || opts.KeepTTL) {
@@ -88,6 +87,12 @@ func (b *Batch) Store(key, value []byte, opts *StoreOptions) StoreResult {
 		if opts.KeepTTL && alive {
 			entry.expireAt = existing.expireAt
 		}
+	}
+
+	if opts != nil {
+		entry.cas = c.nextCAS(shard, opts.CAS)
+	} else {
+		entry.cas = c.nextCAS(shard, 0)
 	}
 
 	c.evictIfNeeded(shard, entry.Size(), hashKey(storeKey))

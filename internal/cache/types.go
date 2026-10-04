@@ -119,7 +119,8 @@ type Shard struct {
 	numMisses  uint64
 	numEvicted uint64
 	numExpired uint64
-	sweepPos   int // current position for incremental sweep
+	sweepPos   int    // current position for incremental sweep
+	cas        uint64 // last CAS token issued, guarded by mu
 }
 
 func newShard(maxMemory int64, loadFactor float64, allowShrink bool) *Shard {
@@ -183,6 +184,7 @@ type Options struct {
 	LoadFactor  float64 // 0.55–0.95, default 0.75
 	NoSixpack   bool    // disable sixpack key compression (enabled by default)
 	NoEvict     bool    // disable eviction (Store fails when memory is full)
+	UseCAS      bool    // assign a fresh CAS token on every write (pogocache --cas)
 	AllowShrink bool    // allow hash map shrinking on delete (default: always shrink)
 
 	// Evicted is called for every entry evicted due to expiration, low memory,
@@ -215,6 +217,7 @@ type Cache struct {
 	evicted     EvictedFunc
 	notify      NotifyFunc
 	noSixpack   bool
+	useCAS      bool
 	noEvict     bool
 	allowShrink bool
 }
@@ -258,6 +261,7 @@ func New(opts *Options) *Cache {
 		c.evicted = opts.Evicted
 		c.notify = opts.Notify
 		c.noSixpack = opts.NoSixpack
+		c.useCAS = opts.UseCAS
 		c.noEvict = opts.NoEvict
 		c.allowShrink = opts.AllowShrink
 	}

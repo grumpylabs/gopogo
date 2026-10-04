@@ -132,6 +132,10 @@ func (h *HTTPHandler) handleSet(writer *bufio.Writer, req *http.Request) {
 		if err == nil {
 			opts.CAS = casVal
 			success, err := h.cache.CompareAndSwap([]byte(path), body, casVal, opts)
+			if err == cache.ErrNotFound {
+				h.writeError(writer, http.StatusNotFound, "Not found")
+				return
+			}
 			if err != nil {
 				h.writeError(writer, http.StatusInternalServerError, err.Error())
 				return

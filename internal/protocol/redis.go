@@ -55,21 +55,26 @@ func (h *RedisHandler) Handle(conn net.Conn) {
 		
 		cmdName := strings.ToUpper(cmd[0])
 		
-		if !authenticated && cmdName != "AUTH" && cmdName != "PING" {
-			h.writeError(writer, "NOAUTH Authentication required")
+		if !authenticated && cmdName != "AUTH" {
+			h.writeError(writer, "NOAUTH Authentication required.")
 			writer.Flush()
 			continue
 		}
 		
 		switch cmdName {
 		case "AUTH":
-			if len(cmd) != 2 {
+			// Replies match pogocache. AUTH <user> <password> is not supported
+			// and always fails as a wrong password.
+			switch {
+			case len(cmd) == 1:
 				h.writeError(writer, "ERR wrong number of arguments for 'auth' command")
-			} else if cmd[1] == h.auth {
+			case len(cmd) > 3:
+				h.writeError(writer, "ERR syntax error")
+			case len(cmd) == 2 && cmd[1] == h.auth:
 				authenticated = true
 				h.writeSimpleString(writer, "OK")
-			} else {
-				h.writeError(writer, "ERR invalid password")
+			default:
+				h.writeError(writer, "WRONGPASS invalid username-password pair or user is disabled.")
 			}
 			
 		case "PING":
@@ -235,7 +240,16 @@ func (h *RedisHandler) Handle(conn net.Conn) {
 			return
 			
 		case "SELECT":
-			h.writeSimpleString(writer, "OK")
+			// Only database 0 exists.
+			if len(cmd) != 2 {
+				h.writeError(writer, "ERR wrong number of arguments for 'select' command")
+			} else if db, err := strconv.ParseInt(cmd[1], 10, 64); err != nil {
+				h.writeError(writer, "ERR value is not an integer or out of range")
+			} else if db != 0 {
+				h.writeError(writer, "ERR index is out of range")
+			} else {
+				h.writeSimpleString(writer, "OK")
+			}
 			
 		case "SAVE", "LOAD":
 			h.handleSaveLoad(writer, cmdName == "LOAD", cmd[1:])

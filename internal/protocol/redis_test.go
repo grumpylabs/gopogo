@@ -21,9 +21,13 @@ type respClient struct {
 }
 
 func newRESPClient(t *testing.T, c *cache.Cache) *respClient {
+	return newRESPClientAuth(t, c, "")
+}
+
+func newRESPClientAuth(t *testing.T, c *cache.Cache, auth string) *respClient {
 	t.Helper()
 	server, client := net.Pipe()
-	go NewRedisHandler(c, "", "").Handle(server)
+	go NewRedisHandler(c, auth, "").Handle(server)
 	t.Cleanup(func() { client.Close() })
 	return &respClient{t: t, conn: client, r: bufio.NewReader(client)}
 }
@@ -149,7 +153,7 @@ func TestRedisSetExAppend(t *testing.T) {
 }
 
 func TestRedisMGetS(t *testing.T) {
-	ch := cache.New(nil)
+	ch := cache.New(&cache.Options{UseCAS: true})
 	ch.Store([]byte("a"), []byte("1"), &cache.StoreOptions{Flags: 7, CAS: 42})
 	c := newRESPClient(t, ch)
 
@@ -235,6 +239,27 @@ func TestRedisAdminCommands(t *testing.T) {
 	c.expect(int64(0), "DBSIZE")
 }
 
+func TestRedisSelect(t *testing.T) {
+	c := newRESPClient(t, cache.New(nil))
+	c.expect("OK", "SELECT", "0")
+	c.expect(errReply("ERR index is out of range"), "SELECT", "1")
+	c.expect(errReply("ERR index is out of range"), "SELECT", "-1")
+	c.expect(errReply("ERR value is not an integer or out of range"), "SELECT", "db")
+	c.expect(errReply("ERR wrong number of arguments for 'select' command"), "SELECT")
+}
+
+func TestRedisAuth(t *testing.T) {
+	c := newRESPClientAuth(t, cache.New(nil), "secret")
+	c.expect(errReply("NOAUTH Authentication required."), "PING")
+	c.expect(errReply("NOAUTH Authentication required."), "GET", "k")
+	c.expect(errReply("WRONGPASS invalid username-password pair or user is disabled."), "AUTH", "nope")
+	c.expect(errReply("WRONGPASS invalid username-password pair or user is disabled."), "AUTH", "default", "secret")
+	c.expect(errReply("ERR syntax error"), "AUTH", "a", "b", "c")
+	c.expect(errReply("ERR wrong number of arguments for 'auth' command"), "AUTH")
+	c.expect("OK", "AUTH", "secret")
+	c.expect("PONG", "PING")
+}
+
 func TestMemcacheIncrDecr(t *testing.T) {
 	ch := cache.New(nil)
 	server, client := net.Pipe()
@@ -266,5 +291,58 @@ func TestMemcacheIncrDecr(t *testing.T) {
 	do("incr num x", "CLIENT_ERROR invalid numeric delta argument")
 	if e, _ := ch.Load([]byte("num")); string(e.Value()) != "0" {
 		t.Fatalf("stored value %q, want \"0\"", e.Value())
+	}
+}
+
+func TestMemcacheCAS(t *testing.T) {
+	for _, useCAS := range []bool{true, false} {
+		ch := cache.New(&cache.Options{UseCAS: useCAS})
+		server, client := net.Pipe()
+		go NewMemcacheHandler(ch).Handle(server)
+		r := bufio.NewReader(client)
+
+		send := func(cmd string) {
+			client.SetDeadline(time.Now().Add(5 * time.Second))
+			if _, err := client.Write([]byte(cmd + "\r\n")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		line := func() string {
+			l, err := r.ReadString('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			return strings.TrimSuffix(l, "\r\n")
+		}
+
+		send("set k 0 0 1\r\na")
+		line()
+		send("gets k")
+		fields := strings.Fields(line()) // VALUE k 0 1 <cas>
+		line()                           // data
+		line()                           // END
+		token := fields[4]
+
+		send("set k 0 0 1\r\nb") // another client's write
+		line()
+		send("cas k 0 0 1 " + token + "\r\nc")
+		if got := line(); got != "EXISTS" {
+			t.Fatalf("useCAS=%v: stale cas got %q, want EXISTS", useCAS, got)
+		}
+		send("cas missing 0 0 1 1\r\nc")
+		if got := line(); got != "NOT_FOUND" {
+			t.Fatalf("useCAS=%v: missing key cas got %q, want NOT_FOUND", useCAS, got)
+		}
+		if useCAS {
+			send("gets k")
+			token = strings.Fields(line())[4]
+			line()
+			line()
+			send("cas k 0 0 1 " + token + "\r\nc")
+			if got := line(); got != "STORED" {
+				t.Fatalf("current cas got %q, want STORED", got)
+			}
+		}
+		client.Close()
 	}
 }

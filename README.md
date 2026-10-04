@@ -74,6 +74,8 @@ gopogo --persist /var/lib/gopogo/data.pogo
 | `--maxmemory` | `GOPOGO_MAXMEMORY` | `0` | Maximum memory (e.g., 1GB) |
 | `--noevict` | `GOPOGO_NOEVICT` | `false` | Disable eviction |
 | `--nosixpack` | `GOPOGO_NOSIXPACK` | `false` | Disable sixpack key compression |
+| `--loadfactor` | `GOPOGO_LOADFACTOR` | `75` | Hashmap load factor percent (55-95) |
+| `--cas` | `GOPOGO_CAS` | `false` | Assign compare-and-swap tokens on every write. When off, memcache `cas` and HTTP `X-CAS` writes always fail |
 | `--autosweep` | `GOPOGO_AUTOSWEEP` | `true` | Enable background sweeping |
 | `--sweepinterval` | `GOPOGO_SWEEPINTERVAL` | `10s` | Sweep interval |
 | `--telemetry` | `GOPOGO_TELEMETRY` | `false` | Enable OpenTelemetry metrics |

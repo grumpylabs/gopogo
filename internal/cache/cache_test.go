@@ -102,7 +102,7 @@ func TestIncrement(t *testing.T) {
 }
 
 func TestCompareAndSwap(t *testing.T) {
-	c := New(nil)
+	c := New(&Options{UseCAS: true})
 	
 	key := []byte("cas-key")
 	value1 := []byte("value1")
@@ -129,6 +129,66 @@ func TestCompareAndSwap(t *testing.T) {
 	}
 	if success {
 		t.Fatal("CAS should have failed with old CAS value")
+	}
+}
+
+func TestCASTokens(t *testing.T) {
+	c := New(&Options{UseCAS: true}) // sixpack on by default
+	key := []byte("user:cas")
+
+	c.Store(key, []byte("a"), nil)
+	e, _ := c.Load(key)
+	first := e.CAS()
+	if first == 0 {
+		t.Fatal("Expected non-zero CAS token")
+	}
+
+	// A plain overwrite must issue a new token so a stale CAS fails.
+	c.Store(key, []byte("b"), nil)
+	e, _ = c.Load(key)
+	if e.CAS() == first {
+		t.Fatal("Store did not issue a new CAS token")
+	}
+	if ok, _ := c.CompareAndSwap(key, []byte("c"), first, nil); ok {
+		t.Fatal("CAS with stale token should fail")
+	}
+	if ok, err := c.CompareAndSwap(key, []byte("c"), e.CAS(), nil); !ok || err != nil {
+		t.Fatalf("CAS with current token should succeed: %v", err)
+	}
+	e, _ = c.Load(key)
+	if !bytes.Equal(e.Key(), key) || string(e.Value()) != "c" {
+		t.Fatalf("CAS corrupted entry: key=%q value=%q", e.Key(), e.Value())
+	}
+
+	// Read-modify-write paths issue a fresh token too.
+	c.Store([]byte("n"), []byte("1"), nil)
+	n1, _ := c.Load([]byte("n"))
+	c.Increment([]byte("n"), 1)
+	n2, _ := c.Load([]byte("n"))
+	if n2.CAS() <= n1.CAS() {
+		t.Fatalf("Increment did not issue a new CAS token: %d -> %d", n1.CAS(), n2.CAS())
+	}
+
+	if _, err := c.CompareAndSwap([]byte("missing"), []byte("x"), 1, nil); err != ErrNotFound {
+		t.Fatalf("Expected ErrNotFound for missing key, got %v", err)
+	}
+
+	// An explicit token (as restored from a save file) is kept.
+	c.Store([]byte("restored"), []byte("v"), &StoreOptions{CAS: 1000})
+	if r, _ := c.Load([]byte("restored")); r.CAS() != 1000 {
+		t.Fatalf("Explicit CAS not kept: %d", r.CAS())
+	}
+}
+
+func TestCASDisabled(t *testing.T) {
+	c := New(nil)
+	c.Store([]byte("k"), []byte("v"), &StoreOptions{CAS: 5})
+	e, _ := c.Load([]byte("k"))
+	if e.CAS() != 0 {
+		t.Fatalf("Expected CAS 0 when disabled, got %d", e.CAS())
+	}
+	if ok, err := c.CompareAndSwap([]byte("k"), []byte("x"), 0, nil); ok || err != nil {
+		t.Fatalf("CAS should always fail when disabled: ok=%v err=%v", ok, err)
 	}
 }
 
