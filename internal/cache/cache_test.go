@@ -845,6 +845,53 @@ func TestSaveLoadExpiredSkipped(t *testing.T) {
 	}
 }
 
+func TestCleanWorkFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.pogo")
+
+	stale := []string{
+		filepath.Join(dir, "data.pogo.123.pogocache.work"),
+		filepath.Join(dir, "data.pogo.456.pogocache.work"),
+	}
+	keep := []string{
+		path,
+		filepath.Join(dir, "other.pogo.789.pogocache.work"),
+	}
+	for _, f := range append(stale, keep...) {
+		if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	removed, err := CleanWorkFiles(path)
+	if err != nil {
+		t.Fatalf("CleanWorkFiles failed: %v", err)
+	}
+	if len(removed) != len(stale) {
+		t.Fatalf("Expected %d removed, got %d: %v", len(stale), len(removed), removed)
+	}
+	for _, f := range stale {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Fatalf("Stale work file %s still exists", f)
+		}
+	}
+	for _, f := range keep {
+		if _, err := os.Stat(f); err != nil {
+			t.Fatalf("File %s should have been kept: %v", f, err)
+		}
+	}
+
+	// A successful save leaves no work files behind.
+	c := New(&Options{NumShards: 1})
+	c.Store([]byte("k"), []byte("v"), nil)
+	if err := c.Save(path); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	if removed, _ := CleanWorkFiles(path); len(removed) != 0 {
+		t.Fatalf("Save left work files: %v", removed)
+	}
+}
+
 func TestBatch(t *testing.T) {
 	c := New(nil)
 

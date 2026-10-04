@@ -55,6 +55,9 @@ gopogo --telemetry --telemetry-exporter otlp --otlp-endpoint localhost:4317
 
 # Disable eviction (reject writes when full) and key compression
 gopogo --noevict --nosixpack
+
+# Load data at startup and save it on shutdown (SIGINT/SIGTERM)
+gopogo --persist /var/lib/gopogo/data.pogo
 ```
 
 ## Configuration
@@ -65,6 +68,7 @@ gopogo --noevict --nosixpack
 | `-p, --port` | `GOPOGO_PORT` | `6379` | Listening port |
 | `-s, --socket` | `GOPOGO_SOCKET` | | Unix socket path |
 | `--auth` | `GOPOGO_AUTH` | | Authentication password |
+| `--persist` | `GOPOGO_PERSIST` | | Persistence file loaded at startup and saved at shutdown |
 | `--threads` | `GOPOGO_THREADS` | CPU count | Number of threads |
 | `--shards` | `GOPOGO_SHARDS` | `16` | Number of cache shards |
 | `--maxmemory` | `GOPOGO_MAXMEMORY` | `0` | Maximum memory (e.g., 1GB) |
@@ -157,7 +161,9 @@ c.IterateShard(0, func(e *cache.Entry) bool { return true })
 
 ### Redis Protocol
 
-Supported commands: GET, SET (EX/PX/EXAT/PXAT/NX/XX/KEEPTTL), DEL, EXISTS, MGET, MSET, INCR, DECR, INCRBY, DECRBY, EXPIRE, TTL, PTTL, TOUCH, KEYS, SCAN, DBSIZE, FLUSHDB, FLUSHALL, INFO, PING, QUIT, SELECT, ECHO, AUTH.
+Supported commands: GET, SET (EX/PX/EXAT/PXAT/NX/XX/KEEPTTL), DEL, EXISTS, MGET, MSET, INCR, DECR, INCRBY, DECRBY, EXPIRE, TTL, PTTL, TOUCH, KEYS, SCAN, DBSIZE, FLUSHDB, FLUSHALL, INFO, PING, QUIT, SELECT, ECHO, AUTH, SAVE, LOAD.
+
+`SAVE [TO <path>] [FAST]` and `LOAD [FROM <path>] [FAST]` default to the `--persist` path. `LOAD` merges into the existing data rather than replacing it. `FAST` is accepted for pogocache compatibility.
 
 ```bash
 redis-cli -p 6379

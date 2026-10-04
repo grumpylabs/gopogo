@@ -27,7 +27,7 @@ type LoadStats struct {
 func (c *Cache) Save(path string) error {
 	start := time.Now()
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".pogocache.work.*")
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*"+workFileSuffix)
 	if err != nil {
 		c.recordPersist(start, true, false)
 		return fmt.Errorf("create work file: %w", err)
@@ -100,6 +100,39 @@ func (c *Cache) Save(path string) error {
 	}
 	c.recordPersist(start, true, true)
 	return nil
+}
+
+// workFileSuffix marks in-progress save files, matching pogocache's naming.
+const workFileSuffix = ".pogocache.work"
+
+// CleanWorkFiles removes work files left behind by an interrupted Save to
+// path. It returns the paths of the files that were removed.
+func CleanWorkFiles(path string) ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(path),
+		globEscape(filepath.Base(path))+".*"+workFileSuffix))
+	if err != nil {
+		return nil, err
+	}
+	var removed []string
+	for _, m := range matches {
+		if err := os.Remove(m); err != nil {
+			return removed, err
+		}
+		removed = append(removed, m)
+	}
+	return removed, nil
+}
+
+func globEscape(s string) string {
+	var b []byte
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '*', '?', '[', '\\':
+			b = append(b, '\\')
+		}
+		b = append(b, s[i])
+	}
+	return string(b)
 }
 
 // LoadFromFile reads cache entries from a persistence file at path.

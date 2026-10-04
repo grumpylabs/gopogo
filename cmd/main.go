@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -35,6 +36,7 @@ func init() {
 	rootCmd.PersistentFlags().IntP("port", "p", 6379, "Listening port")
 	rootCmd.PersistentFlags().StringP("socket", "s", "", "Unix socket path")
 	rootCmd.PersistentFlags().String("auth", "", "Authentication password")
+	rootCmd.PersistentFlags().String("persist", "", "Persistence file to load at startup and save at shutdown")
 
 	rootCmd.PersistentFlags().Int("threads", runtime.NumCPU(), "Number of threads")
 	rootCmd.PersistentFlags().Int("shards", 16, "Number of cache shards")
@@ -118,11 +120,17 @@ func runServer(cmd *cobra.Command, args []string) {
 		func() int64 { return int64(c.NumItems()) },
 	)
 
+	persist := viper.GetString("persist")
+	if persist != "" {
+		loadPersist(c, persist)
+	}
+
 	srv := server.New(&server.Config{
 		Host:     viper.GetString("host"),
 		Port:     viper.GetInt("port"),
 		Socket:   viper.GetString("socket"),
 		Auth:     viper.GetString("auth"),
+		Persist:  persist,
 		Threads:  viper.GetInt("threads"),
 		TLSPort:  viper.GetInt("tlsport"),
 		TLSCert:  viper.GetString("tlscert"),
@@ -145,6 +153,50 @@ func runServer(cmd *cobra.Command, args []string) {
 	if err := srv.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error starting server: %v\n", err)
 		os.Exit(1)
+	}
+
+	if persist != "" {
+		if !viper.GetBool("quiet") {
+			fmt.Printf("Saving data to %s, please wait...\n", persist)
+		}
+		if err := c.Save(persist); err != nil {
+			fmt.Fprintf(os.Stderr, "Save failed: %v\n", err)
+			os.Exit(1)
+		}
+	}
+}
+
+// loadPersist removes stale work files and loads path into c if it exists.
+// Any failure is fatal so a bad file is never overwritten at shutdown.
+func loadPersist(c *cache.Cache, path string) {
+	quiet := viper.GetBool("quiet")
+	removed, err := cache.CleanWorkFiles(path)
+	for _, f := range removed {
+		if !quiet {
+			fmt.Printf("Deleted work file %s\n", f)
+		}
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to clean work files: %v\n", err)
+		os.Exit(1)
+	}
+
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if !quiet {
+		fmt.Printf("Loading data from %s, please wait...\n", path)
+	}
+	start := time.Now()
+	stats, err := c.LoadFromFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Load failed: %v\n", err)
+		os.Exit(1)
+	}
+	if !quiet {
+		fmt.Printf("Loaded %d entries (%d expired) (%s in %.3f secs)\n",
+			stats.Inserted, stats.Expired, formatBytes(stats.CompressedSize),
+			time.Since(start).Seconds())
 	}
 }
 
@@ -177,6 +229,9 @@ func printStartupBanner(c *cache.Cache, maxMemory int64) {
 	fmt.Printf("Host: %s:%d\n", viper.GetString("host"), viper.GetInt("port"))
 	fmt.Printf("Threads: %d\n", viper.GetInt("threads"))
 	fmt.Printf("Shards: %d\n", viper.GetInt("shards"))
+	if p := viper.GetString("persist"); p != "" {
+		fmt.Printf("Persist: %s\n", p)
+	}
 
 	if maxMemory > 0 {
 		fmt.Printf("Max Memory: %s\n", formatBytes(maxMemory))

@@ -16,13 +16,17 @@ type RedisHandler struct {
 	cache        *cache.Cache
 	auth         string
 	authRequired bool
+	persist      string
 }
 
-func NewRedisHandler(cache *cache.Cache, auth string) *RedisHandler {
+// NewRedisHandler creates a Redis protocol handler. persist is the default
+// path used by SAVE and LOAD; it may be empty.
+func NewRedisHandler(cache *cache.Cache, auth, persist string) *RedisHandler {
 	return &RedisHandler{
 		cache:        cache,
 		auth:         auth,
 		authRequired: auth != "",
+		persist:      persist,
 	}
 }
 
@@ -212,6 +216,9 @@ func (h *RedisHandler) Handle(conn net.Conn) {
 		case "SELECT":
 			h.writeSimpleString(writer, "OK")
 			
+		case "SAVE", "LOAD":
+			h.handleSaveLoad(writer, cmdName == "LOAD", cmd[1:])
+
 		case "ECHO":
 			if len(cmd) != 2 {
 				h.writeError(writer, "ERR wrong number of arguments for 'echo' command")
@@ -279,6 +286,42 @@ func (h *RedisHandler) readArray(reader *bufio.Reader, line string) ([]string, e
 	}
 	
 	return args, nil
+}
+
+// handleSaveLoad implements SAVE [TO <path>] [FAST] and
+// LOAD [FROM <path>] [FAST]. FAST is accepted for pogocache compatibility.
+func (h *RedisHandler) handleSaveLoad(writer *bufio.Writer, load bool, args []string) {
+	path := h.persist
+	for i := 0; i < len(args); i++ {
+		arg := strings.ToUpper(args[i])
+		switch {
+		case arg == "FAST":
+		case (load && arg == "FROM") || (!load && arg == "TO"):
+			i++
+			if i == len(args) {
+				h.writeError(writer, "ERR syntax error")
+				return
+			}
+			path = args[i]
+		default:
+			h.writeError(writer, "ERR syntax error")
+			return
+		}
+	}
+	if path == "" {
+		h.writeError(writer, "ERR path not provided")
+		return
+	}
+	if load {
+		if _, err := h.cache.LoadFromFile(path); err != nil {
+			h.writeError(writer, "load failed")
+			return
+		}
+	} else if err := h.cache.Save(path); err != nil {
+		h.writeError(writer, "save failed")
+		return
+	}
+	h.writeSimpleString(writer, "OK")
 }
 
 func (h *RedisHandler) writeError(writer *bufio.Writer, msg string) {

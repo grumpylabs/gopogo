@@ -21,6 +21,7 @@ type Config struct {
 	Port          int
 	Socket        string
 	Auth          string
+	Persist       string
 	Threads       int
 	TLSPort       int
 	TLSCert       string
@@ -61,7 +62,7 @@ func New(config *Config) *Server {
 	}
 	
 	if config.Redis {
-		s.redisHandler = protocol.NewRedisHandler(config.Cache, config.Auth)
+		s.redisHandler = protocol.NewRedisHandler(config.Cache, config.Auth, config.Persist)
 	}
 	if config.HTTP {
 		s.httpHandler = protocol.NewHTTPHandler(config.Cache, config.Auth)
