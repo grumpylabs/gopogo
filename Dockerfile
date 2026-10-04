@@ -1,4 +1,4 @@
-FROM golang:1.24-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 RUN apk add --no-cache git make
 
@@ -22,4 +22,4 @@ COPY --from=builder /build/bin/gopogo /app/gopogo
 EXPOSE 6379 8080 11211 5432
 
 ENTRYPOINT ["/app/gopogo"]
-CMD ["-h", "0.0.0.0"]
+CMD ["--host", "0.0.0.0"]

@@ -42,7 +42,7 @@ go install github.com/grumpylabs/gopogo/cmd/gopogo@latest
 gopogo
 
 # Start with specific settings
-gopogo -h 0.0.0.0 -p 6380 --maxmemory 1GB
+gopogo --host 0.0.0.0 -p 6380 --maxmemory 1GB
 
 # Enable multiple protocols
 gopogo --redis --http --memcache
@@ -64,7 +64,7 @@ gopogo --persist /var/lib/gopogo/data.pogo
 
 | Flag | Environment | Default | Description |
 |------|-------------|---------|-------------|
-| `-h, --host` | `GOPOGO_HOST` | `127.0.0.1` | Listening hostname |
+| `--host` | `GOPOGO_HOST` | `127.0.0.1` | Listening hostname |
 | `-p, --port` | `GOPOGO_PORT` | `6379` | Listening port |
 | `-s, --socket` | `GOPOGO_SOCKET` | | Unix socket path |
 | `--auth` | `GOPOGO_AUTH` | | Authentication password |
