@@ -8,6 +8,8 @@ import (
 	"os"
 	"strconv"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // listenTCP opens a TCP listener with an explicit accept backlog and optional
@@ -46,7 +48,7 @@ func listenTCP(host string, port, backlog int, reusePort bool) (net.Listener, er
 		return nil, os.NewSyscallError("setsockopt SO_REUSEADDR", err)
 	}
 	if reusePort {
-		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1); err != nil {
+		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
 			return nil, os.NewSyscallError("setsockopt SO_REUSEPORT", err)
 		}
 	}
