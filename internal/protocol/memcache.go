@@ -28,6 +28,7 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 	
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
+	addr := conn.RemoteAddr().String()
 	
 	for {
 		line, err := reader.ReadString('\n')
@@ -50,6 +51,7 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 		}
 		
 		cmd := strings.ToLower(parts[0])
+		monitors.publish(addr, parts)
 		
 		switch cmd {
 		case "get", "gets":
@@ -273,7 +275,7 @@ func (h *MemcacheHandler) handleCAS(reader *bufio.Reader, writer *bufio.Writer, 
 	}
 }
 
-func (h *MemcacheHandler) handleAppend(reader *bufio.Reader, writer *bufio.Writer, parts []string, append bool) {
+func (h *MemcacheHandler) handleAppend(reader *bufio.Reader, writer *bufio.Writer, parts []string, isAppend bool) {
 	if len(parts) < 5 {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
@@ -297,28 +299,25 @@ func (h *MemcacheHandler) handleAppend(reader *bufio.Reader, writer *bufio.Write
 	
 	reader.ReadString('\n')
 	
-	entry, found := h.cache.Load([]byte(key))
-	if !found {
+	// Update is atomic and keeps the entry's flags and TTL.
+	err = h.cache.Update([]byte(key), func(cur []byte, found bool) ([]byte, error) {
+		if !found {
+			return nil, errMemcacheNotFound
+		}
+		out := make([]byte, 0, len(cur)+len(data))
+		if isAppend {
+			out = append(append(out, cur...), data...)
+		} else {
+			out = append(append(out, data...), cur...)
+		}
+		return out, nil
+	})
+	if err != nil {
 		if !noreply {
 			writer.WriteString("NOT_STORED\r\n")
 		}
 		return
 	}
-	
-	var newValue []byte
-	if append {
-		newValue = make([]byte, len(entry.Value())+len(data))
-		copy(newValue, entry.Value())
-		copy(newValue[len(entry.Value()):], data)
-	} else {
-		newValue = make([]byte, len(data)+len(entry.Value()))
-		copy(newValue, data)
-		copy(newValue[len(data):], entry.Value())
-	}
-	
-	h.cache.Store([]byte(key), newValue, &cache.StoreOptions{
-		Flags: entry.Flags(),
-	})
 	
 	if !noreply {
 		writer.WriteString("STORED\r\n")

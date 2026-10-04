@@ -2,8 +2,8 @@ name: integration
 
 # Runs pogocache's protocol tests (test/integration) against a live server.
 # The job graph is deliberately richer than ci.yml (artifact hand-off, a
-# matrix, a job allowed to fail, an always-run summary) so it also exercises
-# the GitHub webhook collector with workflow_job events of several shapes.
+# matrix, an always-run summary) so it also exercises the GitHub webhook
+# collector with workflow_job events of several shapes.
 
 on:
   push:
@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        protocol: [resp, memcache, http]
+        protocol: [resp, memcache, http, postgres]
         include:
           - protocol: resp
             tests: ^TestRESP
@@ -43,6 +43,8 @@ jobs:
             tests: ^TestMemcache
           - protocol: http
             tests: ^TestHTTP
+          - protocol: postgres
+            tests: ^TestPostgres
     steps:
       - uses: actions/checkout@v7
 
@@ -65,44 +67,14 @@ jobs:
       - name: make
         run: make integration-run INTEGRATION_RUN='${{ matrix.tests }}'
 
-  # TestPostgres fails until gopogo supports the Postgres extended query
-  # protocol. The job runs anyway, and continue-on-error keeps the run green,
-  # so the run reports a failed job inside a successful workflow.
-  postgres:
-    needs: build
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: |
-            go.sum
-            test/integration/go.sum
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: gopogo
-          path: bin
-
-      - name: chmod
-        run: chmod +x bin/gopogo
-
-      - name: make
-        run: make integration-run INTEGRATION_RUN='^TestPostgres$' INTEGRATION_SKIP=
-
   summary:
-    needs: [integration, postgres]
+    needs: integration
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: results
         env:
           INTEGRATION: ${{ needs.integration.result }}
-          POSTGRES: ${{ needs.postgres.result }}
         run: |
           echo "integration: $INTEGRATION"
-          echo "postgres:    $POSTGRES (known gap, allowed to fail)"
           test "$INTEGRATION" = success

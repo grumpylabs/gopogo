@@ -3,6 +3,7 @@ package protocol
 import (
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/grumpylabs/gopogo/internal/cache"
@@ -13,6 +14,15 @@ import (
 var Version = "dev"
 
 var startTime = time.Now()
+
+// ConnStats holds server connection counters reported by STATS. The server
+// updates them as it accepts and closes connections.
+var ConnStats struct {
+	Max      int64
+	Curr     atomic.Int64
+	Total    atomic.Int64
+	Rejected atomic.Int64
+}
 
 // statLines returns server stats as name/value pairs in the order pogocache's
 // STATS command reports them, limited to what gopogo tracks.
@@ -38,6 +48,10 @@ func statLines(c *cache.Cache) [][2]string {
 		{"product", "gopogo"},
 		{"version", Version},
 		{"pointer_size", strconv.Itoa(strconv.IntSize)},
+		{"max_connections", strconv.FormatInt(ConnStats.Max, 10)},
+		{"curr_connections", strconv.FormatInt(ConnStats.Curr.Load(), 10)},
+		{"total_connections", strconv.FormatInt(ConnStats.Total.Load(), 10)},
+		{"rejected_connections", strconv.FormatInt(ConnStats.Rejected.Load(), 10)},
 		{"cmd_get", strconv.FormatUint(hits+misses, 10)},
 		{"get_hits", num(s["num_hits"])},
 		{"get_misses", num(s["num_misses"])},

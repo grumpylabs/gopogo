@@ -4,268 +4,136 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"math"
 	"net"
-	"runtime/debug"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/grumpylabs/gopogo/internal/cache"
 )
 
+// RedisHandler serves the RESP protocol (and RESP inline/telnet commands).
 type RedisHandler struct {
-	cache        *cache.Cache
-	auth         string
-	authRequired bool
-	persist      string
+	exec *Executor
 }
 
 // NewRedisHandler creates a Redis protocol handler. persist is the default
 // path used by SAVE and LOAD; it may be empty.
 func NewRedisHandler(cache *cache.Cache, auth, persist string) *RedisHandler {
-	return &RedisHandler{
-		cache:        cache,
-		auth:         auth,
-		authRequired: auth != "",
-		persist:      persist,
-	}
+	return &RedisHandler{exec: NewExecutor(cache, auth, persist)}
 }
 
 func (h *RedisHandler) Handle(conn net.Conn) {
 	defer conn.Close()
-	
+
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
-	authenticated := !h.authRequired
-	
+	s := &session{
+		proto:  TypeRedis,
+		addr:   conn.RemoteAddr().String(),
+		authed: h.exec.auth == "",
+	}
+
 	for {
 		cmd, err := h.readCommand(reader)
 		if err != nil {
 			if err != io.EOF {
-				h.writeError(writer, err.Error())
+				writeRESP(writer, rv{kind: '-', s: err.Error()})
 				writer.Flush()
 			}
 			return
 		}
-		
 		if len(cmd) == 0 {
 			continue
 		}
-		
-		cmdName := strings.ToUpper(cmd[0])
-		
-		if !authenticated && cmdName != "AUTH" {
-			h.writeError(writer, "NOAUTH Authentication required.")
-			writer.Flush()
-			continue
+
+		r := h.exec.exec(s, cmd)
+		var lines chan string
+		if r.monitor {
+			// Subscribe before replying so no command after the OK is missed.
+			lines = monitors.subscribe()
 		}
-		
-		switch cmdName {
-		case "AUTH":
-			// Replies match pogocache. AUTH <user> <password> is not supported
-			// and always fails as a wrong password.
-			switch {
-			case len(cmd) == 1:
-				h.writeError(writer, "ERR wrong number of arguments for 'auth' command")
-			case len(cmd) > 3:
-				h.writeError(writer, "ERR syntax error")
-			case len(cmd) == 2 && cmd[1] == h.auth:
-				authenticated = true
-				h.writeSimpleString(writer, "OK")
-			default:
-				h.writeError(writer, "WRONGPASS invalid username-password pair or user is disabled.")
-			}
-			
-		case "PING":
-			if len(cmd) == 1 {
-				h.writeSimpleString(writer, "PONG")
-			} else {
-				h.writeBulkString(writer, cmd[1])
-			}
-			
-		case "GET":
-			if len(cmd) != 2 {
-				h.writeError(writer, "ERR wrong number of arguments for 'get' command")
-			} else {
-				h.handleGet(writer, cmd[1])
-			}
-			
-		case "SET":
-			if len(cmd) < 3 {
-				h.writeError(writer, "ERR wrong number of arguments for 'set' command")
-			} else {
-				h.handleSet(writer, cmd[1:])
-			}
-			
-		case "DEL":
-			if len(cmd) < 2 {
-				h.writeError(writer, "ERR wrong number of arguments for 'del' command")
-			} else {
-				h.handleDel(writer, cmd[1:])
-			}
-			
-		case "EXISTS":
-			if len(cmd) < 2 {
-				h.writeError(writer, "ERR wrong number of arguments for 'exists' command")
-			} else {
-				h.handleExists(writer, cmd[1:])
-			}
-			
-		case "INCR", "DECR", "UINCR", "UDECR":
-			if len(cmd) != 2 {
-				h.writeError(writer, fmt.Sprintf("ERR wrong number of arguments for '%s' command", strings.ToLower(cmdName)))
-			} else {
-				h.handleIncr(writer, cmdName, cmd[1], "1")
-			}
-
-		case "INCRBY", "DECRBY", "UINCRBY", "UDECRBY":
-			if len(cmd) != 3 {
-				h.writeError(writer, fmt.Sprintf("ERR wrong number of arguments for '%s' command", strings.ToLower(cmdName)))
-			} else {
-				h.handleIncr(writer, cmdName, cmd[1], cmd[2])
-			}
-
-		case "SETEX":
-			if len(cmd) != 4 {
-				h.writeError(writer, "ERR wrong number of arguments for 'setex' command")
-			} else {
-				h.handleSetEx(writer, cmd[1], cmd[2], cmd[3])
-			}
-
-		case "APPEND", "PREPEND":
-			if len(cmd) != 3 {
-				h.writeError(writer, fmt.Sprintf("ERR wrong number of arguments for '%s' command", strings.ToLower(cmdName)))
-			} else {
-				h.handleAppend(writer, cmdName == "PREPEND", cmd[1], cmd[2])
-			}
-
-		case "MGETS":
-			if len(cmd) < 2 {
-				h.writeError(writer, "ERR wrong number of arguments for 'mgets' command")
-			} else {
-				h.handleMGetS(writer, cmd[1:])
-			}
-
-		case "SCAN":
-			if len(cmd) < 2 {
-				h.writeError(writer, "ERR wrong number of arguments for 'scan' command")
-			} else {
-				h.handleScan(writer, cmd[1:])
-			}
-
-		case "VERSION":
-			h.writeSimpleString(writer, Version)
-
-		case "STATS":
-			if len(cmd) != 1 {
-				h.writeError(writer, "ERR syntax error")
-			} else {
-				h.handleStats(writer)
-			}
-
-		case "SWEEP":
-			h.handleSweep(writer, cmd[1:])
-
-		case "PURGE":
-			h.handlePurge(writer, cmd[1:])
-
-		case "MGET":
-			if len(cmd) < 2 {
-				h.writeError(writer, "ERR wrong number of arguments for 'mget' command")
-			} else {
-				h.handleMGet(writer, cmd[1:])
-			}
-			
-		case "MSET":
-			if len(cmd) < 3 || len(cmd)%2 == 0 {
-				h.writeError(writer, "ERR wrong number of arguments for 'mset' command")
-			} else {
-				h.handleMSet(writer, cmd[1:])
-			}
-			
-		case "EXPIRE":
-			if len(cmd) != 3 {
-				h.writeError(writer, "ERR wrong number of arguments for 'expire' command")
-			} else {
-				h.handleExpire(writer, cmd[1], cmd[2])
-			}
-			
-		case "TTL":
-			if len(cmd) != 2 {
-				h.writeError(writer, "ERR wrong number of arguments for 'ttl' command")
-			} else {
-				h.handleTTL(writer, cmd[1])
-			}
-			
-		case "KEYS":
-			if len(cmd) != 2 {
-				h.writeError(writer, "ERR wrong number of arguments for 'keys' command")
-			} else {
-				h.handleKeys(writer, cmd[1])
-			}
-			
-		case "FLUSH", "FLUSHDB", "FLUSHALL":
-			h.handleFlush(writer, cmd[1:])
-			
-		case "DBSIZE":
-			h.writeInteger(writer, int64(h.cache.NumItems()))
-
-		case "TOUCH":
-			if len(cmd) < 2 {
-				h.writeError(writer, "ERR wrong number of arguments for 'touch' command")
-			} else {
-				touched := int64(0)
-				for _, k := range cmd[1:] {
-					if _, found := h.cache.LoadWithOptions([]byte(k), nil); found {
-						touched++
-					}
-				}
-				h.writeInteger(writer, touched)
-			}
-
-		case "PTTL":
-			if len(cmd) != 2 {
-				h.writeError(writer, "ERR wrong number of arguments for 'pttl' command")
-			} else {
-				h.handlePTTL(writer, cmd[1])
-			}
-			
-		case "INFO":
-			h.handleInfo(writer)
-			
-		case "QUIT":
-			h.writeSimpleString(writer, "OK")
-			writer.Flush()
-			return
-			
-		case "SELECT":
-			// Only database 0 exists.
-			if len(cmd) != 2 {
-				h.writeError(writer, "ERR wrong number of arguments for 'select' command")
-			} else if db, err := strconv.ParseInt(cmd[1], 10, 64); err != nil {
-				h.writeError(writer, "ERR value is not an integer or out of range")
-			} else if db != 0 {
-				h.writeError(writer, "ERR index is out of range")
-			} else {
-				h.writeSimpleString(writer, "OK")
-			}
-			
-		case "SAVE", "LOAD":
-			h.handleSaveLoad(writer, cmdName == "LOAD", cmd[1:])
-
-		case "ECHO":
-			if len(cmd) != 2 {
-				h.writeError(writer, "ERR wrong number of arguments for 'echo' command")
-			} else {
-				h.writeBulkString(writer, cmd[1])
-			}
-			
-		default:
-			h.writeError(writer, fmt.Sprintf("ERR unknown command '%s'", cmdName))
+		if r.err != "" {
+			writeRESP(writer, rv{kind: '-', s: r.err})
+		} else {
+			writeRESP(writer, r.resp)
 		}
-		
 		writer.Flush()
+		if r.quit {
+			return
+		}
+		if r.monitor {
+			h.monitor(reader, writer, lines)
+			return
+		}
+	}
+}
+
+// monitor streams the subscribed command lines until the client sends QUIT
+// or disconnects. Other input is ignored.
+func (h *RedisHandler) monitor(reader *bufio.Reader, writer *bufio.Writer, lines chan string) {
+	defer monitors.unsubscribe(lines)
+
+	quit := make(chan bool, 1) // true: client sent QUIT
+	go func() {
+		for {
+			cmd, err := h.readCommand(reader)
+			if err != nil {
+				quit <- false
+				return
+			}
+			if len(cmd) > 0 && strings.EqualFold(cmd[0], "QUIT") {
+				quit <- true
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case line := <-lines:
+			writer.WriteString(line)
+			// Batch whatever else is queued into one write.
+			for n := len(lines); n > 0; n-- {
+				writer.WriteString(<-lines)
+			}
+			if writer.Flush() != nil {
+				return
+			}
+		case sentQuit := <-quit:
+			if sentQuit {
+				writeRESP(writer, rvOK())
+				writer.Flush()
+			}
+			return
+		}
+	}
+}
+
+// writeRESP writes v in RESP2. Unsigned values are written as simple
+// strings, as pogocache does, since they may not fit a RESP integer.
+func writeRESP(w *bufio.Writer, v rv) {
+	switch v.kind {
+	case '+', '-':
+		w.WriteByte(v.kind)
+		w.WriteString(v.s)
+		w.WriteString("\r\n")
+	case ':':
+		w.WriteString(":" + strconv.FormatInt(v.n, 10) + "\r\n")
+	case 'u':
+		w.WriteString("+" + strconv.FormatUint(v.u, 10) + "\r\n")
+	case '$':
+		w.WriteString("$" + strconv.Itoa(len(v.s)) + "\r\n")
+		w.WriteString(v.s)
+		w.WriteString("\r\n")
+	case '_':
+		w.WriteString("$-1\r\n")
+	case '*':
+		w.WriteString("*" + strconv.Itoa(len(v.arr)) + "\r\n")
+		for _, e := range v.arr {
+			writeRESP(w, e)
+		}
+	default:
+		panic(fmt.Sprintf("writeRESP: unknown kind %q", v.kind))
 	}
 }
 
@@ -274,16 +142,16 @@ func (h *RedisHandler) readCommand(reader *bufio.Reader) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	line = strings.TrimSpace(line)
 	if len(line) == 0 {
 		return nil, nil
 	}
-	
+
 	if line[0] == '*' {
 		return h.readArray(reader, line)
 	}
-	
+
 	return strings.Fields(line), nil
 }
 
@@ -292,618 +160,36 @@ func (h *RedisHandler) readArray(reader *bufio.Reader, line string) ([]string, e
 	if err != nil {
 		return nil, err
 	}
-	
+
 	args := make([]string, 0, count)
-	
+
 	for i := 0; i < count; i++ {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			return nil, err
 		}
-		
+
 		line = strings.TrimSpace(line)
 		if len(line) == 0 || line[0] != '$' {
 			return nil, fmt.Errorf("expected bulk string")
 		}
-		
+
 		size, err := strconv.Atoi(line[1:])
 		if err != nil {
 			return nil, err
 		}
-		
+
 		buf := make([]byte, size+2)
 		_, err = io.ReadFull(reader, buf)
 		if err != nil {
 			return nil, err
 		}
-		
+
 		args = append(args, string(buf[:size]))
 	}
-	
+
 	return args, nil
 }
 
 // handleSaveLoad implements SAVE [TO <path>] [FAST] and
 // LOAD [FROM <path>] [FAST]. FAST is accepted for pogocache compatibility.
-func (h *RedisHandler) handleSaveLoad(writer *bufio.Writer, load bool, args []string) {
-	path := h.persist
-	for i := 0; i < len(args); i++ {
-		arg := strings.ToUpper(args[i])
-		switch {
-		case arg == "FAST":
-		case (load && arg == "FROM") || (!load && arg == "TO"):
-			i++
-			if i == len(args) {
-				h.writeError(writer, "ERR syntax error")
-				return
-			}
-			path = args[i]
-		default:
-			h.writeError(writer, "ERR syntax error")
-			return
-		}
-	}
-	if path == "" {
-		h.writeError(writer, "ERR path not provided")
-		return
-	}
-	if load {
-		if _, err := h.cache.LoadFromFile(path); err != nil {
-			h.writeError(writer, "load failed")
-			return
-		}
-	} else if err := h.cache.Save(path); err != nil {
-		h.writeError(writer, "save failed")
-		return
-	}
-	h.writeSimpleString(writer, "OK")
-}
-
-func (h *RedisHandler) writeError(writer *bufio.Writer, msg string) {
-	writer.WriteString("-")
-	writer.WriteString(msg)
-	writer.WriteString("\r\n")
-}
-
-func (h *RedisHandler) writeSimpleString(writer *bufio.Writer, msg string) {
-	writer.WriteString("+")
-	writer.WriteString(msg)
-	writer.WriteString("\r\n")
-}
-
-func (h *RedisHandler) writeInteger(writer *bufio.Writer, n int64) {
-	writer.WriteString(":")
-	writer.WriteString(strconv.FormatInt(n, 10))
-	writer.WriteString("\r\n")
-}
-
-// writeUint writes an unsigned value as a simple string, as pogocache does,
-// since it may not fit a RESP (signed 64-bit) integer.
-func (h *RedisHandler) writeUint(writer *bufio.Writer, n uint64) {
-	writer.WriteString("+")
-	writer.WriteString(strconv.FormatUint(n, 10))
-	writer.WriteString("\r\n")
-}
-
-func (h *RedisHandler) writeBulkString(writer *bufio.Writer, s string) {
-	writer.WriteString("$")
-	writer.WriteString(strconv.Itoa(len(s)))
-	writer.WriteString("\r\n")
-	writer.WriteString(s)
-	writer.WriteString("\r\n")
-}
-
-func (h *RedisHandler) writeNil(writer *bufio.Writer) {
-	writer.WriteString("$-1\r\n")
-}
-
-func (h *RedisHandler) writeArray(writer *bufio.Writer, items []string) {
-	writer.WriteString("*")
-	writer.WriteString(strconv.Itoa(len(items)))
-	writer.WriteString("\r\n")
-	
-	for _, item := range items {
-		h.writeBulkString(writer, item)
-	}
-}
-
-func (h *RedisHandler) handleGet(writer *bufio.Writer, key string) {
-	entry, found := h.cache.Load([]byte(key))
-	if !found {
-		h.writeNil(writer)
-		return
-	}
-	
-	h.writeBulkString(writer, string(entry.Value()))
-}
-
-func (h *RedisHandler) handleSet(writer *bufio.Writer, args []string) {
-	key := args[0]
-	value := args[1]
-	
-	opts := &cache.StoreOptions{}
-	
-	for i := 2; i < len(args); i++ {
-		switch strings.ToUpper(args[i]) {
-		case "EX":
-			if i+1 < len(args) {
-				seconds, err := strconv.Atoi(args[i+1])
-				if err == nil {
-					opts.TTL = time.Duration(seconds) * time.Second
-				}
-				i++
-			}
-		case "PX":
-			if i+1 < len(args) {
-				millis, err := strconv.Atoi(args[i+1])
-				if err == nil {
-					opts.TTL = time.Duration(millis) * time.Millisecond
-				}
-				i++
-			}
-		case "EXAT":
-			if i+1 < len(args) {
-				ts, err := strconv.ParseInt(args[i+1], 10, 64)
-				if err == nil {
-					dur := time.Until(time.Unix(ts, 0))
-					if dur > 0 {
-						opts.TTL = dur
-					}
-				}
-				i++
-			}
-		case "PXAT":
-			if i+1 < len(args) {
-				tsMs, err := strconv.ParseInt(args[i+1], 10, 64)
-				if err == nil {
-					dur := time.Until(time.Unix(0, tsMs*int64(time.Millisecond)))
-					if dur > 0 {
-						opts.TTL = dur
-					}
-				}
-				i++
-			}
-		case "NX":
-			opts.NX = true
-		case "XX":
-			opts.XX = true
-		case "KEEPTTL":
-			opts.KeepTTL = true
-		}
-	}
-
-	result, _ := h.cache.Store([]byte(key), []byte(value), opts)
-	if result == cache.NotStored {
-		h.writeNil(writer)
-		return
-	}
-	h.writeSimpleString(writer, "OK")
-}
-
-func (h *RedisHandler) handleDel(writer *bufio.Writer, keys []string) {
-	deleted := int64(0)
-	for _, key := range keys {
-		if h.cache.Delete([]byte(key)) {
-			deleted++
-		}
-	}
-	h.writeInteger(writer, deleted)
-}
-
-func (h *RedisHandler) handleExists(writer *bufio.Writer, keys []string) {
-	exists := int64(0)
-	for _, key := range keys {
-		if entry, _ := h.cache.Load([]byte(key)); entry != nil {
-			exists++
-		}
-	}
-	h.writeInteger(writer, exists)
-}
-
-// handleIncr implements INCR, DECR, INCRBY, DECRBY and their unsigned
-// U-prefixed variants. Values are stored as decimal text.
-func (h *RedisHandler) handleIncr(writer *bufio.Writer, cmdName, key, deltaStr string) {
-	decr := strings.HasSuffix(cmdName, "DECR") || strings.HasSuffix(cmdName, "DECRBY")
-	var err error
-	if strings.HasPrefix(cmdName, "U") {
-		var delta, n uint64
-		if delta, err = strconv.ParseUint(deltaStr, 10, 64); err != nil {
-			h.writeError(writer, "ERR value is not an integer or out of range")
-			return
-		}
-		if n, err = h.cache.IncrementUnsigned([]byte(key), delta, decr); err == nil {
-			h.writeUint(writer, n)
-			return
-		}
-	} else {
-		var delta, n int64
-		if delta, err = strconv.ParseInt(deltaStr, 10, 64); err != nil {
-			h.writeError(writer, "ERR value is not an integer or out of range")
-			return
-		}
-		if decr {
-			if delta == math.MinInt64 {
-				h.writeError(writer, "ERR increment or decrement would overflow")
-				return
-			}
-			delta = -delta
-		}
-		if n, err = h.cache.Increment([]byte(key), delta); err == nil {
-			h.writeInteger(writer, n)
-			return
-		}
-	}
-	h.writeError(writer, "ERR "+err.Error())
-}
-
-func (h *RedisHandler) handleSetEx(writer *bufio.Writer, key, secondsStr, value string) {
-	seconds, err := strconv.ParseInt(secondsStr, 10, 64)
-	if err != nil || seconds <= 0 || seconds > math.MaxInt64/int64(time.Second) {
-		h.writeError(writer, "ERR invalid expire time")
-		return
-	}
-	h.cache.Store([]byte(key), []byte(value), &cache.StoreOptions{
-		TTL: time.Duration(seconds) * time.Second,
-	})
-	h.writeSimpleString(writer, "OK")
-}
-
-// handleAppend implements APPEND and PREPEND, creating the key if missing and
-// preserving the flags and TTL of an existing one.
-func (h *RedisHandler) handleAppend(writer *bufio.Writer, prepend bool, key, value string) {
-	var n int
-	h.cache.Update([]byte(key), func(cur []byte, found bool) ([]byte, error) {
-		out := make([]byte, 0, len(cur)+len(value))
-		if prepend {
-			out = append(append(out, value...), cur...)
-		} else {
-			out = append(append(out, cur...), value...)
-		}
-		n = len(out)
-		return out, nil
-	})
-	h.writeInteger(writer, int64(n))
-}
-
-// handleMGetS is MGET that returns [flags, cas, value] for each found key.
-func (h *RedisHandler) handleMGetS(writer *bufio.Writer, keys []string) {
-	writer.WriteString("*")
-	writer.WriteString(strconv.Itoa(len(keys)))
-	writer.WriteString("\r\n")
-	for _, key := range keys {
-		entry, found := h.cache.Load([]byte(key))
-		if !found {
-			h.writeNil(writer)
-			continue
-		}
-		writer.WriteString("*3\r\n")
-		h.writeUint(writer, uint64(entry.Flags()))
-		h.writeUint(writer, entry.CAS())
-		h.writeBulkString(writer, string(entry.Value()))
-	}
-}
-
-// handleScan implements SCAN cursor [MATCH pattern] [COUNT count] [TYPE type].
-func (h *RedisHandler) handleScan(writer *bufio.Writer, args []string) {
-	cursor, err := strconv.ParseUint(args[0], 10, 64)
-	if err != nil {
-		h.writeError(writer, "ERR invalid cursor")
-		return
-	}
-	pattern := "*"
-	count := 100
-	for i := 1; i < len(args); i++ {
-		opt := strings.ToUpper(args[i])
-		if i+1 == len(args) {
-			h.writeError(writer, "ERR syntax error")
-			return
-		}
-		i++
-		switch opt {
-		case "MATCH":
-			pattern = args[i]
-		case "COUNT":
-			n, err := strconv.ParseUint(args[i], 10, 64)
-			if err != nil || n == 0 || n > math.MaxInt32 {
-				h.writeError(writer, "ERR syntax error")
-				return
-			}
-			count = int(n)
-		case "TYPE":
-			if !strings.EqualFold(args[i], "string") {
-				h.writeError(writer, fmt.Sprintf("ERR unknown type name '%s'", args[i]))
-				return
-			}
-		default:
-			h.writeError(writer, "ERR syntax error")
-			return
-		}
-	}
-	keys, next := h.cache.Scan(cursor, count, func(k []byte) bool {
-		return matchPattern(pattern, string(k))
-	})
-	writer.WriteString("*2\r\n")
-	h.writeBulkString(writer, strconv.FormatUint(next, 10))
-	writer.WriteString("*")
-	writer.WriteString(strconv.Itoa(len(keys)))
-	writer.WriteString("\r\n")
-	for _, k := range keys {
-		h.writeBulkString(writer, string(k))
-	}
-}
-
-func (h *RedisHandler) handleStats(writer *bufio.Writer) {
-	lines := statLines(h.cache)
-	writer.WriteString("*")
-	writer.WriteString(strconv.Itoa(len(lines)))
-	writer.WriteString("\r\n")
-	for _, kv := range lines {
-		writer.WriteString("*2\r\n")
-		h.writeBulkString(writer, kv[0])
-		h.writeBulkString(writer, kv[1])
-	}
-}
-
-// handleFlush implements FLUSH/FLUSHDB/FLUSHALL [ASYNC|SYNC] [FAST] [DELAY n].
-// FAST is accepted for pogocache compatibility.
-func (h *RedisHandler) handleFlush(writer *bufio.Writer, args []string) {
-	async := false
-	var delay int64
-	for i := 0; i < len(args); i++ {
-		switch strings.ToUpper(args[i]) {
-		case "ASYNC":
-			async = true
-		case "SYNC":
-			async = false
-		case "FAST":
-		case "DELAY":
-			i++
-			if i == len(args) {
-				h.writeError(writer, "ERR syntax error")
-				return
-			}
-			n, err := strconv.ParseInt(args[i], 10, 64)
-			if err != nil || n < 0 || n > 31536000 {
-				h.writeError(writer, "ERR invalid delay argument")
-				return
-			}
-			delay = n
-			if delay > 0 {
-				async = true
-			}
-		default:
-			h.writeError(writer, "ERR syntax error")
-			return
-		}
-	}
-	switch {
-	case delay > 0:
-		time.AfterFunc(time.Duration(delay)*time.Second, h.cache.Clear)
-	case async:
-		go h.cache.Clear()
-	default:
-		h.cache.Clear()
-	}
-	h.writeSimpleString(writer, "OK")
-}
-
-// handleSweep implements SWEEP [ASYNC|FAST], removing expired and evicted
-// entries. FAST is accepted for pogocache compatibility.
-func (h *RedisHandler) handleSweep(writer *bufio.Writer, args []string) {
-	if len(args) > 1 {
-		h.writeError(writer, "ERR wrong number of arguments for 'sweep' command")
-		return
-	}
-	async := false
-	for _, a := range args {
-		switch strings.ToUpper(a) {
-		case "ASYNC":
-			async = true
-		case "FAST":
-		default:
-			h.writeError(writer, "ERR syntax error")
-			return
-		}
-	}
-	sweep := func() {
-		h.cache.Sweep()
-		h.cache.SweepEvicted()
-	}
-	if async {
-		go sweep()
-	} else {
-		sweep()
-	}
-	h.writeSimpleString(writer, "OK")
-}
-
-// handlePurge implements PURGE [ASYNC], returning freed memory to the OS.
-func (h *RedisHandler) handlePurge(writer *bufio.Writer, args []string) {
-	if len(args) > 1 {
-		h.writeError(writer, "ERR wrong number of arguments for 'purge' command")
-		return
-	}
-	if len(args) == 1 && !strings.EqualFold(args[0], "ASYNC") {
-		h.writeError(writer, "ERR syntax error")
-		return
-	}
-	if len(args) == 1 {
-		go debug.FreeOSMemory()
-	} else {
-		debug.FreeOSMemory()
-	}
-	h.writeSimpleString(writer, "OK")
-}
-
-func (h *RedisHandler) handleMGet(writer *bufio.Writer, keys []string) {
-	writer.WriteString("*")
-	writer.WriteString(strconv.Itoa(len(keys)))
-	writer.WriteString("\r\n")
-	
-	for _, key := range keys {
-		entry, found := h.cache.Load([]byte(key))
-		if !found {
-			h.writeNil(writer)
-		} else {
-			h.writeBulkString(writer, string(entry.Value()))
-		}
-	}
-}
-
-func (h *RedisHandler) handleMSet(writer *bufio.Writer, args []string) {
-	for i := 0; i < len(args); i += 2 {
-		h.cache.Store([]byte(args[i]), []byte(args[i+1]), nil)
-	}
-	h.writeSimpleString(writer, "OK")
-}
-
-func (h *RedisHandler) handleExpire(writer *bufio.Writer, key, secondsStr string) {
-	seconds, err := strconv.Atoi(secondsStr)
-	if err != nil {
-		h.writeError(writer, "ERR value is not an integer or out of range")
-		return
-	}
-	
-	entry, found := h.cache.Load([]byte(key))
-	if !found {
-		h.writeInteger(writer, 0)
-		return
-	}
-	
-	entry.SetExpireAt(time.Now().Add(time.Duration(seconds) * time.Second).UnixNano())
-	h.writeInteger(writer, 1)
-}
-
-func (h *RedisHandler) handleTTL(writer *bufio.Writer, key string) {
-	entry, found := h.cache.Load([]byte(key))
-	if !found {
-		h.writeInteger(writer, -2)
-		return
-	}
-	
-	expireAt := entry.ExpireAt()
-	if expireAt == 0 {
-		h.writeInteger(writer, -1)
-		return
-	}
-	
-	ttl := (expireAt - time.Now().UnixNano()) / 1e9
-	if ttl < 0 {
-		ttl = 0
-	}
-	h.writeInteger(writer, ttl)
-}
-
-func (h *RedisHandler) handleKeys(writer *bufio.Writer, pattern string) {
-	keys := make([]string, 0)
-	
-	h.cache.Iterate(func(entry *cache.Entry) bool {
-		key := string(entry.Key())
-		if pattern == "*" || matchPattern(pattern, key) {
-			keys = append(keys, key)
-		}
-		return true
-	})
-	
-	h.writeArray(writer, keys)
-}
-
-func (h *RedisHandler) handleInfo(writer *bufio.Writer) {
-	stats := h.cache.Stats()
-	
-	info := fmt.Sprintf("# Server\r\n"+
-		"redis_version:7.0.0\r\n"+
-		"redis_mode:standalone\r\n"+
-		"process_id:1\r\n"+
-		"tcp_port:6379\r\n"+
-		"\r\n"+
-		"# Keyspace\r\n"+
-		"db0:keys=%d,expires=0\r\n"+
-		"\r\n"+
-		"# Stats\r\n"+
-		"total_commands_processed:%d\r\n"+
-		"keyspace_hits:%d\r\n"+
-		"keyspace_misses:%d\r\n"+
-		"evicted_keys:%d\r\n"+
-		"expired_keys:%d\r\n"+
-		"\r\n"+
-		"# Memory\r\n"+
-		"used_memory:%d\r\n"+
-		"used_memory_human:%s\r\n",
-		stats["num_items"],
-		stats["num_ops"],
-		stats["num_hits"],
-		stats["num_misses"],
-		stats["num_evicted"],
-		stats["num_expired"],
-		stats["mem_used"],
-		formatMemory(stats["mem_used"].(int64)))
-	
-	h.writeBulkString(writer, info)
-}
-
-func (h *RedisHandler) handlePTTL(writer *bufio.Writer, key string) {
-	entry, found := h.cache.Load([]byte(key))
-	if !found {
-		h.writeInteger(writer, -2)
-		return
-	}
-
-	expireAt := entry.ExpireAt()
-	if expireAt == 0 {
-		h.writeInteger(writer, -1)
-		return
-	}
-
-	pttl := (expireAt - time.Now().UnixNano()) / 1e6
-	if pttl < 0 {
-		pttl = 0
-	}
-	h.writeInteger(writer, pttl)
-}
-
-func matchPattern(pattern, key string) bool {
-	if pattern == "*" {
-		return true
-	}
-	
-	i, j := 0, 0
-	for i < len(pattern) && j < len(key) {
-		if pattern[i] == '*' {
-			if i == len(pattern)-1 {
-				return true
-			}
-			for j < len(key) {
-				if matchPattern(pattern[i+1:], key[j:]) {
-					return true
-				}
-				j++
-			}
-			return false
-		} else if pattern[i] == '?' || pattern[i] == key[j] {
-			i++
-			j++
-		} else {
-			return false
-		}
-	}
-	
-	for i < len(pattern) && pattern[i] == '*' {
-		i++
-	}
-	
-	return i == len(pattern) && j == len(key)
-}
-
-func formatMemory(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%dB", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f%cB", float64(bytes)/float64(div), "KMGTPE"[exp])
-}

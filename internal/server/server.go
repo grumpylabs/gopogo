@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log"
 	"net"
@@ -26,6 +27,12 @@ type Config struct {
 	TLSPort       int
 	TLSCert       string
 	TLSKey        string
+	TLSCACert     string // CA bundle for verifying client certificates
+	MaxConns      int    // connections beyond this are closed on accept
+	Backlog       int    // listen backlog (Linux and macOS)
+	ReusePort     bool   // set SO_REUSEPORT (Linux and macOS)
+	TCPNoDelay    bool   // disable Nagle's algorithm
+	QuickAck      bool   // set TCP_QUICKACK (Linux)
 	HTTP          bool
 	Memcache      bool
 	Postgres      bool
@@ -71,7 +78,7 @@ func New(config *Config) *Server {
 		s.memcacheHandler = protocol.NewMemcacheHandler(config.Cache)
 	}
 	if config.Postgres {
-		s.postgresHandler = protocol.NewPostgresHandler(config.Cache, config.Auth)
+		s.postgresHandler = protocol.NewPostgresHandler(config.Cache, config.Auth, config.Persist)
 	}
 	
 	return s
@@ -131,7 +138,7 @@ func (s *Server) setupListeners() error {
 	
 	if s.config.Port > 0 {
 		addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
-		listener, err := net.Listen("tcp", addr)
+		listener, err := listenTCP(s.config.Host, s.config.Port, s.config.Backlog, s.config.ReusePort)
 		if err != nil {
 			return fmt.Errorf("failed to listen on %s: %w", addr, err)
 		}
@@ -151,12 +158,27 @@ func (s *Server) setupListeners() error {
 		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{cert},
 		}
+		if s.config.TLSCACert != "" {
+			// Like pogocache (SSL_VERIFY_PEER), verify a client certificate
+			// when one is presented.
+			pem, err := os.ReadFile(s.config.TLSCACert)
+			if err != nil {
+				return fmt.Errorf("failed to read TLS CA certificate: %w", err)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(pem) {
+				return fmt.Errorf("no certificates found in %s", s.config.TLSCACert)
+			}
+			tlsConfig.ClientCAs = pool
+			tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+		}
 		
 		addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.TLSPort)
-		listener, err := tls.Listen("tcp", addr, tlsConfig)
+		ln, err := listenTCP(s.config.Host, s.config.TLSPort, s.config.Backlog, s.config.ReusePort)
 		if err != nil {
 			return fmt.Errorf("failed to listen on TLS %s: %w", addr, err)
 		}
+		listener := tls.NewListener(ln, tlsConfig)
 		s.listeners = append(s.listeners, listener)
 		
 		if !s.config.Quiet {
@@ -188,11 +210,40 @@ func (s *Server) serve(listener net.Listener) {
 			}
 		}
 		
+		if !s.admit(conn) {
+			continue
+		}
 		go s.handleConnection(conn)
 	}
 }
 
+// admit applies the connection limit and TCP options to a new connection.
+// It closes the connection and returns false when the limit is reached.
+func (s *Server) admit(conn net.Conn) bool {
+	stats := &protocol.ConnStats
+	if n := stats.Curr.Add(1); s.config.MaxConns > 0 && n > int64(s.config.MaxConns) {
+		stats.Curr.Add(-1)
+		stats.Rejected.Add(1)
+		conn.Close()
+		return false
+	}
+	stats.Total.Add(1)
+
+	tcp, _ := conn.(*net.TCPConn)
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		tcp, _ = tlsConn.NetConn().(*net.TCPConn)
+	}
+	if tcp != nil {
+		tcp.SetNoDelay(s.config.TCPNoDelay)
+		if s.config.QuickAck {
+			setQuickAck(tcp)
+		}
+	}
+	return true
+}
+
 func (s *Server) handleConnection(conn net.Conn) {
+	defer protocol.ConnStats.Curr.Add(-1)
 	defer conn.Close()
 	
 	detector := protocol.NewDetector(conn)

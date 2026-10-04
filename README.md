@@ -84,6 +84,12 @@ gopogo --persist /var/lib/gopogo/data.pogo
 | `--tlsport` | `GOPOGO_TLSPORT` | `0` | TLS listening port |
 | `--tlscert` | `GOPOGO_TLSCERT` | | TLS certificate file |
 | `--tlskey` | `GOPOGO_TLSKEY` | | TLS key file |
+| `--tlscacert` | `GOPOGO_TLSCACERT` | | CA file; client certificates are verified when presented |
+| `--maxconns` | `GOPOGO_MAXCONNS` | `1024` | Maximum client connections; extra connections are closed |
+| `--backlog` | `GOPOGO_BACKLOG` | `1024` | Listen accept backlog (Linux, macOS) |
+| `--reuseport` | `GOPOGO_REUSEPORT` | `false` | Set `SO_REUSEPORT` so several servers can share a port (Linux, macOS) |
+| `--tcpnodelay` | `GOPOGO_TCPNODELAY` | `true` | Disable Nagle's algorithm |
+| `--quickack` | `GOPOGO_QUICKACK` | `false` | Enable TCP quick acks (Linux) |
 | `--http` | `GOPOGO_HTTP` | `false` | Enable HTTP protocol |
 | `--memcache` | `GOPOGO_MEMCACHE` | `false` | Enable Memcache protocol |
 | `--postgres` | `GOPOGO_POSTGRES` | `false` | Enable Postgres protocol |
@@ -163,7 +169,7 @@ c.IterateShard(0, func(e *cache.Entry) bool { return true })
 
 ### Redis Protocol
 
-Supported commands: GET, SET (EX/PX/EXAT/PXAT/NX/XX/KEEPTTL), SETEX, DEL, EXISTS, MGET, MGETS, MSET, APPEND, PREPEND, INCR, DECR, INCRBY, DECRBY, UINCR, UDECR, UINCRBY, UDECRBY, EXPIRE, TTL, PTTL, TOUCH, KEYS, SCAN (MATCH/COUNT/TYPE), DBSIZE, FLUSH, FLUSHDB, FLUSHALL (ASYNC/SYNC/DELAY), SWEEP, PURGE, STATS, VERSION, INFO, PING, QUIT, SELECT, ECHO, AUTH, SAVE, LOAD.
+Supported commands: GET, SET (EX/PX/EXAT/PXAT/NX/XX/KEEPTTL), SETEX, DEL, EXISTS, MGET, MGETS, MSET, APPEND, PREPEND, INCR, DECR, INCRBY, DECRBY, UINCR, UDECR, UINCRBY, UDECRBY, EXPIRE, TTL, PTTL, TOUCH, KEYS, SCAN (MATCH/COUNT/TYPE), DBSIZE, FLUSH, FLUSHDB, FLUSHALL (ASYNC/SYNC/DELAY), SWEEP, PURGE, STATS, VERSION, INFO, PING, QUIT, SELECT, ECHO, AUTH, SAVE, LOAD, MONITOR, DEBUG (POPULATE/DETACH).
 
 Counters are stored as decimal text. The `U`-prefixed commands operate on unsigned 64-bit values. `MGETS` returns `[flags, cas, value]` for each found key.
 
@@ -183,13 +189,15 @@ OK
 
 ### HTTP Protocol
 
+HTTP requests map onto the same commands as Redis: `GET /key`, `PUT /key` (value in the body) and `DELETE /key`. `PUT` accepts `ex` (or `ttl`), `flags`, `cas`, `nx` and `xx` query parameters, and the `X-TTL`, `X-Flags` and `X-CAS` headers. Replies are plain text: `Stored`, `Deleted` or `Not Found`. Authenticate with `?auth=<password>` or `Authorization: Bearer <password>`. Paths starting with `@` are reserved; `/@stats` and `/@keys?pattern=` return JSON.
+
 ```bash
 gopogo --http -p 8080
 
-curl -X PUT http://localhost:8080/mykey -d "myvalue" -H "X-TTL: 3600"
+curl -X PUT 'http://localhost:8080/mykey?ex=3600' -d "myvalue"
 curl http://localhost:8080/mykey
 curl -X DELETE http://localhost:8080/mykey
-curl http://localhost:8080/stats
+curl http://localhost:8080/@stats
 ```
 
 ### Memcache Protocol
@@ -209,12 +217,15 @@ END
 
 ### PostgreSQL Protocol
 
+A query is a cache command, not SQL, as in pogocache. Values with spaces go in single quotes, and `E'...'` strings take backslash escapes. Both the simple and the extended query protocol work, so drivers can bind parameters (`GET $1`). `BEGIN`, `COMMIT` and `ROLLBACK` are accepted and ignored, and a leading `::bytea` or `::text` sets the result column type.
+
 ```bash
 gopogo --postgres -p 5432
 
 psql -h localhost -p 5432 -U user dbname
-> INSERT INTO cache VALUES ('key', 'value');
-> SELECT * FROM cache WHERE key = 'key';
+> SET greeting 'hello world';
+> GET greeting;
+> MGET greeting other;
 ```
 
 ## Telemetry
@@ -259,7 +270,7 @@ make test-coverage  # Generate test coverage
 make integration    # Run pogocache's protocol tests against a live server
 ```
 
-`make integration` runs the test suite from pogocache's `tools/tests`, copied unchanged into `test/integration` (a separate Go module, so its client libraries stay out of gopogo's `go.mod`). `run.sh` starts `bin/gopogo` on port 9401 with every protocol enabled and stops it afterwards. `TestPostgres` is skipped until gopogo supports the Postgres extended query protocol; override with `make integration INTEGRATION_SKIP=`.
+`make integration` runs the test suite from pogocache's `tools/tests`, copied unchanged into `test/integration` (a separate Go module, so its client libraries stay out of gopogo's `go.mod`). `run.sh` starts `bin/gopogo` on port 9401 with every protocol enabled and stops it afterwards. `INTEGRATION_RUN` and `INTEGRATION_SKIP` select tests, e.g. `make integration INTEGRATION_RUN=^TestRESP`.
 
 ## Docker
 

@@ -49,6 +49,12 @@ func init() {
 	rootCmd.PersistentFlags().Int("tlsport", 0, "TLS listening port")
 	rootCmd.PersistentFlags().String("tlscert", "", "TLS certificate file")
 	rootCmd.PersistentFlags().String("tlskey", "", "TLS key file")
+	rootCmd.PersistentFlags().String("tlscacert", "", "TLS CA certificate file for verifying client certificates")
+	rootCmd.PersistentFlags().Int("maxconns", 1024, "Maximum client connections")
+	rootCmd.PersistentFlags().Int("backlog", 1024, "Listen accept backlog")
+	rootCmd.PersistentFlags().Bool("reuseport", false, "Set SO_REUSEPORT on listening sockets")
+	rootCmd.PersistentFlags().Bool("tcpnodelay", true, "Disable Nagle's algorithm")
+	rootCmd.PersistentFlags().Bool("quickack", false, "Enable TCP quick acks (Linux)")
 
 	rootCmd.PersistentFlags().Bool("http", false, "Enable HTTP protocol")
 	rootCmd.PersistentFlags().Bool("memcache", false, "Enable Memcache protocol")
@@ -98,6 +104,7 @@ func runServer(cmd *cobra.Command, args []string) {
 
 	protocol.Version = version
 	validateFlags()
+	protocol.ConnStats.Max = int64(viper.GetInt("maxconns"))
 	viper.Set("loadfactor", loadFactorPercent())
 	maxMemory := parseMemorySize(viper.GetString("maxmemory"))
 
@@ -143,6 +150,12 @@ func runServer(cmd *cobra.Command, args []string) {
 		TLSPort:  viper.GetInt("tlsport"),
 		TLSCert:  viper.GetString("tlscert"),
 		TLSKey:   viper.GetString("tlskey"),
+		TLSCACert:  viper.GetString("tlscacert"),
+		MaxConns:   viper.GetInt("maxconns"),
+		Backlog:    viper.GetInt("backlog"),
+		ReusePort:  viper.GetBool("reuseport"),
+		TCPNoDelay: viper.GetBool("tcpnodelay"),
+		QuickAck:   viper.GetBool("quickack"),
 		HTTP:     viper.GetBool("http"),
 		Memcache: viper.GetBool("memcache"),
 		Postgres: viper.GetBool("postgres"),
@@ -186,6 +199,12 @@ func validateFlags() {
 	if viper.GetInt("port") == 0 && viper.GetInt("tlsport") == 0 && viper.GetString("socket") == "" {
 		fmt.Fprintln(os.Stderr, "Need to specify at least one valid port, tlsport or socket option")
 		os.Exit(1)
+	}
+	for _, name := range []string{"maxconns", "backlog"} {
+		if viper.GetInt(name) < 1 {
+			fmt.Fprintf(os.Stderr, "Option --%s is invalid\n", name)
+			os.Exit(1)
+		}
 	}
 	if viper.GetInt("tlsport") > 0 && (viper.GetString("tlscert") == "" || viper.GetString("tlskey") == "") {
 		fmt.Fprintln(os.Stderr, "Option --tlsport requires --tlscert and --tlskey")

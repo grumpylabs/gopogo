@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -344,5 +345,96 @@ func TestMemcacheCAS(t *testing.T) {
 			}
 		}
 		client.Close()
+	}
+}
+
+func TestMemcacheAppendAtomic(t *testing.T) {
+	ch := cache.New(nil)
+	ch.Store([]byte("k"), []byte(""), &cache.StoreOptions{TTL: time.Hour, Flags: 9})
+
+	const workers, perWorker = 8, 50
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			server, client := net.Pipe()
+			go NewMemcacheHandler(ch).Handle(server)
+			defer client.Close()
+			r := bufio.NewReader(client)
+			for i := 0; i < perWorker; i++ {
+				client.Write([]byte("append k 0 0 1\r\nx\r\n"))
+				if l, _ := r.ReadString('\n'); l != "STORED\r\n" {
+					t.Errorf("append got %q", l)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	e, _ := ch.Load([]byte("k"))
+	if len(e.Value()) != workers*perWorker {
+		t.Fatalf("lost appends: got %d bytes, want %d", len(e.Value()), workers*perWorker)
+	}
+	if e.Flags() != 9 || e.ExpireAt() == 0 {
+		t.Fatalf("append dropped flags/TTL: flags=%d expireAt=%d", e.Flags(), e.ExpireAt())
+	}
+
+	server, client := net.Pipe()
+	go NewMemcacheHandler(ch).Handle(server)
+	defer client.Close()
+	client.Write([]byte("prepend missing 0 0 1\r\nx\r\n"))
+	if l, _ := bufio.NewReader(client).ReadString('\n'); l != "NOT_STORED\r\n" {
+		t.Fatalf("prepend missing got %q", l)
+	}
+}
+
+func TestRedisMonitor(t *testing.T) {
+	ch := cache.New(nil)
+	mon := newRESPClient(t, ch)
+	mon.expect("OK", "MONITOR")
+
+	c := newRESPClient(t, ch)
+	c.expect("OK", "SET", "k", "a \"b\"\n")
+	c.expect("OK", "AUTH", "") // not shown
+
+	mon.conn.SetDeadline(time.Now().Add(5 * time.Second))
+	line, err := mon.r.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(line, "+") || !strings.HasSuffix(line, `] "SET" "k" "a \"b\"\n"`+"\r\n") {
+		t.Fatalf("unexpected monitor line %q", line)
+	}
+
+	// Commands from other protocols are shown too.
+	server, client := net.Pipe()
+	go NewMemcacheHandler(ch).Handle(server)
+	defer client.Close()
+	client.Write([]byte("get k\r\n"))
+	if line, _ = mon.r.ReadString('\n'); !strings.HasSuffix(line, `"get" "k"`+"\r\n") {
+		t.Fatalf("memcache command not monitored: %q", line)
+	}
+
+	mon.expect("OK", "QUIT")
+}
+
+func TestRedisDebug(t *testing.T) {
+	ch := cache.New(nil)
+	c := newRESPClient(t, ch)
+	c.expect("OK", "DEBUG", "POPULATE", "1000", "test", "16")
+	c.expect(int64(1000), "DBSIZE")
+	if v := c.do("GET", "test:999"); v != strings.Repeat("\x00", 16) {
+		t.Fatalf("populated value %q", v)
+	}
+	c.expect("OK", "DEBUG", "POPULATE", "10", "ex", "1", "100-200")
+	if ttl := c.do("TTL", "ex:3").(int64); ttl < 99 || ttl > 200 {
+		t.Fatalf("populate TTL %d out of range", ttl)
+	}
+	c.expect(errReply("ERR syntax error"), "DEBUG", "POPULATE", "x", "p", "1")
+	c.expect(errReply("ERR unknown subcommand"), "DEBUG", "NOPE")
+	if v, ok := c.do("DEBUG", "DETACH").(string); !ok || !strings.Contains(v, ":") {
+		t.Fatalf("DEBUG DETACH got %#v", v)
 	}
 }
