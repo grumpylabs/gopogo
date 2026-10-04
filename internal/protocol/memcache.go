@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -92,7 +93,7 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 			h.handleStats(writer)
 			
 		case "version":
-			writer.WriteString("VERSION 1.6.0\r\n")
+			writer.WriteString("VERSION " + Version + "\r\n")
 			
 		case "quit":
 			writer.Flush()
@@ -344,40 +345,58 @@ func (h *MemcacheHandler) handleDelete(writer *bufio.Writer, parts []string) {
 	}
 }
 
+var (
+	errMemcacheNotFound   = errors.New("not found")
+	errMemcacheNonNumeric = errors.New("non-numeric")
+)
+
+// handleIncr implements incr/decr on unsigned 64-bit decimal values. Like
+// memcached, a missing key is NOT_FOUND, incr wraps around at 2^64 and decr
+// stops at 0.
 func (h *MemcacheHandler) handleIncr(writer *bufio.Writer, parts []string, incr bool) {
 	if len(parts) < 3 {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
 	}
-	
+
 	key := parts[1]
-	delta, err := strconv.ParseInt(parts[2], 10, 64)
+	delta, err := strconv.ParseUint(parts[2], 10, 64)
 	if err != nil {
 		writer.WriteString("CLIENT_ERROR invalid numeric delta argument\r\n")
 		return
 	}
-	
+
 	noreply := len(parts) > 3 && parts[3] == "noreply"
-	
-	if !incr {
-		delta = -delta
-	}
-	
-	newVal, err := h.cache.Increment([]byte(key), delta)
-	if err != nil {
-		if !noreply {
-			writer.WriteString("NOT_FOUND\r\n")
+
+	var newVal uint64
+	err = h.cache.Update([]byte(key), func(cur []byte, found bool) ([]byte, error) {
+		if !found {
+			return nil, errMemcacheNotFound
 		}
+		n, err := strconv.ParseUint(string(cur), 10, 64)
+		if err != nil {
+			return nil, errMemcacheNonNumeric
+		}
+		switch {
+		case incr:
+			newVal = n + delta
+		case delta > n:
+			newVal = 0
+		default:
+			newVal = n - delta
+		}
+		return strconv.AppendUint(nil, newVal, 10), nil
+	})
+	if noreply {
 		return
 	}
-	
-	if newVal < 0 {
-		newVal = 0
-		h.cache.Store([]byte(key), []byte(strconv.FormatInt(newVal, 10)), nil)
-	}
-	
-	if !noreply {
+	switch err {
+	case nil:
 		fmt.Fprintf(writer, "%d\r\n", newVal)
+	case errMemcacheNotFound:
+		writer.WriteString("NOT_FOUND\r\n")
+	default:
+		writer.WriteString("CLIENT_ERROR cannot increment or decrement non-numeric value\r\n")
 	}
 }
 
@@ -420,15 +439,8 @@ func (h *MemcacheHandler) handleTouch(writer *bufio.Writer, parts []string) {
 }
 
 func (h *MemcacheHandler) handleStats(writer *bufio.Writer) {
-	stats := h.cache.Stats()
-	
-	fmt.Fprintf(writer, "STAT curr_items %d\r\n", stats["num_items"])
-	fmt.Fprintf(writer, "STAT bytes %d\r\n", stats["mem_used"])
-	fmt.Fprintf(writer, "STAT limit_maxbytes %d\r\n", stats["max_memory"])
-	fmt.Fprintf(writer, "STAT cmd_get %d\r\n", stats["num_hits"].(uint64)+stats["num_misses"].(uint64))
-	fmt.Fprintf(writer, "STAT get_hits %d\r\n", stats["num_hits"])
-	fmt.Fprintf(writer, "STAT get_misses %d\r\n", stats["num_misses"])
-	fmt.Fprintf(writer, "STAT evictions %d\r\n", stats["num_evicted"])
-	fmt.Fprintf(writer, "STAT expired_unfetched %d\r\n", stats["num_expired"])
+	for _, kv := range statLines(h.cache) {
+		fmt.Fprintf(writer, "STAT %s %s\r\n", kv[0], kv[1])
+	}
 	writer.WriteString("END\r\n")
 }

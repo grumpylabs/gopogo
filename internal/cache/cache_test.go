@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -892,6 +893,49 @@ func TestCleanWorkFiles(t *testing.T) {
 	}
 }
 
+func TestScan(t *testing.T) {
+	c := New(&Options{NumShards: 4})
+	want := map[string]bool{}
+	for i := 0; i < 250; i++ {
+		k := fmt.Sprintf("key:%d", i)
+		c.Store([]byte(k), []byte("v"), nil)
+		want[k] = true
+	}
+	c.Store([]byte("other"), []byte("v"), nil)
+
+	got := map[string]bool{}
+	var cursor uint64
+	calls := 0
+	for {
+		keys, next := c.Scan(cursor, 10, func(k []byte) bool {
+			return bytes.HasPrefix(k, []byte("key:"))
+		})
+		if len(keys) > 10 {
+			t.Fatalf("Scan returned %d keys, more than count", len(keys))
+		}
+		for _, k := range keys {
+			if got[string(k)] {
+				t.Fatalf("Key %s returned twice", k)
+			}
+			got[string(k)] = true
+		}
+		calls++
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
+	if len(got) != len(want) {
+		t.Fatalf("Expected %d keys, got %d", len(want), len(got))
+	}
+	if calls < 25 {
+		t.Fatalf("Expected at least 25 calls with count 10, got %d", calls)
+	}
+	if keys, next := c.Scan(uint64(99)<<32, 10, nil); len(keys) != 0 || next != 0 {
+		t.Fatalf("Out-of-range cursor should end scan, got %d keys next=%d", len(keys), next)
+	}
+}
+
 func TestBatch(t *testing.T) {
 	c := New(nil)
 
@@ -1031,11 +1075,61 @@ func TestNoTouch(t *testing.T) {
 	}
 }
 
+func TestIncrementDecimalText(t *testing.T) {
+	c := New(nil) // sixpack on by default
+
+	key := []byte("user:counter")
+	c.Store(key, []byte("10"), &StoreOptions{TTL: time.Hour, Flags: 7})
+	val, err := c.Increment(key, 1)
+	if err != nil || val != 11 {
+		t.Fatalf("Expected 11, got %d (%v)", val, err)
+	}
+	e, ok := c.Load(key)
+	if !ok || string(e.Value()) != "11" {
+		t.Fatalf("Expected stored value \"11\", got %q", e.Value())
+	}
+	if e.Flags() != 7 || e.ExpireAt() == 0 {
+		t.Fatalf("Flags/TTL not preserved: flags=%d expireAt=%d", e.Flags(), e.ExpireAt())
+	}
+	if !bytes.Equal(e.Key(), key) {
+		t.Fatalf("Key corrupted after increment: %q", e.Key())
+	}
+
+	c.Store([]byte("str"), []byte("hello"), nil)
+	if _, err := c.Increment([]byte("str"), 1); err != ErrNotInteger {
+		t.Fatalf("Expected ErrNotInteger, got %v", err)
+	}
+	if e, _ := c.Load([]byte("str")); string(e.Value()) != "hello" {
+		t.Fatalf("Failed increment modified value: %q", e.Value())
+	}
+}
+
+func TestIncrementUnsigned(t *testing.T) {
+	c := New(nil)
+	key := []byte("u")
+
+	val, err := c.IncrementUnsigned(key, 5, false)
+	if err != nil || val != 5 {
+		t.Fatalf("Expected 5, got %d (%v)", val, err)
+	}
+	if _, err := c.IncrementUnsigned(key, 6, true); err != ErrOverflow {
+		t.Fatalf("Expected ErrOverflow below zero, got %v", err)
+	}
+	c.Store(key, []byte(strconv.FormatUint(math.MaxUint64-1, 10)), nil)
+	if _, err := c.IncrementUnsigned(key, 2, false); err != ErrOverflow {
+		t.Fatalf("Expected ErrOverflow above max, got %v", err)
+	}
+	c.Store(key, []byte("-1"), nil)
+	if _, err := c.IncrementUnsigned(key, 1, false); err != ErrNotInteger {
+		t.Fatalf("Expected ErrNotInteger for negative value, got %v", err)
+	}
+}
+
 func TestIncrementOverflow(t *testing.T) {
 	c := New(nil)
 
 	// Set to near max
-	c.Store([]byte("counter"), int64ToBytes(math.MaxInt64-5), nil)
+	c.Store([]byte("counter"), []byte(strconv.FormatInt(math.MaxInt64-5, 10)), nil)
 
 	// Small increment should work
 	val, err := c.Increment([]byte("counter"), 3)
@@ -1053,7 +1147,7 @@ func TestIncrementOverflow(t *testing.T) {
 	}
 
 	// Negative overflow
-	c.Store([]byte("neg"), int64ToBytes(math.MinInt64+5), nil)
+	c.Store([]byte("neg"), []byte(strconv.FormatInt(math.MinInt64+5, 10)), nil)
 	_, err = c.Increment([]byte("neg"), -10)
 	if err != ErrOverflow {
 		t.Fatalf("Expected ErrOverflow for negative overflow, got %v", err)

@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strconv"
 	"sync/atomic"
 	"time"
 )
 
-var ErrOverflow = errors.New("increment or decrement would overflow")
+var (
+	ErrOverflow   = errors.New("increment or decrement would overflow")
+	ErrNotInteger = errors.New("value is not an integer or out of range")
+)
 
 // StoreResult indicates the outcome of a Store operation.
 type StoreResult int
@@ -317,7 +321,65 @@ func (c *Cache) CompareAndSwap(key, value []byte, cas uint64, opts *StoreOptions
 	return true, nil
 }
 
+// Increment adds delta to the signed 64-bit decimal integer stored at key and
+// returns the result. A missing key counts as 0. The value is stored as
+// decimal text, so it reads back with Load like any other value.
 func (c *Cache) Increment(key []byte, delta int64) (int64, error) {
+	var out int64
+	err := c.Update(key, func(cur []byte, found bool) ([]byte, error) {
+		var n int64
+		if found {
+			v, err := strconv.ParseInt(string(cur), 10, 64)
+			if err != nil {
+				return nil, ErrNotInteger
+			}
+			n = v
+		}
+		// Overflow detection matching C's __builtin_add_overflow behavior
+		if (delta > 0 && n > math.MaxInt64-delta) ||
+			(delta < 0 && n < math.MinInt64-delta) {
+			return nil, ErrOverflow
+		}
+		out = n + delta
+		return strconv.AppendInt(nil, out, 10), nil
+	})
+	return out, err
+}
+
+// IncrementUnsigned adds (or with decr, subtracts) delta to the unsigned
+// 64-bit decimal integer stored at key. A missing key counts as 0.
+func (c *Cache) IncrementUnsigned(key []byte, delta uint64, decr bool) (uint64, error) {
+	var out uint64
+	err := c.Update(key, func(cur []byte, found bool) ([]byte, error) {
+		var n uint64
+		if found {
+			v, err := strconv.ParseUint(string(cur), 10, 64)
+			if err != nil {
+				return nil, ErrNotInteger
+			}
+			n = v
+		}
+		if decr {
+			if delta > n {
+				return nil, ErrOverflow
+			}
+			out = n - delta
+		} else {
+			if n > math.MaxUint64-delta {
+				return nil, ErrOverflow
+			}
+			out = n + delta
+		}
+		return strconv.AppendUint(nil, out, 10), nil
+	})
+	return out, err
+}
+
+// Update atomically replaces the value at key with the result of fn, which is
+// called with the current value (found is false for a missing or expired key)
+// while the shard lock is held. Flags and TTL of a live entry are preserved.
+// If fn returns an error the entry is left untouched and the error returned.
+func (c *Cache) Update(key []byte, fn func(cur []byte, found bool) ([]byte, error)) error {
 	shard := c.getShard(key)
 	storeKey, origLen := c.compressKey(key)
 
@@ -325,44 +387,45 @@ func (c *Cache) Increment(key []byte, delta int64) (int64, error) {
 	defer shard.mu.Unlock()
 
 	atomic.AddUint64(&shard.numOps, 1)
+	now := time.Now().UnixNano()
 
 	existing, idx := shard.m.getWithIndex(storeKey)
-	if existing == nil {
-		val := delta
-		entry := &Entry{
-			key:        storeKey,
-			origKeyLen: origLen,
-			value:      int64ToBytes(val),
+	if existing != nil && !existing.IsExpired() {
+		val, err := fn(existing.value, true)
+		if err != nil {
+			return err
 		}
-
-		c.evictIfNeeded(shard, entry.Size(), hashKey(storeKey))
-		shard.m.insert(entry)
-		shard.addMemUsed(entry.Size())
-
-		return val, nil
+		newEntry := &Entry{
+			key:        existing.key,
+			origKeyLen: existing.origKeyLen,
+			value:      val,
+			expireAt:   existing.expireAt,
+			accessedAt: now,
+			flags:      existing.flags,
+			cas:        existing.cas + 1,
+		}
+		// Replace entry pointer in bucket
+		shard.m.buckets[idx].entry = newEntry
+		shard.addMemUsed(newEntry.Size() - existing.Size())
+		return nil
 	}
 
-	currentVal := bytesToInt64(existing.value)
-	// Overflow detection matching C's __builtin_add_overflow behavior
-	if (delta > 0 && currentVal > math.MaxInt64-delta) ||
-		(delta < 0 && currentVal < math.MinInt64-delta) {
-		return currentVal, ErrOverflow
+	val, err := fn(nil, false)
+	if err != nil {
+		return err
 	}
-	newVal := currentVal + delta
-
-	newEntry := &Entry{
-		key:      existing.key,
-		value:    int64ToBytes(newVal),
-		expireAt: existing.expireAt,
-		flags:    existing.flags,
-		cas:      existing.cas + 1,
+	entry := &Entry{
+		key:        storeKey,
+		origKeyLen: origLen,
+		value:      val,
+		accessedAt: now,
 	}
-
-	// Replace entry pointer in bucket
-	shard.m.buckets[idx].entry = newEntry
-	shard.addMemUsed(newEntry.Size() - existing.Size())
-
-	return newVal, nil
+	c.evictIfNeeded(shard, entry.Size(), hashKey(storeKey))
+	if old := shard.m.insert(entry); old != nil {
+		shard.addMemUsed(-old.Size())
+	}
+	shard.addMemUsed(entry.Size())
+	return nil
 }
 
 func (c *Cache) Sweep() int {
@@ -489,6 +552,39 @@ func (c *Cache) IterateShard(shardIdx int, fn func(*Entry) bool) {
 		return
 	}
 	c.iterateShard(c.shards[shardIdx], fn)
+}
+
+// Scan returns up to count live keys accepted by match, resuming from cursor,
+// along with the cursor for the next call; a returned cursor of 0 means the
+// scan is complete. The cursor packs the shard index into the upper 32 bits
+// and the bucket position into the lower 32, as pogocache does. Like Redis
+// SCAN, keys inserted or moved during a scan may be missed or repeated.
+func (c *Cache) Scan(cursor uint64, count int, match func(key []byte) bool) ([][]byte, uint64) {
+	var keys [][]byte
+	pos := int(cursor & 0xFFFFFFFF)
+	for idx := int(cursor >> 32); idx < c.numShards; idx++ {
+		shard := c.shards[idx]
+		shard.mu.RLock()
+		buckets := shard.m.buckets
+		for i := pos; i < len(buckets); i++ {
+			e := buckets[i].entry
+			if e == nil || e.IsExpired() {
+				continue
+			}
+			key := e.Key()
+			if match != nil && !match(key) {
+				continue
+			}
+			keys = append(keys, key)
+			if len(keys) == count {
+				shard.mu.RUnlock()
+				return keys, uint64(idx)<<32 | uint64(i+1)
+			}
+		}
+		shard.mu.RUnlock()
+		pos = 0
+	}
+	return keys, 0
 }
 
 func (c *Cache) iterateShard(shard *Shard, fn func(*Entry) bool) bool {
@@ -669,24 +765,4 @@ func (c *Cache) fireNotifyDeleted(oldEntry *Entry) {
 	if c.notify != nil {
 		c.notify(nil, oldEntry)
 	}
-}
-
-func int64ToBytes(n int64) []byte {
-	b := make([]byte, 8)
-	for i := 7; i >= 0; i-- {
-		b[i] = byte(n)
-		n >>= 8
-	}
-	return b
-}
-
-func bytesToInt64(b []byte) int64 {
-	if len(b) != 8 {
-		return 0
-	}
-	var n int64
-	for i := 0; i < 8; i++ {
-		n = (n << 8) | int64(b[i])
-	}
-	return n
 }

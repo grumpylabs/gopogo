@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/grumpylabs/gopogo/internal/cache"
+	"github.com/grumpylabs/gopogo/internal/protocol"
 	"github.com/grumpylabs/gopogo/internal/server"
 	"github.com/grumpylabs/gopogo/internal/telemetry"
 	"github.com/spf13/cobra"
@@ -93,6 +94,7 @@ func runServer(cmd *cobra.Command, args []string) {
 		os.Exit(0)
 	}
 
+	protocol.Version = version
 	maxMemory := parseMemorySize(viper.GetString("maxmemory"))
 
 	c := cache.New(&cache.Options{

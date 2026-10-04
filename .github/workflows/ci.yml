@@ -15,13 +15,16 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # The two "make" steps share a name on purpose: duplicate step names are
-      # what receiver.githubreceiver.UseCheckRunID collided on (docs#1028).
+      # The "make" steps share a name on purpose: duplicate step names are what
+      # receiver.githubreceiver.UseCheckRunID collided on (docs#1028).
       - name: make
         run: make build
 
       - name: make
         run: make vet
+
+      - name: make
+        run: make bench
 
       - name: test
         run: make test

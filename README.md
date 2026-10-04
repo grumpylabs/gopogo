@@ -161,7 +161,9 @@ c.IterateShard(0, func(e *cache.Entry) bool { return true })
 
 ### Redis Protocol
 
-Supported commands: GET, SET (EX/PX/EXAT/PXAT/NX/XX/KEEPTTL), DEL, EXISTS, MGET, MSET, INCR, DECR, INCRBY, DECRBY, EXPIRE, TTL, PTTL, TOUCH, KEYS, SCAN, DBSIZE, FLUSHDB, FLUSHALL, INFO, PING, QUIT, SELECT, ECHO, AUTH, SAVE, LOAD.
+Supported commands: GET, SET (EX/PX/EXAT/PXAT/NX/XX/KEEPTTL), SETEX, DEL, EXISTS, MGET, MGETS, MSET, APPEND, PREPEND, INCR, DECR, INCRBY, DECRBY, UINCR, UDECR, UINCRBY, UDECRBY, EXPIRE, TTL, PTTL, TOUCH, KEYS, SCAN (MATCH/COUNT/TYPE), DBSIZE, FLUSH, FLUSHDB, FLUSHALL (ASYNC/SYNC/DELAY), SWEEP, PURGE, STATS, VERSION, INFO, PING, QUIT, SELECT, ECHO, AUTH, SAVE, LOAD.
+
+Counters are stored as decimal text. The `U`-prefixed commands operate on unsigned 64-bit values. `MGETS` returns `[flags, cas, value]` for each found key.
 
 `SAVE [TO <path>] [FAST]` and `LOAD [FROM <path>] [FAST]` default to the `--persist` path. `LOAD` merges into the existing data rather than replacing it. `FAST` is accepted for pogocache compatibility.
 
