@@ -180,6 +180,40 @@ func TestCASTokens(t *testing.T) {
 	}
 }
 
+func TestSixpackRawKeysDistinct(t *testing.T) {
+	// A sixpacked key can have the same bytes as some raw key; they must
+	// still be different keys.
+	c := New(nil)
+	for i := 0; i < 256; i++ {
+		for j := 0; j < 256; j++ {
+			k := []byte{byte(i), byte(j)}
+			c.Store(k, k, nil)
+		}
+	}
+	if n := c.NumItems(); n != 65536 {
+		t.Fatalf("Expected 65536 items, got %d", n)
+	}
+	for i := 0; i < 256; i++ {
+		for j := 0; j < 256; j++ {
+			k := []byte{byte(i), byte(j)}
+			e, ok := c.Load(k)
+			if !ok || !bytes.Equal(e.Value(), k) {
+				t.Fatalf("Key %v: ok=%v value=%v", k, ok, e.Value())
+			}
+		}
+	}
+	for i := 0; i < 256; i++ {
+		for j := 0; j < 256; j++ {
+			if !c.Delete([]byte{byte(i), byte(j)}) {
+				t.Fatalf("Delete %v failed", []byte{byte(i), byte(j)})
+			}
+		}
+	}
+	if n := c.NumItems(); n != 0 {
+		t.Fatalf("Expected 0 items after delete, got %d", n)
+	}
+}
+
 func TestCASDisabled(t *testing.T) {
 	c := New(nil)
 	c.Store([]byte("k"), []byte("v"), &StoreOptions{CAS: 5})
@@ -189,6 +223,10 @@ func TestCASDisabled(t *testing.T) {
 	}
 	if ok, err := c.CompareAndSwap([]byte("k"), []byte("x"), 0, nil); ok || err != nil {
 		t.Fatalf("CAS should always fail when disabled: ok=%v err=%v", ok, err)
+	}
+	c.Store([]byte("k"), []byte("v2"), nil)
+	if e, _ := c.Load([]byte("k")); e.CAS() != 0 {
+		t.Fatalf("Expected CAS 0 after overwrite when disabled, got %d", e.CAS())
 	}
 }
 

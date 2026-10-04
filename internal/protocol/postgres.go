@@ -11,6 +11,8 @@ import (
 	"github.com/grumpylabs/gopogo/internal/cache"
 )
 
+const sslRequestCode = 80877103
+
 type PostgresHandler struct {
 	cache *cache.Cache
 	auth  string
@@ -75,6 +77,15 @@ func (h *PostgresHandler) handleStartup(conn net.Conn) error {
 	
 	length := binary.BigEndian.Uint32(buf[:4])
 	version := binary.BigEndian.Uint32(buf[4:])
+	
+	// psql and most drivers ask for TLS first (SSLRequest). Decline with 'N'
+	// so the client continues with a plain startup message.
+	if length == 8 && version == sslRequestCode {
+		if _, err := conn.Write([]byte{'N'}); err != nil {
+			return err
+		}
+		return h.handleStartup(conn)
+	}
 	
 	if version != 196608 {
 		return fmt.Errorf("unsupported protocol version: %d", version)

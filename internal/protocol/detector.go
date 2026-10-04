@@ -30,50 +30,62 @@ func NewDetector(conn net.Conn) *Detector {
 	}
 }
 
+// Detect sniffs the protocol from the first bytes of a connection using
+// pogocache's rules: '*' is RESP, a zero byte is Postgres, a first line ending
+// in " HTTP/x.y" is HTTP, a line starting with an uppercase letter is RESP
+// inline (telnet) and any other line is Memcache.
 func (d *Detector) Detect() (Type, error) {
-	peek, err := d.reader.Peek(8)
-	if err != nil && err != io.EOF {
+	first, err := d.reader.Peek(1)
+	if err != nil {
+		if err == io.EOF {
+			return TypeRedis, nil
+		}
 		return TypeUnknown, err
 	}
-	
-	d.peeked = peek
-	
-	if len(peek) == 0 {
+	switch first[0] {
+	case '*':
 		return TypeRedis, nil
-	}
-	
-	if peek[0] == '*' || peek[0] == '$' || peek[0] == '+' || peek[0] == '-' || peek[0] == ':' {
-		return TypeRedis, nil
-	}
-	
-	if bytes.HasPrefix(peek, []byte("GET ")) || 
-	   bytes.HasPrefix(peek, []byte("POST ")) ||
-	   bytes.HasPrefix(peek, []byte("PUT ")) ||
-	   bytes.HasPrefix(peek, []byte("DELETE ")) ||
-	   bytes.HasPrefix(peek, []byte("HEAD ")) ||
-	   bytes.HasPrefix(peek, []byte("OPTIONS ")) ||
-	   bytes.HasPrefix(peek, []byte("PATCH ")) {
-		return TypeHTTP, nil
-	}
-	
-	if bytes.HasPrefix(peek, []byte("get ")) ||
-	   bytes.HasPrefix(peek, []byte("set ")) ||
-	   bytes.HasPrefix(peek, []byte("add ")) ||
-	   bytes.HasPrefix(peek, []byte("replace ")) ||
-	   bytes.HasPrefix(peek, []byte("delete ")) ||
-	   bytes.HasPrefix(peek, []byte("incr ")) ||
-	   bytes.HasPrefix(peek, []byte("decr ")) ||
-	   bytes.HasPrefix(peek, []byte("stats")) ||
-	   bytes.HasPrefix(peek, []byte("flush")) ||
-	   bytes.HasPrefix(peek, []byte("version")) {
-		return TypeMemcache, nil
-	}
-	
-	if len(peek) >= 8 && peek[4] == 0x00 && peek[5] == 0x03 && peek[6] == 0x00 && peek[7] == 0x00 {
+	case 0:
 		return TypePostgres, nil
 	}
-	
-	return TypeRedis, nil
+
+	line := d.peekLine()
+	d.peeked = line
+	if isHTTPRequestLine(line) {
+		return TypeHTTP, nil
+	}
+	line = bytes.TrimLeft(line, " ")
+	if len(line) > 0 && line[0] >= 'A' && line[0] <= 'Z' {
+		return TypeRedis, nil
+	}
+	return TypeMemcache, nil
+}
+
+// peekLine returns the buffered bytes up to and including the first '\n',
+// waiting for more input as needed. It returns what is buffered if the line
+// does not fit the buffer or the connection ends first.
+func (d *Detector) peekLine() []byte {
+	for {
+		n := d.reader.Buffered()
+		buf, _ := d.reader.Peek(n)
+		if i := bytes.IndexByte(buf, '\n'); i >= 0 {
+			return buf[:i+1]
+		}
+		if n == d.reader.Size() {
+			return buf
+		}
+		if _, err := d.reader.Peek(n + 1); err != nil {
+			buf, _ = d.reader.Peek(d.reader.Buffered())
+			return buf
+		}
+	}
+}
+
+// isHTTPRequestLine reports whether line ends in " HTTP/x.y\r\n".
+func isHTTPRequestLine(line []byte) bool {
+	n := len(line)
+	return n >= 11 && bytes.Equal(line[n-11:n-5], []byte(" HTTP/")) &&
+		line[n-4] == '.' && line[n-2] == '\r'
 }
 
 func (d *Detector) Conn() net.Conn {

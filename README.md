@@ -256,7 +256,10 @@ make test           # Run tests
 make bench          # Run benchmarks
 make build-race     # Build with race detector
 make test-coverage  # Generate test coverage
+make integration    # Run pogocache's protocol tests against a live server
 ```
+
+`make integration` runs the test suite from pogocache's `tools/tests`, copied unchanged into `test/integration` (a separate Go module, so its client libraries stay out of gopogo's `go.mod`). `run.sh` starts `bin/gopogo` on port 9401 with every protocol enabled and stops it afterwards. `TestPostgres` is skipped until gopogo supports the Postgres extended query protocol; override with `make integration INTEGRATION_SKIP=`.
 
 ## Docker
 

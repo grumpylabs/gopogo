@@ -377,6 +377,14 @@ func (h *RedisHandler) writeInteger(writer *bufio.Writer, n int64) {
 	writer.WriteString("\r\n")
 }
 
+// writeUint writes an unsigned value as a simple string, as pogocache does,
+// since it may not fit a RESP (signed 64-bit) integer.
+func (h *RedisHandler) writeUint(writer *bufio.Writer, n uint64) {
+	writer.WriteString("+")
+	writer.WriteString(strconv.FormatUint(n, 10))
+	writer.WriteString("\r\n")
+}
+
 func (h *RedisHandler) writeBulkString(writer *bufio.Writer, s string) {
 	writer.WriteString("$")
 	writer.WriteString(strconv.Itoa(len(s)))
@@ -504,9 +512,7 @@ func (h *RedisHandler) handleIncr(writer *bufio.Writer, cmdName, key, deltaStr s
 			return
 		}
 		if n, err = h.cache.IncrementUnsigned([]byte(key), delta, decr); err == nil {
-			writer.WriteString(":")
-			writer.WriteString(strconv.FormatUint(n, 10))
-			writer.WriteString("\r\n")
+			h.writeUint(writer, n)
 			return
 		}
 	} else {
@@ -571,10 +577,8 @@ func (h *RedisHandler) handleMGetS(writer *bufio.Writer, keys []string) {
 			continue
 		}
 		writer.WriteString("*3\r\n")
-		h.writeInteger(writer, int64(entry.Flags()))
-		writer.WriteString(":")
-		writer.WriteString(strconv.FormatUint(entry.CAS(), 10))
-		writer.WriteString("\r\n")
+		h.writeUint(writer, uint64(entry.Flags()))
+		h.writeUint(writer, entry.CAS())
 		h.writeBulkString(writer, string(entry.Value()))
 	}
 }

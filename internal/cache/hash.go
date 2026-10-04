@@ -54,7 +54,10 @@ func (m *Map) insertInternal(entry *Entry, hash uint64) {
 	}
 }
 
-func (m *Map) lookup(key []byte, hash uint64) (*Entry, int) {
+// lookup finds the entry for key. packed tells whether key is in sixpack form:
+// a packed key and a raw key with the same bytes are different keys, as in
+// pogocache, so both the bytes and the packed flag must match.
+func (m *Map) lookup(key []byte, hash uint64, packed bool) (*Entry, int) {
 	idx := int(hash & m.mask)
 	distance := uint16(0)
 	
@@ -63,8 +66,9 @@ func (m *Map) lookup(key []byte, hash uint64) (*Entry, int) {
 			return nil, -1
 		}
 		
-		if m.buckets[idx].hash == hash && 
-		   len(m.buckets[idx].entry.key) == len(key) {
+		if m.buckets[idx].hash == hash &&
+			len(m.buckets[idx].entry.key) == len(key) &&
+			(m.buckets[idx].entry.origKeyLen > 0) == packed {
 			match := true
 			for i := range key {
 				if key[i] != m.buckets[idx].entry.key[i] {
@@ -82,8 +86,8 @@ func (m *Map) lookup(key []byte, hash uint64) (*Entry, int) {
 	}
 }
 
-func (m *Map) delete(key []byte, hash uint64) *Entry {
-	entry, idx := m.lookup(key, hash)
+func (m *Map) delete(key []byte, hash uint64, packed bool) *Entry {
+	entry, idx := m.lookup(key, hash, packed)
 	if entry == nil {
 		return nil
 	}
@@ -111,10 +115,9 @@ func (m *Map) delete(key []byte, hash uint64) *Entry {
 func (m *Map) insert(entry *Entry) *Entry {
 	hash := hashKey(entry.key)
 
-	if existing, idx := m.lookup(entry.key, hash); existing != nil {
+	if existing, idx := m.lookup(entry.key, hash, entry.origKeyLen > 0); existing != nil {
 		// Replace entry pointer in the bucket rather than mutating in-place.
 		// This ensures concurrent readers holding the old pointer see consistent data.
-		entry.cas = existing.cas + 1
 		m.buckets[idx].entry = entry
 		return existing
 	}
@@ -128,15 +131,20 @@ func (m *Map) insert(entry *Entry) *Entry {
 }
 
 // getWithIndex returns the entry and its bucket index for the given key.
-func (m *Map) getWithIndex(key []byte) (*Entry, int) {
+func (m *Map) getWithIndex(key []byte, packed bool) (*Entry, int) {
 	hash := hashKey(key)
-	return m.lookup(key, hash)
+	return m.lookup(key, hash, packed)
 }
 
-func (m *Map) get(key []byte) *Entry {
+func (m *Map) get(key []byte, packed bool) *Entry {
 	hash := hashKey(key)
-	entry, _ := m.lookup(key, hash)
+	entry, _ := m.lookup(key, hash, packed)
 	return entry
+}
+
+// deleteEntry removes the entry stored under e's key.
+func (m *Map) deleteEntry(e *Entry) *Entry {
+	return m.delete(e.key, hashKey(e.key), e.origKeyLen > 0)
 }
 
 // randomEntries selects up to n random entries, skipping buckets whose hash

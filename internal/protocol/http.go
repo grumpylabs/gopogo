@@ -36,7 +36,8 @@ func (h *HTTPHandler) Handle(conn net.Conn) {
 		req, err := http.ReadRequest(reader)
 		if err != nil {
 			if err != io.EOF {
-				h.writeError(writer, http.StatusBadRequest, err.Error())
+				h.writeError(writer, http.StatusBadRequest)
+				writer.Flush()
 			}
 			return
 		}
@@ -44,7 +45,7 @@ func (h *HTTPHandler) Handle(conn net.Conn) {
 		if h.auth != "" {
 			authHeader := req.Header.Get("Authorization")
 			if !strings.HasPrefix(authHeader, "Bearer ") || authHeader[7:] != h.auth {
-				h.writeError(writer, http.StatusUnauthorized, "Unauthorized")
+				h.writeError(writer, http.StatusUnauthorized)
 				continue
 			}
 		}
@@ -59,7 +60,7 @@ func (h *HTTPHandler) Handle(conn net.Conn) {
 		case http.MethodHead:
 			h.handleHead(writer, req)
 		default:
-			h.writeError(writer, http.StatusMethodNotAllowed, "Method not allowed")
+			h.writeError(writer, http.StatusMethodNotAllowed)
 		}
 		
 		writer.Flush()
@@ -85,13 +86,12 @@ func (h *HTTPHandler) handleGet(writer *bufio.Writer, req *http.Request) {
 	
 	entry, found := h.cache.Load([]byte(path))
 	if !found {
-		h.writeError(writer, http.StatusNotFound, "Key not found")
+		h.writeError(writer, http.StatusNotFound)
 		return
 	}
 	
 	h.writeResponse(writer, http.StatusOK, map[string]string{
 		"Content-Type":   "application/octet-stream",
-		"Content-Length": strconv.Itoa(len(entry.Value())),
 		"X-Flags":        strconv.FormatUint(uint64(entry.Flags()), 10),
 		"X-CAS":          strconv.FormatUint(entry.CAS(), 10),
 	}, entry.Value())
@@ -100,14 +100,13 @@ func (h *HTTPHandler) handleGet(writer *bufio.Writer, req *http.Request) {
 func (h *HTTPHandler) handleSet(writer *bufio.Writer, req *http.Request) {
 	path := strings.TrimPrefix(req.URL.Path, "/")
 	if path == "" {
-		h.writeError(writer, http.StatusBadRequest, "Key required")
+		h.writeError(writer, http.StatusBadRequest)
 		return
 	}
 	
-	body := make([]byte, req.ContentLength)
-	_, err := io.ReadFull(req.Body, body)
+	body, err := io.ReadAll(req.Body)
 	if err != nil {
-		h.writeError(writer, http.StatusBadRequest, "Failed to read body")
+		h.writeError(writer, http.StatusBadRequest)
 		return
 	}
 	
@@ -133,50 +132,50 @@ func (h *HTTPHandler) handleSet(writer *bufio.Writer, req *http.Request) {
 			opts.CAS = casVal
 			success, err := h.cache.CompareAndSwap([]byte(path), body, casVal, opts)
 			if err == cache.ErrNotFound {
-				h.writeError(writer, http.StatusNotFound, "Not found")
+				h.writeError(writer, http.StatusNotFound)
 				return
 			}
 			if err != nil {
-				h.writeError(writer, http.StatusInternalServerError, err.Error())
+				h.writeError(writer, http.StatusInternalServerError)
 				return
 			}
 			if !success {
-				h.writeError(writer, http.StatusConflict, "CAS mismatch")
+				h.writeError(writer, http.StatusConflict)
 				return
 			}
-			h.writeResponse(writer, http.StatusOK, nil, []byte("OK"))
+			h.writeResponse(writer, http.StatusOK, nil, []byte("Stored\r\n"))
 			return
 		}
 	}
 	
 	h.cache.Store([]byte(path), body, opts)
-	h.writeResponse(writer, http.StatusCreated, nil, []byte("OK"))
+	h.writeResponse(writer, http.StatusOK, nil, []byte("Stored\r\n"))
 }
 
 func (h *HTTPHandler) handleDelete(writer *bufio.Writer, req *http.Request) {
 	path := strings.TrimPrefix(req.URL.Path, "/")
 	if path == "" {
-		h.writeError(writer, http.StatusBadRequest, "Key required")
+		h.writeError(writer, http.StatusBadRequest)
 		return
 	}
 	
 	if h.cache.Delete([]byte(path)) {
-		h.writeResponse(writer, http.StatusOK, nil, []byte("OK"))
+		h.writeResponse(writer, http.StatusOK, nil, []byte("Deleted\r\n"))
 	} else {
-		h.writeError(writer, http.StatusNotFound, "Key not found")
+		h.writeError(writer, http.StatusNotFound)
 	}
 }
 
 func (h *HTTPHandler) handleHead(writer *bufio.Writer, req *http.Request) {
 	path := strings.TrimPrefix(req.URL.Path, "/")
 	if path == "" {
-		h.writeError(writer, http.StatusBadRequest, "Key required")
+		h.writeError(writer, http.StatusBadRequest)
 		return
 	}
 	
 	entry, found := h.cache.Load([]byte(path))
 	if !found {
-		h.writeError(writer, http.StatusNotFound, "Key not found")
+		h.writeError(writer, http.StatusNotFound)
 		return
 	}
 	
@@ -194,8 +193,7 @@ func (h *HTTPHandler) handleStats(writer *bufio.Writer) {
 	body, _ := json.MarshalIndent(stats, "", "  ")
 	
 	h.writeResponse(writer, http.StatusOK, map[string]string{
-		"Content-Type":   "application/json",
-		"Content-Length": strconv.Itoa(len(body)),
+		"Content-Type": "application/json",
 	}, body)
 }
 
@@ -217,11 +215,12 @@ func (h *HTTPHandler) handleKeys(writer *bufio.Writer, req *http.Request) {
 	body, _ := json.Marshal(keys)
 	
 	h.writeResponse(writer, http.StatusOK, map[string]string{
-		"Content-Type":   "application/json",
-		"Content-Length": strconv.Itoa(len(body)),
+		"Content-Type": "application/json",
 	}, body)
 }
 
+// writeResponse writes a response with a Content-Length for body. HEAD
+// responses pass a nil body and set Content-Length in headers instead.
 func (h *HTTPHandler) writeResponse(writer *bufio.Writer, status int, headers map[string]string, body []byte) {
 	writer.WriteString(fmt.Sprintf("HTTP/1.1 %d %s\r\n", status, http.StatusText(status)))
 	writer.WriteString("Server: gopogo/1.0\r\n")
@@ -230,22 +229,19 @@ func (h *HTTPHandler) writeResponse(writer *bufio.Writer, status int, headers ma
 	for key, value := range headers {
 		writer.WriteString(fmt.Sprintf("%s: %s\r\n", key, value))
 	}
-	
-	if body == nil {
-		writer.WriteString("Content-Length: 0\r\n")
+	if _, ok := headers["Content-Length"]; !ok {
+		writer.WriteString("Content-Length: " + strconv.Itoa(len(body)) + "\r\n")
 	}
 	
 	writer.WriteString("\r\n")
-	
-	if body != nil {
-		writer.Write(body)
-	}
+	writer.Write(body)
 }
 
-func (h *HTTPHandler) writeError(writer *bufio.Writer, status int, message string) {
-	body := fmt.Sprintf(`{"error":"%s"}`, message)
+// writeError writes the status text as a plain-text body, as pogocache does
+// (e.g. "Not Found\r\n").
+func (h *HTTPHandler) writeError(writer *bufio.Writer, status int) {
+	text := http.StatusText(status)
 	h.writeResponse(writer, status, map[string]string{
-		"Content-Type":   "application/json",
-		"Content-Length": strconv.Itoa(len(body)),
-	}, []byte(body))
+		"Content-Type": "text/plain",
+	}, []byte(text+"\r\n"))
 }

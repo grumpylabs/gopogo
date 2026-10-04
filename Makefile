@@ -1,4 +1,4 @@
-.PHONY: all build clean test bench install run help docker
+.PHONY: all build clean test integration integration-run bench install run help docker
 
 VERSION := 1.0.0
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "dev")
@@ -26,6 +26,16 @@ clean: ## Clean build artifacts and cache
 
 test: ## Run all tests with race detection
 	@go test -v -race -cover ./...
+
+# TestPostgres needs the Postgres extended query protocol and the shared
+# command layer, which gopogo does not have yet.
+INTEGRATION_SKIP ?= TestPostgres
+INTEGRATION_RUN ?= .
+
+integration: build integration-run ## Run pogocache's protocol tests against a live server
+
+integration-run: ## Run the integration tests without rebuilding (GOPOGO_BIN overrides the binary)
+	@test/integration/run.sh -timeout 5m -run '$(INTEGRATION_RUN)' -skip '$(INTEGRATION_SKIP)'
 
 test-coverage: ## Run tests and generate coverage report
 	@go test -v -race -coverprofile=coverage.out ./...

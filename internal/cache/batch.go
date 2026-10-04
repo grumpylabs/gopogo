@@ -74,7 +74,7 @@ func (b *Batch) Store(key, value []byte, opts *StoreOptions) StoreResult {
 	}
 
 	if opts != nil && (opts.NX || opts.XX || opts.KeepTTL) {
-		existing := shard.m.get(storeKey)
+		existing := shard.m.get(storeKey, origLen > 0)
 		alive := existing != nil && !existing.IsExpired()
 		if opts.NX && alive {
 			c.recordStore(start, "not_stored")
@@ -116,9 +116,9 @@ func (b *Batch) Load(key []byte) (*Entry, bool) {
 	start := time.Now()
 	shard, _ := b.acquireShard(key)
 	c := b.cache
-	lk := c.lookupKey(key)
+	lk, packed := c.lookupKey(key)
 
-	entry := shard.m.get(lk)
+	entry := shard.m.get(lk, packed)
 	if entry == nil {
 		c.recordLoad(start, false)
 		return nil, false
@@ -137,9 +137,9 @@ func (b *Batch) Delete(key []byte) bool {
 	start := time.Now()
 	shard, _ := b.acquireShard(key)
 	c := b.cache
-	lk := c.lookupKey(key)
+	lk, packed := c.lookupKey(key)
 
-	entry := shard.m.delete(lk, hashKey(lk))
+	entry := shard.m.delete(lk, hashKey(lk), packed)
 	if entry == nil {
 		c.recordDelete(start, false)
 		return false

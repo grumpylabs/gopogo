@@ -121,8 +121,8 @@ func TestRedisIncrDecr(t *testing.T) {
 	c.expect(errReply("ERR increment or decrement would overflow"), "INCR", "max")
 	c.expect(errReply("ERR increment or decrement would overflow"), "DECRBY", "x", "-9223372036854775808")
 
-	c.expect(int64(5), "UINCRBY", "u", "5")
-	c.expect(int64(4), "UDECR", "u")
+	c.expect("5", "UINCRBY", "u", "5")
+	c.expect("4", "UDECR", "u")
 	c.expect(errReply("ERR increment or decrement would overflow"), "UDECRBY", "u", "5")
 	c.expect(errReply("ERR value is not an integer or out of range"), "UINCR", "x")
 	c.expect(errReply("ERR wrong number of arguments for 'uincr' command"), "UINCR")
@@ -158,7 +158,7 @@ func TestRedisMGetS(t *testing.T) {
 	c := newRESPClient(t, ch)
 
 	c.expect([]interface{}{
-		[]interface{}{int64(7), int64(42), "1"},
+		[]interface{}{"7", "42", "1"},
 		nil,
 	}, "MGETS", "a", "missing")
 }

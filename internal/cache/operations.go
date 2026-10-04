@@ -78,7 +78,7 @@ func (c *Cache) Store(key, value []byte, opts *StoreOptions) (StoreResult, error
 
 	// Handle NX/XX conditional store at the engine level
 	if opts != nil && (opts.NX || opts.XX || opts.KeepTTL) {
-		existing := shard.m.get(storeKey)
+		existing := shard.m.get(storeKey, origLen > 0)
 		alive := existing != nil && !existing.IsExpired()
 
 		if opts.NX && alive {
@@ -150,17 +150,17 @@ func (c *Cache) Load(key []byte) (*Entry, bool) {
 func (c *Cache) LoadWithOptions(key []byte, opts *LoadOptions) (*Entry, bool) {
 	start := time.Now()
 	shard := c.getShard(key)
-	lk := c.lookupKey(key)
+	lk, packed := c.lookupKey(key)
 	needsWrite := opts != nil && opts.Entry != nil
 
 	// If the caller wants to update, take a write lock from the start.
 	// Otherwise use read lock with upgrade-on-expired.
 	if needsWrite {
-		return c.loadWithWrite(start, shard, lk, opts)
+		return c.loadWithWrite(start, shard, lk, packed, opts)
 	}
 
 	shard.mu.RLock()
-	entry := shard.m.get(lk)
+	entry := shard.m.get(lk, packed)
 	expired := entry != nil && entry.IsExpired()
 	shard.mu.RUnlock()
 
@@ -175,9 +175,9 @@ func (c *Cache) LoadWithOptions(key []byte, opts *LoadOptions) (*Entry, bool) {
 	if expired {
 		// Upgrade to write lock and delete the expired entry from the map.
 		shard.mu.Lock()
-		entry2 := shard.m.get(lk)
+		entry2 := shard.m.get(lk, packed)
 		if entry2 != nil && entry2.IsExpired() {
-			deleted := shard.m.delete(lk, hashKey(lk))
+			deleted := shard.m.deleteEntry(entry2)
 			if deleted != nil {
 				shard.addMemUsed(-deleted.Size())
 				atomic.AddUint64(&shard.numExpired, 1)
@@ -200,13 +200,13 @@ func (c *Cache) LoadWithOptions(key []byte, opts *LoadOptions) (*Entry, bool) {
 }
 
 // loadWithWrite handles Load when an Entry callback is set (needs write lock).
-func (c *Cache) loadWithWrite(start time.Time, shard *Shard, lk []byte, opts *LoadOptions) (*Entry, bool) {
+func (c *Cache) loadWithWrite(start time.Time, shard *Shard, lk []byte, packed bool, opts *LoadOptions) (*Entry, bool) {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	atomic.AddUint64(&shard.numOps, 1)
 
-	entry, idx := shard.m.getWithIndex(lk)
+	entry, idx := shard.m.getWithIndex(lk, packed)
 	if entry == nil {
 		atomic.AddUint64(&shard.numMisses, 1)
 		c.recordLoad(start, false)
@@ -214,7 +214,7 @@ func (c *Cache) loadWithWrite(start time.Time, shard *Shard, lk []byte, opts *Lo
 	}
 
 	if entry.IsExpired() {
-		deleted := shard.m.delete(lk, hashKey(lk))
+		deleted := shard.m.deleteEntry(entry)
 		if deleted != nil {
 			shard.addMemUsed(-deleted.Size())
 			atomic.AddUint64(&shard.numExpired, 1)
@@ -261,7 +261,7 @@ func (c *Cache) Delete(key []byte) bool {
 func (c *Cache) DeleteWithOptions(key []byte, opts *DeleteOptions) bool {
 	start := time.Now()
 	shard := c.getShard(key)
-	lk := c.lookupKey(key)
+	lk, packed := c.lookupKey(key)
 	h := hashKey(lk)
 
 	shard.mu.Lock()
@@ -271,7 +271,7 @@ func (c *Cache) DeleteWithOptions(key []byte, opts *DeleteOptions) bool {
 
 	// If there's a cancel callback, look up entry first without deleting
 	if opts != nil && opts.Entry != nil {
-		entry := shard.m.get(lk)
+		entry := shard.m.get(lk, packed)
 		if entry == nil {
 			c.recordDelete(start, false)
 			return false
@@ -283,7 +283,7 @@ func (c *Cache) DeleteWithOptions(key []byte, opts *DeleteOptions) bool {
 		}
 	}
 
-	entry := shard.m.delete(lk, h)
+	entry := shard.m.delete(lk, h, packed)
 	if entry == nil {
 		c.recordDelete(start, false)
 		return false
@@ -305,14 +305,14 @@ func (c *Cache) DeleteWithOptions(key []byte, opts *DeleteOptions) bool {
 
 func (c *Cache) CompareAndSwap(key, value []byte, cas uint64, opts *StoreOptions) (bool, error) {
 	shard := c.getShard(key)
-	lk := c.lookupKey(key)
+	lk, packed := c.lookupKey(key)
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	atomic.AddUint64(&shard.numOps, 1)
 
-	existing, idx := shard.m.getWithIndex(lk)
+	existing, idx := shard.m.getWithIndex(lk, packed)
 	if existing == nil || existing.IsExpired() {
 		return false, ErrNotFound
 	}
@@ -415,7 +415,7 @@ func (c *Cache) Update(key []byte, fn func(cur []byte, found bool) ([]byte, erro
 	atomic.AddUint64(&shard.numOps, 1)
 	now := time.Now().UnixNano()
 
-	existing, idx := shard.m.getWithIndex(storeKey)
+	existing, idx := shard.m.getWithIndex(storeKey, origLen > 0)
 	if existing != nil && !existing.IsExpired() {
 		val, err := fn(existing.value, true)
 		if err != nil {
@@ -497,15 +497,15 @@ func (c *Cache) SweepShard(shardIdx int) int {
 
 func (c *Cache) sweepShard(shard *Shard) int {
 	expired := 0
-	toDelete := make([][]byte, 0)
+	toDelete := make([]*Entry, 0)
 	shard.m.iter(func(e *Entry) bool {
 		if e.IsExpired() {
-			toDelete = append(toDelete, e.key)
+			toDelete = append(toDelete, e)
 		}
 		return true
 	})
-	for _, key := range toDelete {
-		if entry := shard.m.delete(key, hashKey(key)); entry != nil {
+	for _, e := range toDelete {
+		if entry := shard.m.deleteEntry(e); entry != nil {
 			shard.addMemUsed(-entry.Size())
 			expired++
 			atomic.AddUint64(&shard.numExpired, 1)
@@ -547,7 +547,7 @@ func (c *Cache) sweepPollShard(shard *Shard, pollSize int) int {
 			continue
 		}
 		if bucket.entry.IsExpired() {
-			entry := shard.m.delete(bucket.entry.key, hashKey(bucket.entry.key))
+			entry := shard.m.deleteEntry(bucket.entry)
 			if entry != nil {
 				shard.addMemUsed(-entry.Size())
 				expired++
@@ -699,7 +699,7 @@ func (c *Cache) evictIfNeeded(shard *Shard, requiredSpace int64, skipHash uint64
 		}
 
 		// Delete from map immediately (matches C implementation behavior)
-		deleted := shard.m.delete(toEvict.key, hashKey(toEvict.key))
+		deleted := shard.m.deleteEntry(toEvict)
 		if deleted != nil {
 			shard.addMemUsed(-deleted.Size())
 			atomic.AddUint64(&shard.numEvicted, 1)
@@ -756,16 +756,17 @@ func (c *Cache) compressKey(key []byte) ([]byte, int) {
 	return packed, len(key)
 }
 
-// lookupKey returns the key form used for map lookups.
-func (c *Cache) lookupKey(key []byte) []byte {
+// lookupKey returns the key form used for map lookups and whether it is
+// sixpack encoded.
+func (c *Cache) lookupKey(key []byte) ([]byte, bool) {
 	if c.noSixpack {
-		return key
+		return key, false
 	}
 	packed := Sixpack(key)
 	if packed == nil {
-		return key
+		return key, false
 	}
-	return packed
+	return packed, true
 }
 
 // Callback helpers
