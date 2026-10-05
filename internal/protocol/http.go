@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"github.com/grumpylabs/gopogo/internal/cache"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 // HTTPHandler maps HTTP requests onto the shared command layer, as pogocache
@@ -140,7 +143,9 @@ func (h *HTTPHandler) serve(w *bufio.Writer, req *http.Request, addr string) {
 		return
 	}
 
-	s := &session{proto: TypeHTTP, addr: addr, authed: true}
+	// Continue the caller's trace when the request carries traceparent.
+	ctx := otel.GetTextMapPropagator().Extract(context.Background(), propagation.HeaderCarrier(req.Header))
+	s := &session{proto: TypeHTTP, addr: addr, authed: true, ctx: ctx}
 	r := h.exec.exec(s, args)
 	switch {
 	case r.err != "":
@@ -168,7 +173,7 @@ func (h *HTTPHandler) authorized(req *http.Request, query url.Values) bool {
 		return true
 	}
 	ok := token == h.exec.auth
-	countAuth(ok)
+	countAuth(TypeHTTP, ok)
 	return ok
 }
 

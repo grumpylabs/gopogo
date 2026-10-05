@@ -2,4 +2,5 @@
 
 package protocol
 
-func cpuTimes() (user, system string, ok bool) { return "", "", false }
+// CPUSeconds is not available on this platform.
+func CPUSeconds() (user, system float64, ok bool) { return 0, 0, false }

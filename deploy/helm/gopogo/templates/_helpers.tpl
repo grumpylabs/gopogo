@@ -93,7 +93,14 @@ password
 {{- if .Values.telemetry.enabled }}
 - --telemetry
 - --telemetry-exporter={{ .Values.telemetry.exporter }}
-- --otlp-endpoint={{ .Values.telemetry.otlpEndpoint }}
+{{- with .Values.telemetry.otlpEndpoint }}
+- --otlp-endpoint={{ . }}
+{{- end }}
+- --otlp-insecure={{ .Values.telemetry.insecure }}
+{{- with .Values.telemetry.environment }}
+- --telemetry-environment={{ . }}
+{{- end }}
+- --trace-sample-ratio={{ .Values.telemetry.traceSampleRatio }}
 {{- end }}
 {{- range .Values.extraArgs }}
 - {{ . | quote }}

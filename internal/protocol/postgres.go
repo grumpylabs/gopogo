@@ -186,7 +186,7 @@ func (c *pgConn) startup() error {
 	if c.h.exec.auth != "" {
 		err := c.scramAuth(c.h.exec.auth)
 		if err == nil || err == errSCRAM {
-			countAuth(err == nil)
+			countAuth(TypePostgres, err == nil)
 		}
 		if err != nil {
 			if err == errSCRAM {

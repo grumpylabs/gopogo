@@ -2,17 +2,14 @@
 
 package protocol
 
-import (
-	"fmt"
-	"syscall"
-)
+import "syscall"
 
-// cpuTimes returns user and system CPU time as "seconds.microseconds".
-func cpuTimes() (user, system string, ok bool) {
+// CPUSeconds returns the process's user and system CPU time in seconds.
+func CPUSeconds() (user, system float64, ok bool) {
 	var ru syscall.Rusage
 	if syscall.Getrusage(syscall.RUSAGE_SELF, &ru) != nil {
-		return "", "", false
+		return 0, 0, false
 	}
-	return fmt.Sprintf("%d.%06d", ru.Utime.Sec, ru.Utime.Usec),
-		fmt.Sprintf("%d.%06d", ru.Stime.Sec, ru.Stime.Usec), true
+	tv := func(sec, usec int64) float64 { return float64(sec) + float64(usec)/1e6 }
+	return tv(int64(ru.Utime.Sec), int64(ru.Utime.Usec)), tv(int64(ru.Stime.Sec), int64(ru.Stime.Usec)), true
 }

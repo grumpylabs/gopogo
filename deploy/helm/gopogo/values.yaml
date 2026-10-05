@@ -72,10 +72,20 @@ persistence:
   fileName: gopogo.pogo
 
 telemetry:
+  # OpenTelemetry metrics and traces.
   enabled: false
   # otlp or stdout
   exporter: otlp
-  otlpEndpoint: localhost:4317
+  # OTLP gRPC host:port, e.g. otel-collector.observability:4317. Empty uses
+  # OTEL_EXPORTER_OTLP_ENDPOINT (set it in extraEnv) or localhost:4317.
+  otlpEndpoint: ""
+  # Plaintext OTLP; set false for a collector that requires TLS.
+  insecure: true
+  # deployment.environment resource attribute, e.g. stage or prod.
+  environment: ""
+  # Fraction of new traces to sample (0-1). A caller's sampling decision
+  # (HTTP traceparent) is always respected.
+  traceSampleRatio: 1.0
 
 # Extra command-line flags, e.g. ["--tcpnodelay=false"].
 extraArgs: []

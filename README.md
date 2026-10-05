@@ -50,8 +50,8 @@ gopogo --redis --http --memcache
 # With authentication and TLS
 gopogo --auth mypassword --tlsport 6380 --tlscert cert.pem --tlskey key.pem
 
-# With telemetry
-gopogo --telemetry --telemetry-exporter otlp --otlp-endpoint localhost:4317
+# With telemetry (metrics and traces)
+gopogo --telemetry --otlp-endpoint otel-collector:4317 --telemetry-environment stage
 
 # Disable eviction (reject writes when full) and key compression
 gopogo --noevict --nosixpack
@@ -81,9 +81,12 @@ Boolean flags take `=true` or `=false` (e.g. `--cas=false`); pogocache-style `--
 | `--cas` | `GOPOGO_CAS` | `false` | Assign compare-and-swap tokens on every write. When off, memcache `cas` and HTTP `X-CAS` writes always fail |
 | `--autosweep` | `GOPOGO_AUTOSWEEP` | `true` | Enable background sweeping |
 | `--sweepinterval` | `GOPOGO_SWEEPINTERVAL` | `10s` | Sweep interval |
-| `--telemetry` | `GOPOGO_TELEMETRY` | `false` | Enable OpenTelemetry metrics |
+| `--telemetry` | `GOPOGO_TELEMETRY` | `false` | Enable OpenTelemetry metrics and traces (see Telemetry) |
 | `--telemetry-exporter` | `GOPOGO_TELEMETRY_EXPORTER` | `otlp` | Exporter type (otlp, stdout) |
-| `--otlp-endpoint` | `GOPOGO_OTLP_ENDPOINT` | `localhost:4317` | OTLP gRPC endpoint |
+| `--otlp-endpoint` | `GOPOGO_OTLP_ENDPOINT` | | OTLP gRPC endpoint (default `OTEL_EXPORTER_OTLP_ENDPOINT`, else `localhost:4317`) |
+| `--otlp-insecure` | `GOPOGO_OTLP_INSECURE` | `true` | Plaintext OTLP; `false` uses TLS |
+| `--telemetry-environment` | `GOPOGO_TELEMETRY_ENVIRONMENT` | | `deployment.environment` resource attribute |
+| `--trace-sample-ratio` | `GOPOGO_TRACE_SAMPLE_RATIO` | `1.0` | Fraction of new traces sampled |
 | `--tlsport` | `GOPOGO_TLSPORT` | `0` | TLS listening port |
 | `--tlscert` | `GOPOGO_TLSCERT` | | TLS certificate file |
 | `--tlskey` | `GOPOGO_TLSKEY` | | TLS key file |
@@ -237,18 +240,42 @@ psql -h localhost -p 5432 -U user dbname
 
 ## Telemetry
 
-When enabled, Gopogo exports OpenTelemetry metrics:
+With `--telemetry`, Gopogo exports OpenTelemetry metrics and traces over OTLP gRPC (`--telemetry-exporter otlp`, the default) or to stdout. Metrics are exported every 30 seconds, and pending metrics and spans are flushed on shutdown.
 
-| Metric | Type | Description |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--otlp-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT`, else `localhost:4317` | Collector host:port |
+| `--otlp-insecure` | `true` | Plaintext OTLP; `false` uses TLS |
+| `--telemetry-environment` | | `deployment.environment` resource attribute |
+| `--trace-sample-ratio` | `1.0` | Fraction of new traces sampled; a caller's sampling decision is respected |
+
+`OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` override the resource attributes.
+
+### Traces
+
+Every command runs in a server span named after the command (`GET`, `SET`, memcache `get`; unrecognized commands are `UNKNOWN`), with `db.system.name`, `db.operation.name`, `network.protocol.name` (redis, http, memcache, postgres), `client.address` and `client.port`. Failed commands set the span status to error and `error.type` to the error reply's first word (`ERR`, `WRONGPASS`, `CLIENT_ERROR`, ...). Keys and values are never recorded. HTTP requests continue the caller's trace from a W3C `traceparent` header; the other protocols cannot carry trace context, so their spans start new traces. Loading and saving the persistence file run in `persist.load` and `persist.save` spans.
+
+### Metrics
+
+| Metric | Type | Attributes / description |
 |--------|------|-------------|
-| `cache.store.count` | Counter | Store operations (with `result` attribute) |
+| `gopogo.commands` | Counter | `protocol`, `command` (get, set, flush, touch); STATS `cmd_*` |
+| `gopogo.keyspace.lookups` | Counter | `protocol`, `operation` (get, delete, incr, decr, touch), `result` (hit, miss) |
+| `gopogo.store.rejected` | Counter | `protocol`, `reason` (no_memory, too_large) |
+| `gopogo.auth.attempts` | Counter | `protocol`, `result` (success, failure) |
+| `gopogo.connections.active` / `.limit` | Gauge | Open connections and `--maxconns` |
+| `gopogo.connections.accepted` / `.rejected` | Counter | Connections accepted and refused at the limit |
+| `cache.items.stored` | Counter | Successful writes (STATS `total_items`) |
+| `process.cpu.time` | Counter | Seconds, `cpu.mode` (user, system) |
+| `process.memory.usage` | Gauge | Resident memory (bytes; approximate off Linux) |
+| `go.*` | Various | Go runtime: memory, GC, goroutines |
+| `cache.store.count` | Counter | Engine store operations (with `result` attribute) |
 | `cache.store.duration` | Histogram | Store latency (ms) |
-| `cache.load.count` | Counter | Load operations |
+| `cache.load.count` | Counter | Engine load operations |
 | `cache.load.duration` | Histogram | Load latency (ms) |
-| `cache.delete.count` | Counter | Delete operations |
+| `cache.delete.count` | Counter | Engine delete operations |
 | `cache.delete.duration` | Histogram | Delete latency (ms) |
-| `cache.hit.count` | Counter | Cache hits |
-| `cache.miss.count` | Counter | Cache misses |
+| `cache.hit.count` / `cache.miss.count` | Counter | Engine lookups, including internal ones |
 | `cache.memory.used` | Gauge | Current memory usage (bytes) |
 | `cache.items.count` | Gauge | Current item count |
 | `cache.eviction.count` | Counter | Evictions |
@@ -256,6 +283,8 @@ When enabled, Gopogo exports OpenTelemetry metrics:
 | `cache.sweep.duration` | Histogram | Sweep latency (ms) |
 | `cache.save.duration` | Histogram | Persistence save latency (ms) |
 | `cache.loadfile.duration` | Histogram | Persistence load latency (ms) |
+
+The `gopogo.*` counters count client commands like STATS does; the `cache.*` engine counters count every engine operation, including internal lookups.
 
 ## Architecture
 

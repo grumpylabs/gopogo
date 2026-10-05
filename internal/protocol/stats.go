@@ -29,9 +29,9 @@ var ConnStats struct {
 // Commit is reported as githash by STATS; main sets it.
 var Commit = "dev"
 
-// counters are server-wide command counters reported by STATS, counted the
-// way pogocache counts them (per key for multi-key reads and deletes).
-var counters struct {
+// commandCounters are command counters reported by STATS, counted the way
+// pogocache counts them (per key for multi-key reads, deletes and touches).
+type commandCounters struct {
 	cmdGet, cmdSet, cmdFlush, cmdTouch atomic.Uint64
 	getHits, getMisses                 atomic.Uint64
 	deleteHits, deleteMisses           atomic.Uint64
@@ -40,6 +40,18 @@ var counters struct {
 	touchHits, touchMisses             atomic.Uint64
 	storeTooLarge, storeNoMemory       atomic.Uint64
 	authCmds, authErrors               atomic.Uint64
+}
+
+// counters holds one set of counters per protocol, indexed by Type. STATS
+// reports their sum; telemetry exports them per protocol.
+var counters [TypePostgres + 1]commandCounters
+
+// ctr returns the counters for protocol p.
+func ctr(p Type) *commandCounters {
+	if p < 0 || int(p) >= len(counters) {
+		p = TypeUnknown
+	}
+	return &counters[p]
 }
 
 // countHit adds one to hits or misses.
@@ -51,12 +63,46 @@ func countHit(found bool, hits, misses *atomic.Uint64) {
 	}
 }
 
-// countAuth records an authentication check.
-func countAuth(ok bool) {
-	counters.authCmds.Add(1)
+// countAuth records an authentication check on protocol p.
+func countAuth(p Type, ok bool) {
+	c := ctr(p)
+	c.authCmds.Add(1)
 	if !ok {
-		counters.authErrors.Add(1)
+		c.authErrors.Add(1)
 	}
+}
+
+// ProtocolCounters is a snapshot of one protocol's command counters.
+type ProtocolCounters struct {
+	Protocol                                   string
+	CmdGet, CmdSet, CmdFlush, CmdTouch         uint64
+	GetHits, GetMisses                         uint64
+	DeleteHits, DeleteMisses                   uint64
+	IncrHits, IncrMisses, DecrHits, DecrMisses uint64
+	TouchHits, TouchMisses                     uint64
+	StoreTooLarge, StoreNoMemory               uint64
+	AuthCmds, AuthErrors                       uint64
+}
+
+// CounterSnapshot returns the command counters of each protocol.
+func CounterSnapshot() []ProtocolCounters {
+	out := make([]ProtocolCounters, 0, len(counters))
+	for i := range counters {
+		c := &counters[i]
+		out = append(out, ProtocolCounters{
+			Protocol: Type(i).String(),
+			CmdGet:   c.cmdGet.Load(), CmdSet: c.cmdSet.Load(),
+			CmdFlush: c.cmdFlush.Load(), CmdTouch: c.cmdTouch.Load(),
+			GetHits: c.getHits.Load(), GetMisses: c.getMisses.Load(),
+			DeleteHits: c.deleteHits.Load(), DeleteMisses: c.deleteMisses.Load(),
+			IncrHits: c.incrHits.Load(), IncrMisses: c.incrMisses.Load(),
+			DecrHits: c.decrHits.Load(), DecrMisses: c.decrMisses.Load(),
+			TouchHits: c.touchHits.Load(), TouchMisses: c.touchMisses.Load(),
+			StoreTooLarge: c.storeTooLarge.Load(), StoreNoMemory: c.storeNoMemory.Load(),
+			AuthCmds: c.authCmds.Load(), AuthErrors: c.authErrors.Load(),
+		})
+	}
+	return out
 }
 
 // statLines returns server stats as name/value pairs in the order pogocache's
@@ -74,7 +120,14 @@ func statLines(c *cache.Cache) [][2]string {
 		}
 		return "0"
 	}
-	u := func(v *atomic.Uint64) string { return strconv.FormatUint(v.Load(), 10) }
+	// u sums a counter across protocols.
+	u := func(field func(*commandCounters) *atomic.Uint64) string {
+		var n uint64
+		for i := range counters {
+			n += field(&counters[i]).Load()
+		}
+		return strconv.FormatUint(n, 10)
+	}
 
 	lines := [][2]string{
 		{"pid", strconv.Itoa(os.Getpid())},
@@ -85,32 +138,34 @@ func statLines(c *cache.Cache) [][2]string {
 		{"githash", Commit},
 		{"pointer_size", strconv.Itoa(strconv.IntSize)},
 	}
-	if user, system, ok := cpuTimes(); ok {
-		lines = append(lines, [2]string{"rusage_user", user}, [2]string{"rusage_system", system})
+	if user, system, ok := CPUSeconds(); ok {
+		lines = append(lines,
+			[2]string{"rusage_user", strconv.FormatFloat(user, 'f', 6, 64)},
+			[2]string{"rusage_system", strconv.FormatFloat(system, 'f', 6, 64)})
 	}
 	return append(lines, [][2]string{
 		{"max_connections", strconv.FormatInt(ConnStats.Max, 10)},
 		{"curr_connections", strconv.FormatInt(ConnStats.Curr.Load(), 10)},
 		{"total_connections", strconv.FormatInt(ConnStats.Total.Load(), 10)},
 		{"rejected_connections", strconv.FormatInt(ConnStats.Rejected.Load(), 10)},
-		{"cmd_get", u(&counters.cmdGet)},
-		{"cmd_set", u(&counters.cmdSet)},
-		{"cmd_flush", u(&counters.cmdFlush)},
-		{"cmd_touch", u(&counters.cmdTouch)},
-		{"get_hits", u(&counters.getHits)},
-		{"get_misses", u(&counters.getMisses)},
-		{"delete_misses", u(&counters.deleteMisses)},
-		{"delete_hits", u(&counters.deleteHits)},
-		{"incr_misses", u(&counters.incrMisses)},
-		{"incr_hits", u(&counters.incrHits)},
-		{"decr_misses", u(&counters.decrMisses)},
-		{"decr_hits", u(&counters.decrHits)},
-		{"touch_hits", u(&counters.touchHits)},
-		{"touch_misses", u(&counters.touchMisses)},
-		{"store_too_large", u(&counters.storeTooLarge)},
-		{"store_no_memory", u(&counters.storeNoMemory)},
-		{"auth_cmds", u(&counters.authCmds)},
-		{"auth_errors", u(&counters.authErrors)},
+		{"cmd_get", u(func(c *commandCounters) *atomic.Uint64 { return &c.cmdGet })},
+		{"cmd_set", u(func(c *commandCounters) *atomic.Uint64 { return &c.cmdSet })},
+		{"cmd_flush", u(func(c *commandCounters) *atomic.Uint64 { return &c.cmdFlush })},
+		{"cmd_touch", u(func(c *commandCounters) *atomic.Uint64 { return &c.cmdTouch })},
+		{"get_hits", u(func(c *commandCounters) *atomic.Uint64 { return &c.getHits })},
+		{"get_misses", u(func(c *commandCounters) *atomic.Uint64 { return &c.getMisses })},
+		{"delete_misses", u(func(c *commandCounters) *atomic.Uint64 { return &c.deleteMisses })},
+		{"delete_hits", u(func(c *commandCounters) *atomic.Uint64 { return &c.deleteHits })},
+		{"incr_misses", u(func(c *commandCounters) *atomic.Uint64 { return &c.incrMisses })},
+		{"incr_hits", u(func(c *commandCounters) *atomic.Uint64 { return &c.incrHits })},
+		{"decr_misses", u(func(c *commandCounters) *atomic.Uint64 { return &c.decrMisses })},
+		{"decr_hits", u(func(c *commandCounters) *atomic.Uint64 { return &c.decrHits })},
+		{"touch_hits", u(func(c *commandCounters) *atomic.Uint64 { return &c.touchHits })},
+		{"touch_misses", u(func(c *commandCounters) *atomic.Uint64 { return &c.touchMisses })},
+		{"store_too_large", u(func(c *commandCounters) *atomic.Uint64 { return &c.storeTooLarge })},
+		{"store_no_memory", u(func(c *commandCounters) *atomic.Uint64 { return &c.storeNoMemory })},
+		{"auth_cmds", u(func(c *commandCounters) *atomic.Uint64 { return &c.authCmds })},
+		{"auth_errors", u(func(c *commandCounters) *atomic.Uint64 { return &c.authErrors })},
 		{"threads", strconv.Itoa(runtime.GOMAXPROCS(0))},
 		{"rss", strconv.FormatInt(sysmem.RSS(), 10)},
 		{"bytes", num(s["mem_used"])},

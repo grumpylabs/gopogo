@@ -17,6 +17,10 @@ import (
 	"github.com/grumpylabs/gopogo/internal/sysmem"
 	"github.com/grumpylabs/gopogo/internal/telemetry"
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"github.com/spf13/viper"
 )
 
@@ -78,9 +82,12 @@ func init() {
 	rootCmd.PersistentFlags().Bool("verbose", false, "Verbose output")
 	rootCmd.PersistentFlags().Bool("version", false, "Show version")
 
-	rootCmd.PersistentFlags().Bool("telemetry", false, "Enable OpenTelemetry metrics")
+	rootCmd.PersistentFlags().Bool("telemetry", false, "Enable OpenTelemetry metrics and traces")
 	rootCmd.PersistentFlags().String("telemetry-exporter", "otlp", "Telemetry exporter (otlp, stdout)")
-	rootCmd.PersistentFlags().String("otlp-endpoint", "localhost:4317", "OTLP gRPC endpoint")
+	rootCmd.PersistentFlags().String("otlp-endpoint", "", "OTLP gRPC endpoint host:port (default OTEL_EXPORTER_OTLP_ENDPOINT, else localhost:4317)")
+	rootCmd.PersistentFlags().Bool("otlp-insecure", true, "Send OTLP in plaintext; false uses TLS")
+	rootCmd.PersistentFlags().String("telemetry-environment", "", "deployment.environment resource attribute")
+	rootCmd.PersistentFlags().Float64("trace-sample-ratio", 1.0, "Fraction of new traces to sample (0-1); a caller's sampling decision is respected")
 	rootCmd.PersistentFlags().Bool("noevict", false, "Same as --evict=no")
 	rootCmd.PersistentFlags().Bool("nosixpack", false, "Disable sixpack key compression")
 	rootCmd.PersistentFlags().Int("loadfactor", 75, "Hashmap load factor percent (55-95)")
@@ -150,22 +157,45 @@ func runServer(cmd *cobra.Command, args []string) {
 	})
 
 	// Initialize telemetry
-	metrics, err := telemetry.NewMetrics(context.Background(), &telemetry.Config{
+	telemetryCfg := &telemetry.Config{
 		Enabled:        viper.GetBool("telemetry"),
 		ExporterType:   viper.GetString("telemetry-exporter"),
 		OTLPEndpoint:   viper.GetString("otlp-endpoint"),
+		Insecure:       viper.GetBool("otlp-insecure"),
 		ServiceName:    "gopogo",
 		ServiceVersion: version,
-	})
+		Environment:    viper.GetString("telemetry-environment"),
+		SampleRatio:    viper.GetFloat64("trace-sample-ratio"),
+	}
+	metrics, err := telemetry.NewMetrics(context.Background(), telemetryCfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize telemetry: %v\n", err)
 		os.Exit(1)
+	}
+	tracer, err := telemetry.NewTracer(context.Background(), telemetryCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize tracing: %v\n", err)
+		os.Exit(1)
+	}
+	// Flush metrics and spans on every exit path after this point.
+	shutdownTelemetry := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		tracer.Shutdown(ctx)
+		metrics.Shutdown(ctx)
+	}
+	if telemetryCfg.Enabled {
+		protocol.EnableTracing()
 	}
 	c.SetMetrics(metrics)
 	metrics.RegisterGauges(
 		func() int64 { return c.MemUsed() },
 		func() int64 { return int64(c.NumItems()) },
 	)
+	if err := metrics.RegisterServerMetrics(c); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize telemetry: %v\n", err)
+		os.Exit(1)
+	}
 
 	persist := viper.GetString("persist")
 	if persist != "" {
@@ -204,6 +234,7 @@ func runServer(cmd *cobra.Command, args []string) {
 
 	if err := srv.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error starting server: %v\n", err)
+		shutdownTelemetry()
 		os.Exit(1)
 	}
 
@@ -211,11 +242,20 @@ func runServer(cmd *cobra.Command, args []string) {
 		if !viper.GetBool("quiet") {
 			fmt.Printf("Saving data to %s, please wait...\n", persist)
 		}
-		if err := c.Save(persist); err != nil {
+		_, span := otel.Tracer("github.com/grumpylabs/gopogo/cmd").Start(context.Background(), "persist.save",
+			trace.WithAttributes(attribute.String("file.path", persist)))
+		err := c.Save(persist)
+		if err != nil {
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "Save failed: %v\n", err)
+			shutdownTelemetry()
 			os.Exit(1)
 		}
 	}
+	shutdownTelemetry()
 }
 
 // validateFlags exits with a message for flag values the server cannot start
@@ -279,7 +319,16 @@ func loadPersist(c *cache.Cache, path string) {
 		fmt.Printf("Loading data from %s, please wait...\n", path)
 	}
 	start := time.Now()
+	_, span := otel.Tracer("github.com/grumpylabs/gopogo/cmd").Start(context.Background(), "persist.load",
+		trace.WithAttributes(attribute.String("file.path", path)))
 	stats, err := c.LoadFromFile(path)
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+	} else {
+		span.SetAttributes(attribute.Int("gopogo.entries.loaded", stats.Inserted),
+			attribute.Int("gopogo.entries.expired", stats.Expired))
+	}
+	span.End()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Load failed: %v\n", err)
 		os.Exit(1)

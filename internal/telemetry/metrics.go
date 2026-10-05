@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
@@ -21,10 +22,12 @@ import (
 type Config struct {
 	Enabled        bool
 	ExporterType   string // "otlp", "stdout"
-	OTLPEndpoint   string
+	OTLPEndpoint   string // host:port; empty uses OTEL_EXPORTER_OTLP_* or localhost:4317
+	Insecure       bool   // plaintext OTLP instead of TLS
 	ServiceName    string
 	ServiceVersion string
 	Environment    string
+	SampleRatio    float64 // fraction of new traces to sample, 0-1
 }
 
 // Metrics holds the metric instruments for gopogo
@@ -74,8 +77,10 @@ func createResource(cfg *Config) (*resource.Resource, error) {
 	if cfg.Environment != "" {
 		attrs = append(attrs, semconv.DeploymentEnvironment(cfg.Environment))
 	}
+	// OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME override the defaults.
 	return resource.New(context.Background(),
 		resource.WithAttributes(attrs...),
+		resource.WithFromEnv(),
 	)
 }
 
@@ -100,7 +105,9 @@ func NewMetrics(ctx context.Context, cfg *Config) (*Metrics, error) {
 		if cfg.OTLPEndpoint != "" {
 			opts = append(opts, otlpmetricgrpc.WithEndpoint(cfg.OTLPEndpoint))
 		}
-		opts = append(opts, otlpmetricgrpc.WithInsecure())
+		if cfg.Insecure {
+			opts = append(opts, otlpmetricgrpc.WithInsecure())
+		}
 		exporter, err = otlpmetricgrpc.New(ctx, opts...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create OTLP exporter: %w", err)
@@ -128,6 +135,11 @@ func NewMetrics(ctx context.Context, cfg *Config) (*Metrics, error) {
 
 	if err := m.initializeInstruments(); err != nil {
 		return nil, err
+	}
+
+	// Go runtime metrics (go.memory.*, go.goroutine.count, go.gc.* ...).
+	if err := runtime.Start(runtime.WithMeterProvider(m.meterProvider)); err != nil {
+		return nil, fmt.Errorf("failed to start runtime metrics: %w", err)
 	}
 
 	return m, nil

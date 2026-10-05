@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -33,9 +34,9 @@ func NewMemcacheHandler(cache *cache.Cache, auth string) *MemcacheHandler {
 // incrOrDecr returns the hit and miss counters for incr or decr.
 func incrOrDecr(incr bool) (hits, misses *atomic.Uint64) {
 	if incr {
-		return &counters.incrHits, &counters.incrMisses
+		return &ctr(TypeMemcache).incrHits, &ctr(TypeMemcache).incrMisses
 	}
-	return &counters.decrHits, &counters.decrMisses
+	return &ctr(TypeMemcache).decrHits, &ctr(TypeMemcache).decrMisses
 }
 
 // memcacheNoMemory is memcached's reply when a write does not fit and eviction
@@ -51,7 +52,10 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 	defer conn.Close()
 	
 	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
+	// peek sees the start of each flushed reply, so a command's span can be
+	// marked failed when the reply is an error.
+	peek := &replyPeek{w: conn}
+	writer := bufio.NewWriter(peek)
 	addr := conn.RemoteAddr().String()
 	
 	for {
@@ -75,8 +79,15 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 		}
 		
 		cmd := strings.ToLower(parts[0])
+		spanName := cmd
+		if !memcacheCmds[cmd] {
+			spanName = "UNKNOWN"
+		}
+		_, span := startCommandSpan(context.Background(), TypeMemcache, addr, spanName)
+		peek.reset()
 		if h.auth != "" {
 			if cmd == "quit" {
+				endCommandSpan(span, "")
 				return
 			}
 			// Consume a storage command's data block so the next command
@@ -88,9 +99,10 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 					}
 				}
 			}
-			countAuth(false)
+			countAuth(TypeMemcache, false)
 			writer.WriteString("CLIENT_ERROR Authentication required\r\n")
 			writer.Flush()
+			endCommandSpan(span, peek.errorReply())
 			continue
 		}
 		monitors.publish(addr, parts)
@@ -141,7 +153,7 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 			}
 			
 		case "flush_all":
-			counters.cmdFlush.Add(1)
+			ctr(TypeMemcache).cmdFlush.Add(1)
 			h.cache.Clear()
 			writer.WriteString("OK\r\n")
 			
@@ -153,6 +165,7 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 			
 		case "quit":
 			writer.Flush()
+			endCommandSpan(span, "")
 			return
 			
 		default:
@@ -160,7 +173,46 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 		}
 		
 		writer.Flush()
+		endCommandSpan(span, peek.errorReply())
 	}
+}
+
+// memcacheCmds are the commands the handler implements; others are traced
+// as UNKNOWN.
+var memcacheCmds = map[string]bool{
+	"get": true, "gets": true, "gat": true, "gats": true, "set": true, "add": true,
+	"replace": true, "append": true, "prepend": true, "cas": true, "delete": true,
+	"incr": true, "decr": true, "touch": true, "flush_all": true, "stats": true,
+	"version": true, "verbosity": true, "quit": true,
+}
+
+// replyPeek passes writes through and keeps the first bytes written since
+// the last reset.
+type replyPeek struct {
+	w    io.Writer
+	head []byte
+}
+
+func (p *replyPeek) Write(b []byte) (int, error) {
+	if n := 64 - len(p.head); n > 0 {
+		p.head = append(p.head, b[:min(n, len(b))]...)
+	}
+	return p.w.Write(b)
+}
+
+func (p *replyPeek) reset() { p.head = p.head[:0] }
+
+// errorReply returns the first line of the reply if it is a memcache error
+// (ERROR, CLIENT_ERROR or SERVER_ERROR), else "".
+func (p *replyPeek) errorReply() string {
+	line := string(p.head)
+	if i := strings.Index(line, "\r\n"); i >= 0 {
+		line = line[:i]
+	}
+	if line == "ERROR" || strings.HasPrefix(line, "CLIENT_ERROR") || strings.HasPrefix(line, "SERVER_ERROR") {
+		return line
+	}
+	return ""
 }
 
 func (h *MemcacheHandler) handleGet(reader *bufio.Reader, writer *bufio.Writer, keys []string, withCAS bool) {
@@ -188,11 +240,11 @@ func (h *MemcacheHandler) handleGAT(writer *bufio.Writer, parts []string, withCA
 func (h *MemcacheHandler) writeValues(writer *bufio.Writer, keys []string, withCAS bool, touch func(*cache.Entry)) {
 	for _, key := range keys {
 		entry, found := h.cache.Load([]byte(key))
-		counters.cmdGet.Add(1)
-		countHit(found, &counters.getHits, &counters.getMisses)
+		ctr(TypeMemcache).cmdGet.Add(1)
+		countHit(found, &ctr(TypeMemcache).getHits, &ctr(TypeMemcache).getMisses)
 		if touch != nil {
-			counters.cmdTouch.Add(1)
-			countHit(found, &counters.touchHits, &counters.touchMisses)
+			ctr(TypeMemcache).cmdTouch.Add(1)
+			countHit(found, &ctr(TypeMemcache).touchHits, &ctr(TypeMemcache).touchMisses)
 		}
 		if !found {
 			continue
@@ -310,9 +362,9 @@ func (h *MemcacheHandler) handleStore(reader *bufio.Reader, writer *bufio.Writer
 	
 	opts.TTL = memcacheTTL(exptime)
 	
-	counters.cmdSet.Add(1)
+	ctr(TypeMemcache).cmdSet.Add(1)
 	if _, err := h.cache.Store([]byte(key), data, opts); err != nil {
-		counters.storeNoMemory.Add(1)
+		ctr(TypeMemcache).storeNoMemory.Add(1)
 		if !noreply {
 			writer.WriteString(memcacheNoMemory)
 		}
@@ -372,10 +424,10 @@ func (h *MemcacheHandler) handleCAS(reader *bufio.Reader, writer *bufio.Writer, 
 	
 	opts.TTL = memcacheTTL(exptime)
 	
-	counters.cmdSet.Add(1)
+	ctr(TypeMemcache).cmdSet.Add(1)
 	success, err := h.cache.CompareAndSwap([]byte(key), data, cas, opts)
 	if err == cache.ErrOutOfMemory {
-		counters.storeNoMemory.Add(1)
+		ctr(TypeMemcache).storeNoMemory.Add(1)
 	}
 	if err != nil {
 		if !noreply {
@@ -439,7 +491,7 @@ func (h *MemcacheHandler) handleAppend(reader *bufio.Reader, writer *bufio.Write
 	})
 	if err != nil {
 		if err == cache.ErrOutOfMemory {
-			counters.storeNoMemory.Add(1)
+			ctr(TypeMemcache).storeNoMemory.Add(1)
 		}
 		if !noreply {
 			if err == cache.ErrOutOfMemory {
@@ -466,7 +518,7 @@ func (h *MemcacheHandler) handleDelete(writer *bufio.Writer, parts []string) {
 	noreply := len(parts) > 2 && parts[len(parts)-1] == "noreply"
 	
 	found := h.cache.Delete([]byte(key))
-	countHit(found, &counters.deleteHits, &counters.deleteMisses)
+	countHit(found, &ctr(TypeMemcache).deleteHits, &ctr(TypeMemcache).deleteMisses)
 	if found {
 		if !noreply {
 			writer.WriteString("DELETED\r\n")
@@ -527,7 +579,7 @@ func (h *MemcacheHandler) handleIncr(writer *bufio.Writer, parts []string, incr 
 	case errMemcacheNotFound:
 		misses.Add(1)
 	case cache.ErrOutOfMemory:
-		counters.storeNoMemory.Add(1)
+		ctr(TypeMemcache).storeNoMemory.Add(1)
 	}
 	if noreply {
 		return
@@ -560,8 +612,8 @@ func (h *MemcacheHandler) handleTouch(writer *bufio.Writer, parts []string) {
 	noreply := len(parts) > 3 && parts[3] == "noreply"
 	
 	entry, found := h.cache.Load([]byte(key))
-	counters.cmdTouch.Add(1)
-	countHit(found, &counters.touchHits, &counters.touchMisses)
+	ctr(TypeMemcache).cmdTouch.Add(1)
+	countHit(found, &ctr(TypeMemcache).touchHits, &ctr(TypeMemcache).touchMisses)
 	if !found {
 		if !noreply {
 			writer.WriteString("NOT_FOUND\r\n")
