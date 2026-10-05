@@ -61,12 +61,14 @@ spec:
                   name: {{ include "gopogo.authSecretName" . }}
                   key: {{ include "gopogo.authSecretKey" . }}
             {{- end }}
-            {{- if and .Values.telemetry.enabled .Values.telemetry.headersSecret.name }}
+            {{- with dig "headersSecret" "name" "" .Values.telemetry }}
+            {{- if $.Values.telemetry.enabled }}
             - name: GOPOGO_OTLP_HEADERS
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.telemetry.headersSecret.name }}
-                  key: {{ .Values.telemetry.headersSecret.key }}
+                  name: {{ . }}
+                  key: {{ dig "headersSecret" "key" "headers" $.Values.telemetry | default "headers" }}
+            {{- end }}
             {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}

@@ -92,18 +92,21 @@ password
 {{- end }}
 {{- if .Values.telemetry.enabled }}
 - --telemetry
-- --telemetry-exporter={{ .Values.telemetry.exporter }}
-{{- with .Values.telemetry.protocol }}
+{{- /* Options added in later chart versions may be absent when upgrading with
+     --reuse-values, so each has a fallback (hasKey keeps an explicit false or 0). */}}
+{{- $t := .Values.telemetry }}
+- --telemetry-exporter={{ $t.exporter | default "otlp" }}
+{{- with $t.protocol }}
 - --otlp-protocol={{ . }}
 {{- end }}
-{{- with .Values.telemetry.otlpEndpoint }}
+{{- with $t.otlpEndpoint }}
 - --otlp-endpoint={{ . }}
 {{- end }}
-- --otlp-insecure={{ .Values.telemetry.insecure }}
-{{- with .Values.telemetry.environment }}
+- --otlp-insecure={{ if hasKey $t "insecure" }}{{ $t.insecure }}{{ else }}true{{ end }}
+{{- with $t.environment }}
 - --telemetry-environment={{ . }}
 {{- end }}
-- --trace-sample-ratio={{ .Values.telemetry.traceSampleRatio }}
+- --trace-sample-ratio={{ if hasKey $t "traceSampleRatio" }}{{ $t.traceSampleRatio }}{{ else }}1{{ end }}
 {{- end }}
 {{- range .Values.extraArgs }}
 - {{ . | quote }}
