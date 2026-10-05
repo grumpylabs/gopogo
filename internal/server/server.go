@@ -149,30 +149,16 @@ func (s *Server) setupListeners() error {
 		}
 	}
 	
-	if s.config.TLSPort > 0 && s.config.TLSCert != "" && s.config.TLSKey != "" {
-		cert, err := tls.LoadX509KeyPair(s.config.TLSCert, s.config.TLSKey)
-		if err != nil {
-			return fmt.Errorf("failed to load TLS certificate: %w", err)
-		}
-		
-		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-		}
-		if s.config.TLSCACert != "" {
-			// Like pogocache (SSL_VERIFY_PEER), verify a client certificate
-			// when one is presented.
-			pem, err := os.ReadFile(s.config.TLSCACert)
-			if err != nil {
-				return fmt.Errorf("failed to read TLS CA certificate: %w", err)
-			}
-			pool := x509.NewCertPool()
-			if !pool.AppendCertsFromPEM(pem) {
-				return fmt.Errorf("no certificates found in %s", s.config.TLSCACert)
-			}
-			tlsConfig.ClientCAs = pool
-			tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
-		}
-		
+	tlsConfig, err := s.tlsConfig()
+	if err != nil {
+		return err
+	}
+	if tlsConfig != nil && s.postgresHandler != nil {
+		// Postgres clients upgrade the plain port to TLS with an SSLRequest.
+		s.postgresHandler.SetTLSConfig(tlsConfig)
+	}
+
+	if s.config.TLSPort > 0 && tlsConfig != nil {
 		addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.TLSPort)
 		ln, err := listenTCP(s.config.Host, s.config.TLSPort, s.config.Backlog, s.config.ReusePort)
 		if err != nil {
@@ -191,6 +177,36 @@ func (s *Server) setupListeners() error {
 	}
 	
 	return nil
+}
+
+// tlsConfig loads --tlscert/--tlskey (and --tlscacert), or returns nil when no
+// certificate is configured.
+func (s *Server) tlsConfig() (*tls.Config, error) {
+	if s.config.TLSCert == "" || s.config.TLSKey == "" {
+		return nil, nil
+	}
+	cert, err := tls.LoadX509KeyPair(s.config.TLSCert, s.config.TLSKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+	}
+	cfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
+	if s.config.TLSCACert != "" {
+		// Like pogocache (SSL_VERIFY_PEER), verify a client certificate
+		// when one is presented.
+		pem, err := os.ReadFile(s.config.TLSCACert)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read TLS CA certificate: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("no certificates found in %s", s.config.TLSCACert)
+		}
+		cfg.ClientCAs = pool
+		cfg.ClientAuth = tls.VerifyClientCertIfGiven
+	}
+	return cfg, nil
 }
 
 func (s *Server) serve(listener net.Listener) {

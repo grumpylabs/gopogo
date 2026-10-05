@@ -12,7 +12,7 @@ Protocols on that port:
   memcache  {{ include "gopogo.fullname" . }}:{{ .Values.port }}{{ if .Values.auth.enabled }}  (refuses every command: memcache cannot authenticate){{ end }}
 {{- end }}
 {{- if .Values.protocols.postgres }}
-  postgres  psql -h {{ include "gopogo.fullname" . }} -p {{ .Values.port }}
+  postgres  psql "host={{ include "gopogo.fullname" . }} port={{ .Values.port }}{{ if .Values.tls.enabled }} sslmode=require{{ end }}"
 {{- end }}
 
 To try it from your machine:

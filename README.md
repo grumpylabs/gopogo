@@ -217,7 +217,7 @@ END
 
 ### PostgreSQL Protocol
 
-A query is a cache command, not SQL, as in pogocache. Values with spaces go in single quotes, and `E'...'` strings take backslash escapes. Both the simple and the extended query protocol work, so drivers can bind parameters (`GET $1`). `BEGIN`, `COMMIT` and `ROLLBACK` are accepted and ignored, and a leading `::bytea` or `::text` sets the result column type.
+A query is a cache command, not SQL, as in pogocache. Values with spaces go in single quotes, and `E'...'` strings take backslash escapes. Both the simple and the extended query protocol work, so drivers can bind parameters (`GET $1`). `BEGIN`, `COMMIT` and `ROLLBACK` are accepted and ignored, and a leading `::bytea` or `::text` sets the result column type. Passwords use SCRAM-SHA-256. With `--tlscert` and `--tlskey` set, clients can upgrade the connection to TLS on the main port (`sslmode=require` or `verify-full`); without them, TLS requests are declined. Query cancellation is not supported.
 
 ```bash
 gopogo --postgres -p 5432

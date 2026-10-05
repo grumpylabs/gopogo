@@ -2,10 +2,22 @@ package protocol
 
 import (
 	"bufio"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/pbkdf2"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/binary"
 	"io"
+	"math/big"
 	"net"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -234,4 +246,185 @@ func TestPostgresExtendedQuery(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("error recovery: got %q, want %q", got, want)
 	}
+}
+
+// pgReadMsg reads one backend message.
+func pgReadMsg(t *testing.T, r *bufio.Reader) (byte, []byte) {
+	t.Helper()
+	var hdr [5]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		t.Fatal(err)
+	}
+	body := make([]byte, binary.BigEndian.Uint32(hdr[1:])-4)
+	if _, err := io.ReadFull(r, body); err != nil {
+		t.Fatal(err)
+	}
+	return hdr[0], body
+}
+
+func pgWriteMsg(t *testing.T, w io.Writer, typ byte, body []byte) {
+	t.Helper()
+	msg := append([]byte{typ}, be32(int32(len(body)+4))...)
+	if _, err := w.Write(append(msg, body...)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// scramLogin runs a client-side SCRAM-SHA-256 exchange and returns the
+// message that follows it (AuthenticationOk or an error).
+func scramLogin(t *testing.T, conn io.ReadWriter, r *bufio.Reader, password string) (byte, []byte) {
+	t.Helper()
+	startup := append(be32(pgProtocolV3), "user\x00test\x00\x00"...)
+	conn.Write(append(be32(int32(len(startup)+4)), startup...))
+
+	typ, body := pgReadMsg(t, r)
+	if typ != 'R' || binary.BigEndian.Uint32(body) != 10 || !strings.Contains(string(body[4:]), "SCRAM-SHA-256") {
+		t.Fatalf("expected AuthenticationSASL, got %c %q", typ, body)
+	}
+	clientFirstBare := "n=,r=clientnonce123"
+	first := "n,," + clientFirstBare
+	init := append(cstr("SCRAM-SHA-256"), be32(int32(len(first)))...)
+	pgWriteMsg(t, conn, 'p', append(init, first...))
+
+	typ, body = pgReadMsg(t, r)
+	if typ != 'R' || binary.BigEndian.Uint32(body) != 11 {
+		t.Fatalf("expected AuthenticationSASLContinue, got %c %q", typ, body)
+	}
+	serverFirst := string(body[4:])
+	salt, _ := base64.StdEncoding.DecodeString(scramAttr(serverFirst, 's'))
+	iter, _ := strconv.Atoi(scramAttr(serverFirst, 'i'))
+	withoutProof := "c=biws,r=" + scramAttr(serverFirst, 'r')
+	salted, _ := pbkdf2.Key(sha256.New, password, salt, iter, sha256.Size)
+	clientKey := scramHMAC(salted, "Client Key")
+	storedKey := sha256.Sum256(clientKey)
+	sig := scramHMAC(storedKey[:], clientFirstBare+","+serverFirst+","+withoutProof)
+	proof := make([]byte, len(clientKey))
+	for i := range proof {
+		proof[i] = clientKey[i] ^ sig[i]
+	}
+	pgWriteMsg(t, conn, 'p', []byte(withoutProof+",p="+base64.StdEncoding.EncodeToString(proof)))
+	return pgReadMsg(t, r)
+}
+
+func TestPostgresSCRAM(t *testing.T) {
+	for _, tt := range []struct {
+		password string
+		ok       bool
+	}{{"s3cret", true}, {"wrong", false}} {
+		server, client := net.Pipe()
+		go NewPostgresHandler(cache.New(nil), "s3cret", "").Handle(server)
+		client.SetDeadline(time.Now().Add(5 * time.Second))
+		r := bufio.NewReader(client)
+		typ, body := scramLogin(t, client, r, tt.password)
+		if tt.ok {
+			if typ != 'R' || binary.BigEndian.Uint32(body) != 12 {
+				t.Fatalf("expected AuthenticationSASLFinal, got %c %q", typ, body)
+			}
+			if typ, body = pgReadMsg(t, r); typ != 'R' || binary.BigEndian.Uint32(body) != 0 {
+				t.Fatalf("expected AuthenticationOk, got %c %q", typ, body)
+			}
+		} else if typ != 'E' || !strings.Contains(string(body), "WRONGPASS") {
+			t.Fatalf("wrong password: got %c %q", typ, body)
+		}
+		client.Close()
+	}
+}
+
+func testTLSConfig(t *testing.T) (*tls.Config, *x509.CertPool) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "gopogo-test"},
+		DNSNames:              []string{"gopogo-test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, _ := x509.ParseCertificate(der)
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}, pool
+}
+
+func TestPostgresTLSUpgrade(t *testing.T) {
+	serverCfg, pool := testTLSConfig(t)
+	h := NewPostgresHandler(cache.New(nil), "", "")
+	h.SetTLSConfig(serverCfg)
+
+	server, client := net.Pipe()
+	go h.Handle(server)
+	defer client.Close()
+	client.SetDeadline(time.Now().Add(5 * time.Second))
+
+	client.Write(append(be32(8), be32(sslRequestCode)...))
+	var reply [1]byte
+	if _, err := io.ReadFull(client, reply[:]); err != nil || reply[0] != 'S' {
+		t.Fatalf("SSLRequest reply %q, %v; want 'S'", reply[0], err)
+	}
+	tc := tls.Client(client, &tls.Config{RootCAs: pool, ServerName: "gopogo-test"})
+	if err := tc.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	r := bufio.NewReader(tc)
+	startup := append(be32(pgProtocolV3), "user\x00test\x00\x00"...)
+	tc.Write(append(be32(int32(len(startup)+4)), startup...))
+	for {
+		typ, _ := pgReadMsg(t, r)
+		if typ == 'Z' {
+			break
+		}
+	}
+	query := func(q string) []string {
+		pgWriteMsg(t, tc, 'Q', cstr(q))
+		var out []string
+		for {
+			typ, body := pgReadMsg(t, r)
+			switch typ {
+			case 'D':
+				out = append(out, string(body[6:]))
+			case 'C':
+				out = append(out, cstring(body))
+			case 'Z':
+				return out
+			}
+		}
+	}
+	if got := query("SET k over-tls"); !reflect.DeepEqual(got, []string{"SET 1"}) {
+		t.Fatalf("SET over TLS: got %q", got)
+	}
+	if got := query("GET k"); !reflect.DeepEqual(got, []string{"over-tls", "GET 1"}) {
+		t.Fatalf("GET over TLS: got %q", got)
+	}
+}
+
+func TestPostgresTLSRejectsInjectedPlaintext(t *testing.T) {
+	serverCfg, _ := testTLSConfig(t)
+	h := NewPostgresHandler(cache.New(nil), "", "")
+	h.SetTLSConfig(serverCfg)
+	server, client := net.Pipe()
+	go h.Handle(server)
+	defer client.Close()
+	client.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// An SSLRequest with plaintext bytes after it in the same write must not
+	// be upgraded: the extra bytes would bypass encryption.
+	client.Write(append(append(be32(8), be32(sslRequestCode)...), "Qinjected"...))
+	if b, err := bufio.NewReader(client).ReadByte(); err == nil {
+		t.Fatalf("expected the connection to close, got %q", b)
+	}
+}
+
+func TestPostgresNoTLSDeclines(t *testing.T) {
+	newPGTestClient(t, cache.New(nil)) // asserts the 'N' reply
 }

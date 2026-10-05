@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -25,8 +26,17 @@ import (
 // protocols are supported. Results are sent in text format. BEGIN, COMMIT and
 // ROLLBACK are accepted and ignored, and a leading ::bytea or ::text switches
 // the column type for later results.
+//
+// With a TLS config, a client's SSLRequest upgrades the connection to TLS
+// (sslmode=require and verify-full work). Passwords use SCRAM-SHA-256.
 type PostgresHandler struct {
-	exec *Executor
+	exec      *Executor
+	tlsConfig *tls.Config
+}
+
+// SetTLSConfig enables TLS upgrades for clients that send an SSLRequest.
+func (h *PostgresHandler) SetTLSConfig(cfg *tls.Config) {
+	h.tlsConfig = cfg
 }
 
 func NewPostgresHandler(cache *cache.Cache, auth, persist string) *PostgresHandler {
@@ -69,6 +79,7 @@ type pgPortal struct {
 
 type pgConn struct {
 	h        *PostgresHandler
+	conn     net.Conn // replaced by the TLS connection after an upgrade
 	r        *bufio.Reader
 	w        *bufio.Writer
 	s        *session
@@ -82,9 +93,9 @@ type pgConn struct {
 var errPGProtocol = errors.New("postgres protocol error")
 
 func (h *PostgresHandler) Handle(conn net.Conn) {
-	defer conn.Close()
 	c := &pgConn{
 		h:       h,
+		conn:    conn,
 		r:       bufio.NewReader(conn),
 		w:       bufio.NewWriter(conn),
 		s:       &session{proto: TypePostgres, addr: conn.RemoteAddr().String()},
@@ -92,6 +103,7 @@ func (h *PostgresHandler) Handle(conn net.Conn) {
 		stmts:   map[string]*pgStatement{},
 		portals: map[string]*pgPortal{},
 	}
+	defer func() { c.conn.Close() }()
 	if err := c.startup(); err != nil {
 		c.w.Flush()
 		return
@@ -133,8 +145,31 @@ func (c *pgConn) startup() error {
 			return err
 		}
 		switch code {
-		case sslRequestCode, gssRequestCode:
-			// Decline encryption; the client continues in plain text.
+		case sslRequestCode:
+			if c.h.tlsConfig == nil || isTLSConn(c.conn) {
+				// No TLS configured, or already encrypted: decline and the
+				// client continues as it is.
+				c.w.WriteByte('N')
+				c.w.Flush()
+				continue
+			}
+			// Anything already buffered was sent before encryption and could
+			// be injected plaintext (CVE-2021-23214), so refuse it.
+			if c.r.Buffered() > 0 {
+				return errPGProtocol
+			}
+			c.w.WriteByte('S')
+			c.w.Flush()
+			tlsConn := tls.Server(c.conn, c.h.tlsConfig)
+			if err := tlsConn.Handshake(); err != nil {
+				return err
+			}
+			c.conn = tlsConn
+			c.r = bufio.NewReader(tlsConn)
+			c.w = bufio.NewWriter(tlsConn)
+			continue
+		case gssRequestCode:
+			// GSSAPI encryption is not supported.
 			c.w.WriteByte('N')
 			c.w.Flush()
 			continue
@@ -149,14 +184,10 @@ func (c *pgConn) startup() error {
 	}
 
 	if c.h.exec.auth != "" {
-		c.writeMsg('R', be32(3)) // AuthenticationCleartextPassword
-		c.w.Flush()
-		typ, body, err := c.readMessage()
-		if err != nil {
-			return err
-		}
-		if typ != 'p' || cstring(body) != c.h.exec.auth {
-			c.writeError("WRONGPASS invalid username-password pair or user is disabled.")
+		if err := c.scramAuth(c.h.exec.auth); err != nil {
+			if err == errSCRAM {
+				c.writeError("WRONGPASS invalid username-password pair or user is disabled.")
+			}
 			return errPGProtocol
 		}
 	}
@@ -176,6 +207,16 @@ func (c *pgConn) startup() error {
 	c.writeReady()
 	c.w.Flush()
 	return nil
+}
+
+// isTLSConn reports whether conn (possibly wrapped by the protocol detector)
+// is already a TLS connection.
+func isTLSConn(conn net.Conn) bool {
+	if dc, ok := conn.(*detectorConn); ok {
+		conn = dc.Conn
+	}
+	_, ok := conn.(*tls.Conn)
+	return ok
 }
 
 func (c *pgConn) readMessage() (byte, []byte, error) {
