@@ -601,3 +601,87 @@ func TestNoEvictOutOfMemoryReplies(t *testing.T) {
 		t.Fatalf("memcache set when full: got %q", l)
 	}
 }
+
+func TestStatsCounters(t *testing.T) {
+	ch := cache.New(&cache.Options{NumShards: 1, MaxMemory: 1 << 20, NoEvict: true})
+	snapshot := func() map[string]int64 {
+		m := map[string]int64{}
+		for _, kv := range statLines(ch) {
+			n, err := strconv.ParseInt(kv[1], 10, 64)
+			if err == nil {
+				m[kv[0]] = n
+			}
+		}
+		return m
+	}
+	before := snapshot()
+
+	c := newRESPClient(t, ch)
+	c.expect("OK", "SET", "a", "1")
+	c.expect("OK", "SETEX", "b", "100", "2")
+	c.expect("OK", "MSET", "c", "3", "d", "4")
+	c.do("GET", "a")
+	c.do("GET", "nope")
+	c.do("MGET", "a", "b", "nope")
+	c.do("DEL", "c", "nope")
+	c.do("INCR", "n")
+	c.do("DECRBY", "n", "5")
+	c.do("TOUCH", "a", "nope")
+	c.do("FLUSHALL")
+	c.do("SET", "big", strings.Repeat("x", 2<<20)) // over MaxMemory with NoEvict
+
+	authed := newRESPClientAuth(t, ch, "pw")
+	authed.do("GET", "a")      // NOAUTH
+	authed.do("AUTH", "wrong") // auth error
+	authed.expect("OK", "AUTH", "pw")
+
+	server, client := net.Pipe()
+	go NewMemcacheHandler(ch, "").Handle(server)
+	defer client.Close()
+	r := bufio.NewReader(client)
+	mc := func(cmd string) {
+		client.SetDeadline(time.Now().Add(5 * time.Second))
+		client.Write([]byte(cmd + "\r\n"))
+		for {
+			l, err := r.ReadString('\n')
+			if err != nil || !strings.HasPrefix(l, "VALUE") && l != "a\r\n" {
+				return
+			}
+		}
+	}
+	mc("set m 0 0 1\r\na")
+	mc("get m nope")
+	mc("incr m 1")    // non-numeric: neither hit nor miss
+	mc("incr nope 1") // miss
+	mc("delete nope")
+	mc("flush_all")
+
+	after := snapshot()
+	want := map[string]int64{
+		"cmd_get": 1 + 1 + 3 + 2, "get_hits": 1 + 2 + 1, "get_misses": 1 + 1 + 1,
+		"cmd_set": 1 + 1 + 2 + 1 + 1, "store_no_memory": 1,
+		"delete_hits": 1, "delete_misses": 1 + 1,
+		"incr_hits": 1, "incr_misses": 1, "decr_hits": 1,
+		"cmd_touch": 2, "touch_hits": 1, "touch_misses": 1,
+		"cmd_flush": 2, "auth_cmds": 3, "auth_errors": 2,
+	}
+	for k, d := range want {
+		if got := after[k] - before[k]; got != d {
+			t.Errorf("%s: +%d, want +%d", k, got, d)
+		}
+	}
+	if after["total_items"]-before["total_items"] < 5 {
+		t.Errorf("total_items: +%d, want at least +5", after["total_items"]-before["total_items"])
+	}
+	for _, k := range []string{"threads", "rss", "githash", "pid"} {
+		found := false
+		for _, kv := range statLines(ch) {
+			if kv[0] == k && kv[1] != "" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("STATS missing %s", k)
+		}
+	}
+}

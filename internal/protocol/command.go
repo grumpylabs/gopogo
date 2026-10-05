@@ -95,6 +95,12 @@ type result struct {
 
 func errResult(msg string) result { return result{err: msg} }
 
+// noMemory counts a write refused for lack of memory and returns its error.
+func noMemory() result {
+	counters.storeNoMemory.Add(1)
+	return errResult(errNoMemory)
+}
+
 const (
 	errWrongArgs  = "ERR wrong number of arguments"
 	errSyntax     = "ERR syntax error"
@@ -172,6 +178,7 @@ func (x *Executor) exec(s *session, args []string) result {
 	}
 	name := strings.ToUpper(args[0])
 	if !s.authed && name != "AUTH" {
+		countAuth(false)
 		return errResult("NOAUTH Authentication required.")
 	}
 	monitors.publish(s.addr, args)
@@ -185,12 +192,14 @@ func (x *Executor) exec(s *session, args []string) result {
 func cmdAuth(x *Executor, s *session, name string, args []string) result {
 	// AUTH <user> <password> is not supported and fails as a wrong password,
 	// as in pogocache.
+	ok := len(args) == 2 && args[1] == x.auth
+	countAuth(ok)
 	switch {
 	case len(args) == 1:
 		return wrongArgs(name)
 	case len(args) > 3:
 		return errResult(errSyntax)
-	case len(args) == 2 && args[1] == x.auth:
+	case ok:
 		s.authed = true
 		return result{resp: rvOK(), pg: pgTag("AUTH OK")}
 	}
@@ -240,6 +249,8 @@ func cmdGet(x *Executor, s *session, name string, args []string) result {
 		return wrongArgs(name)
 	}
 	entry, found := x.cache.Load([]byte(args[1]))
+	counters.cmdGet.Add(1)
+	countHit(found, &counters.getHits, &counters.getMisses)
 	if !found {
 		return result{
 			resp: rvNull(),
@@ -335,6 +346,7 @@ func cmdSet(x *Executor, s *session, name string, args []string) result {
 	if (opts.KeepTTL && hasEx) || (opts.NX && opts.XX) {
 		return errResult(errSyntax)
 	}
+	counters.cmdSet.Add(1)
 
 	var stored bool
 	var old *string
@@ -342,7 +354,7 @@ func cmdSet(x *Executor, s *session, name string, args []string) result {
 	case withCAS:
 		ok, err := x.cache.CompareAndSwap(key, val, cas, opts)
 		if err == cache.ErrOutOfMemory {
-			return errResult(errNoMemory)
+			return noMemory()
 		}
 		stored = ok
 	case get:
@@ -354,13 +366,13 @@ func cmdSet(x *Executor, s *session, name string, args []string) result {
 		res := b.Store(key, val, opts)
 		b.End()
 		if res == cache.NoMemory {
-			return errResult(errNoMemory)
+			return noMemory()
 		}
 		stored = res != cache.NotStored
 	default:
 		res, err := x.cache.Store(key, val, opts)
 		if err == cache.ErrOutOfMemory {
-			return errResult(errNoMemory)
+			return noMemory()
 		}
 		stored = res != cache.NotStored
 	}
@@ -393,8 +405,9 @@ func cmdSetEx(x *Executor, s *session, name string, args []string) result {
 	if !ok {
 		return errResult(errExpire)
 	}
+	counters.cmdSet.Add(1)
 	if _, err := x.cache.Store([]byte(args[1]), []byte(args[3]), &cache.StoreOptions{TTL: ttl}); err != nil {
-		return errResult(errNoMemory)
+		return noMemory()
 	}
 	return result{resp: rvOK(), pg: pgTag("SETEX 1")}
 }
@@ -405,7 +418,9 @@ func cmdDel(x *Executor, s *session, name string, args []string) result {
 	}
 	var deleted int64
 	for _, k := range args[1:] {
-		if x.cache.Delete([]byte(k)) {
+		found := x.cache.Delete([]byte(k))
+		countHit(found, &counters.deleteHits, &counters.deleteMisses)
+		if found {
 			deleted++
 		}
 	}
@@ -444,6 +459,8 @@ func cmdMGet(x *Executor, s *session, name string, args []string) result {
 	vals := make([]rv, 0, len(args)-1)
 	for _, k := range args[1:] {
 		e, found := x.cache.Load([]byte(k))
+		counters.cmdGet.Add(1)
+		countHit(found, &counters.getHits, &counters.getMisses)
 		if !found {
 			vals = append(vals, rvNull())
 			continue
@@ -467,8 +484,9 @@ func cmdMSet(x *Executor, s *session, name string, args []string) result {
 		return wrongArgs(name)
 	}
 	for i := 1; i < len(args); i += 2 {
+		counters.cmdSet.Add(1)
 		if _, err := x.cache.Store([]byte(args[i]), []byte(args[i+1]), nil); err != nil {
-			return errResult(errNoMemory)
+			return noMemory()
 		}
 	}
 	return result{resp: rvOK(), pg: pgTag(fmt.Sprintf("MSET %d", (len(args)-1)/2))}
@@ -496,6 +514,7 @@ func cmdIncr(x *Executor, s *session, name string, args []string) result {
 			return errResult(errNotInteger)
 		}
 		if n, err = x.cache.IncrementUnsigned(key, delta, decr); err == nil {
+			countIncr(decr)
 			v := strconv.FormatUint(n, 10)
 			return result{resp: rvUint(n), pg: pgRow("value", v, tag)}
 		}
@@ -511,11 +530,25 @@ func cmdIncr(x *Executor, s *session, name string, args []string) result {
 			delta = -delta
 		}
 		if n, err = x.cache.Increment(key, delta); err == nil {
+			countIncr(decr)
 			v := strconv.FormatInt(n, 10)
 			return result{resp: rvInt(n), pg: pgRow("value", v, tag)}
 		}
 	}
+	if err == cache.ErrOutOfMemory {
+		return noMemory()
+	}
 	return errResult("ERR " + err.Error())
+}
+
+// countIncr counts a successful INCR/DECR family command. Over RESP a missing
+// key is created, so there are no misses; memcache counts those.
+func countIncr(decr bool) {
+	if decr {
+		counters.decrHits.Add(1)
+	} else {
+		counters.incrHits.Add(1)
+	}
 }
 
 // cmdAppend implements APPEND and PREPEND, creating the key if missing and
@@ -538,7 +571,7 @@ func cmdAppend(x *Executor, s *session, name string, args []string) result {
 		return out, nil
 	})
 	if err != nil {
-		return errResult(errNoMemory)
+		return noMemory()
 	}
 	return result{resp: rvInt(int64(n)), pg: pgTag(fmt.Sprintf("%s %d", name, n))}
 }
@@ -588,7 +621,10 @@ func cmdTouch(x *Executor, s *session, name string, args []string) result {
 	}
 	var n int64
 	for _, k := range args[1:] {
-		if _, found := x.cache.LoadWithOptions([]byte(k), nil); found {
+		_, found := x.cache.LoadWithOptions([]byte(k), nil)
+		counters.cmdTouch.Add(1)
+		countHit(found, &counters.touchHits, &counters.touchMisses)
+		if found {
 			n++
 		}
 	}
@@ -699,6 +735,7 @@ func cmdFlush(x *Executor, s *session, name string, args []string) result {
 			return errResult(errSyntax)
 		}
 	}
+	counters.cmdFlush.Add(1)
 	switch {
 	case delay > 0:
 		time.AfterFunc(time.Duration(delay)*time.Second, x.cache.Clear)

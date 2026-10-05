@@ -106,11 +106,13 @@ func (b *Batch) Store(key, value []byte, opts *StoreOptions) StoreResult {
 		shard.addMemUsed(entry.Size())
 		c.fireNotifyReplaced(entry, oldEntry)
 		c.recordStore(start, "replaced")
+		c.totalStored.Add(1)
 		return Replaced
 	}
 	shard.addMemUsed(entry.Size())
 	c.fireNotifyInserted(entry)
 	c.recordStore(start, "inserted")
+	c.totalStored.Add(1)
 	return Inserted
 }
 

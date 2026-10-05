@@ -167,7 +167,9 @@ func (h *HTTPHandler) authorized(req *http.Request, query url.Values) bool {
 	if h.exec.auth == "" && !given {
 		return true
 	}
-	return token == h.exec.auth
+	ok := token == h.exec.auth
+	countAuth(ok)
+	return ok
 }
 
 // validHTTPKey matches pogocache's rule: 1-250 printable ASCII bytes, none of

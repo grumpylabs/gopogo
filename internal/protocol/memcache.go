@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/grumpylabs/gopogo/internal/cache"
@@ -27,6 +28,14 @@ func NewMemcacheHandler(cache *cache.Cache, auth string) *MemcacheHandler {
 		cache: cache,
 		auth:  auth,
 	}
+}
+
+// incrOrDecr returns the hit and miss counters for incr or decr.
+func incrOrDecr(incr bool) (hits, misses *atomic.Uint64) {
+	if incr {
+		return &counters.incrHits, &counters.incrMisses
+	}
+	return &counters.decrHits, &counters.decrMisses
 }
 
 // memcacheNoMemory is memcached's reply when a write does not fit and eviction
@@ -79,6 +88,7 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 					}
 				}
 			}
+			countAuth(false)
 			writer.WriteString("CLIENT_ERROR Authentication required\r\n")
 			writer.Flush()
 			continue
@@ -131,6 +141,7 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 			}
 			
 		case "flush_all":
+			counters.cmdFlush.Add(1)
 			h.cache.Clear()
 			writer.WriteString("OK\r\n")
 			
@@ -177,6 +188,12 @@ func (h *MemcacheHandler) handleGAT(writer *bufio.Writer, parts []string, withCA
 func (h *MemcacheHandler) writeValues(writer *bufio.Writer, keys []string, withCAS bool, touch func(*cache.Entry)) {
 	for _, key := range keys {
 		entry, found := h.cache.Load([]byte(key))
+		counters.cmdGet.Add(1)
+		countHit(found, &counters.getHits, &counters.getMisses)
+		if touch != nil {
+			counters.cmdTouch.Add(1)
+			countHit(found, &counters.touchHits, &counters.touchMisses)
+		}
 		if !found {
 			continue
 		}
@@ -293,7 +310,9 @@ func (h *MemcacheHandler) handleStore(reader *bufio.Reader, writer *bufio.Writer
 	
 	opts.TTL = memcacheTTL(exptime)
 	
+	counters.cmdSet.Add(1)
 	if _, err := h.cache.Store([]byte(key), data, opts); err != nil {
+		counters.storeNoMemory.Add(1)
 		if !noreply {
 			writer.WriteString(memcacheNoMemory)
 		}
@@ -353,7 +372,11 @@ func (h *MemcacheHandler) handleCAS(reader *bufio.Reader, writer *bufio.Writer, 
 	
 	opts.TTL = memcacheTTL(exptime)
 	
+	counters.cmdSet.Add(1)
 	success, err := h.cache.CompareAndSwap([]byte(key), data, cas, opts)
+	if err == cache.ErrOutOfMemory {
+		counters.storeNoMemory.Add(1)
+	}
 	if err != nil {
 		if !noreply {
 			if err == cache.ErrOutOfMemory {
@@ -415,6 +438,9 @@ func (h *MemcacheHandler) handleAppend(reader *bufio.Reader, writer *bufio.Write
 		return out, nil
 	})
 	if err != nil {
+		if err == cache.ErrOutOfMemory {
+			counters.storeNoMemory.Add(1)
+		}
 		if !noreply {
 			if err == cache.ErrOutOfMemory {
 				writer.WriteString(memcacheNoMemory)
@@ -439,7 +465,9 @@ func (h *MemcacheHandler) handleDelete(writer *bufio.Writer, parts []string) {
 	key := parts[1]
 	noreply := len(parts) > 2 && parts[len(parts)-1] == "noreply"
 	
-	if h.cache.Delete([]byte(key)) {
+	found := h.cache.Delete([]byte(key))
+	countHit(found, &counters.deleteHits, &counters.deleteMisses)
+	if found {
 		if !noreply {
 			writer.WriteString("DELETED\r\n")
 		}
@@ -492,6 +520,15 @@ func (h *MemcacheHandler) handleIncr(writer *bufio.Writer, parts []string, incr 
 		}
 		return strconv.AppendUint(nil, newVal, 10), nil
 	})
+	hits, misses := incrOrDecr(incr)
+	switch err {
+	case nil:
+		hits.Add(1)
+	case errMemcacheNotFound:
+		misses.Add(1)
+	case cache.ErrOutOfMemory:
+		counters.storeNoMemory.Add(1)
+	}
 	if noreply {
 		return
 	}
@@ -523,6 +560,8 @@ func (h *MemcacheHandler) handleTouch(writer *bufio.Writer, parts []string) {
 	noreply := len(parts) > 3 && parts[3] == "noreply"
 	
 	entry, found := h.cache.Load([]byte(key))
+	counters.cmdTouch.Add(1)
+	countHit(found, &counters.touchHits, &counters.touchMisses)
 	if !found {
 		if !noreply {
 			writer.WriteString("NOT_FOUND\r\n")

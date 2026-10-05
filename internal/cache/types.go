@@ -220,6 +220,7 @@ type Cache struct {
 	useCAS      bool
 	noEvict     bool
 	allowShrink bool
+	totalStored atomic.Uint64 // successful writes since start, for TotalItems
 }
 
 // New creates a new Cache. Pass nil for defaults.
@@ -321,6 +322,12 @@ func (c *Cache) ShardNumItems(shardIdx int) int {
 	n := shard.m.numItems
 	shard.mu.RUnlock()
 	return n
+}
+
+// TotalItems returns the number of successful writes (inserts and
+// replacements) since the cache was created.
+func (c *Cache) TotalItems() uint64 {
+	return c.totalStored.Load()
 }
 
 func (c *Cache) Stats() map[string]interface{} {

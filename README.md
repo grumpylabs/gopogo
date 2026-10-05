@@ -176,6 +176,8 @@ Supported commands: GET, SET (EX/PX/EXAT/PXAT/NX/XX/KEEPTTL), SETEX, DEL, EXISTS
 
 Counters are stored as decimal text. The `U`-prefixed commands operate on unsigned 64-bit values. `MGETS` returns `[flags, cas, value]` for each found key.
 
+`STATS` (and memcache `stats`) reports pogocache's fields: process info (pid, uptime, version, githash, CPU time, threads, rss), connection counts, per-command counters (`cmd_get`, `cmd_set`, `cmd_flush`, `cmd_touch`, get/delete/incr/decr/touch hits and misses, `store_no_memory`, `auth_cmds`, `auth_errors`) and cache size (`bytes`, `curr_items`, `total_items`), followed by `evictions`, `expired_unfetched` and `limit_maxbytes`. On Linux `rss` is the resident set size; elsewhere it is the memory the Go runtime has mapped.
+
 `SAVE [TO <path>] [FAST]` and `LOAD [FROM <path>] [FAST]` default to the `--persist` path. `LOAD` merges into the existing data rather than replacing it. `FAST` is accepted for pogocache compatibility.
 
 ```bash

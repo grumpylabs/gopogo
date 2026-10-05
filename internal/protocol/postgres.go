@@ -184,7 +184,11 @@ func (c *pgConn) startup() error {
 	}
 
 	if c.h.exec.auth != "" {
-		if err := c.scramAuth(c.h.exec.auth); err != nil {
+		err := c.scramAuth(c.h.exec.auth)
+		if err == nil || err == errSCRAM {
+			countAuth(err == nil)
+		}
+		if err != nil {
 			if err == errSCRAM {
 				c.writeError("WRONGPASS invalid username-password pair or user is disabled.")
 			}

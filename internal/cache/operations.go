@@ -116,11 +116,13 @@ func (c *Cache) Store(key, value []byte, opts *StoreOptions) (StoreResult, error
 		shard.addMemUsed(entry.Size())
 		c.fireNotifyReplaced(entry, oldEntry)
 		c.recordStore(start, "replaced")
+		c.totalStored.Add(1)
 		return Replaced, nil
 	}
 	shard.addMemUsed(entry.Size())
 	c.fireNotifyInserted(entry)
 	c.recordStore(start, "inserted")
+	c.totalStored.Add(1)
 	return Inserted, nil
 }
 
@@ -357,6 +359,7 @@ func (c *Cache) CompareAndSwap(key, value []byte, cas uint64, opts *StoreOptions
 	shard.addMemUsed(sizeDelta)
 
 	c.fireNotifyReplaced(newEntry, existing)
+	c.totalStored.Add(1)
 	return true, nil
 }
 
@@ -453,6 +456,7 @@ func (c *Cache) Update(key []byte, fn func(cur []byte, found bool) ([]byte, erro
 		// Replace entry pointer in bucket
 		shard.m.buckets[idx].entry = newEntry
 		shard.addMemUsed(newEntry.Size() - existing.Size())
+		c.totalStored.Add(1)
 		return nil
 	}
 
@@ -474,6 +478,7 @@ func (c *Cache) Update(key []byte, fn func(cur []byte, found bool) ([]byte, erro
 		shard.addMemUsed(-old.Size())
 	}
 	shard.addMemUsed(entry.Size())
+	c.totalStored.Add(1)
 	return nil
 }
 

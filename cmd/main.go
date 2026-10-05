@@ -118,6 +118,7 @@ func runServer(cmd *cobra.Command, args []string) {
 	}
 
 	protocol.Version = version
+	protocol.Commit = commit
 	validateFlags()
 	protocol.ConnStats.Max = int64(viper.GetInt("maxconns"))
 	viper.Set("loadfactor", loadFactorPercent())
