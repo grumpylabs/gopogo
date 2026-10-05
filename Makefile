@@ -36,11 +36,13 @@ all: build ## Build the project
 build: ## Build the binary
 	@go build -ldflags "$(LDFLAGS)" -o bin/gopogo cmd/main.go
 
-amd64: ## Build a static linux/amd64 binary (bin/gopogo-amd64)
+amd64: ## Build static linux/amd64 binaries (bin/gopogo-amd64, bin/gopogo-loadgen-amd64)
 	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o bin/gopogo-amd64 cmd/main.go
+	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/gopogo-loadgen-amd64 ./cmd/loadgen
 
-arm64: ## Build a static linux/arm64 binary (bin/gopogo-arm64)
+arm64: ## Build static linux/arm64 binaries (bin/gopogo-arm64, bin/gopogo-loadgen-arm64)
 	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o bin/gopogo-arm64 cmd/main.go
+	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o bin/gopogo-loadgen-arm64 ./cmd/loadgen
 
 loadgen: ## Build the load generator (bin/gopogo-loadgen)
 	@go build -o bin/gopogo-loadgen ./cmd/loadgen

@@ -155,6 +155,22 @@ readinessProbe:
   periodSeconds: 5
   failureThreshold: 3
 
+# Continuous load generator (gopogo-loadgen from the same image) driving this
+# release over RESP with a mix of reads, writes, counters, expirations and a
+# few deliberate errors. For exercising the cache and its telemetry.
+loadgen:
+  enabled: false
+  rate: 100        # commands per second
+  workers: 4       # connections
+  keys: 10000      # key space size
+  duration: "0"    # 0 runs until the Deployment is removed
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      memory: 64Mi
+
 podAnnotations: {}
 podLabels: {}
 nodeSelector: {}

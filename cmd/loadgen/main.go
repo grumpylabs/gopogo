@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -34,7 +35,7 @@ func main() {
 	auth := flag.String("auth", os.Getenv("GOPOGO_AUTH"), "password (default $GOPOGO_AUTH)")
 	workers := flag.Int("workers", 8, "concurrent connections")
 	rate := flag.Int("rate", 500, "total commands per second (0 = as fast as possible)")
-	duration := flag.Duration("duration", time.Minute, "how long to run")
+	duration := flag.Duration("duration", time.Minute, "how long to run (0 = until interrupted)")
 	keys := flag.Int("keys", 10000, "key space size")
 	minVal := flag.Int("min-value", 16, "minimum value size in bytes")
 	maxVal := flag.Int("max-value", 1024, "maximum value size in bytes")
@@ -90,11 +91,15 @@ func main() {
 
 	stop := make(chan struct{})
 	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
+	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
+	var timeout <-chan time.Time
+	if *duration > 0 {
+		timeout = time.After(*duration)
+	}
 	go func() {
 		select {
 		case <-interrupt:
-		case <-time.After(*duration):
+		case <-timeout:
 		}
 		close(stop)
 	}()

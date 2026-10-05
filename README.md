@@ -364,6 +364,8 @@ helm install cache deploy/helm/gopogo \
 helm test cache
 ```
 
+Set `loadgen.enabled=true` to run `gopogo-loadgen` (shipped in the same image) as a Deployment that drives the release continuously at `loadgen.rate` commands per second, for exercising the cache and its telemetry.
+
 See `deploy/helm/gopogo/values.yaml` for all options. The chart uses `ghcr.io/grumpylabs/gopogo`, tagged with the chart's `appVersion`; override `image.repository` and `image.tag` to use your own registry.
 
 ## License

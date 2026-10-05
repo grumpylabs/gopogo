@@ -10,6 +10,7 @@ LABEL org.opencontainers.image.description="Gopogo multi-protocol cache server"
 WORKDIR /app
 
 COPY bin/gopogo-${TARGETARCH} /app/gopogo
+COPY bin/gopogo-loadgen-${TARGETARCH} /app/gopogo-loadgen
 
 # Run as a non-root user; the Helm chart uses the same IDs.
 USER 65532:65532
