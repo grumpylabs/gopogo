@@ -485,3 +485,100 @@ func TestMemcacheAuthRequired(t *testing.T) {
 		t.Fatal("quit should close the connection")
 	}
 }
+
+func TestMemcacheGATAndExptime(t *testing.T) {
+	ch := cache.New(&cache.Options{UseCAS: true})
+	server, client := net.Pipe()
+	go NewMemcacheHandler(ch, "").Handle(server)
+	defer client.Close()
+	r := bufio.NewReader(client)
+
+	send := func(cmd string) {
+		t.Helper()
+		client.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := client.Write([]byte(cmd + "\r\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// lines reads until END (or one line for other replies).
+	reply := func(cmd string) []string {
+		t.Helper()
+		send(cmd)
+		var out []string
+		for {
+			l, err := r.ReadString('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			l = strings.TrimSuffix(l, "\r\n")
+			out = append(out, l)
+			// A non-VALUE first line is a one-line reply; otherwise read to END.
+			if l == "END" || !strings.HasPrefix(out[0], "VALUE ") {
+				return out
+			}
+		}
+	}
+	expireAt := func(key string) int64 {
+		t.Helper()
+		e, ok := ch.Load([]byte(key))
+		if !ok {
+			return -1 // missing or expired
+		}
+		return e.ExpireAt()
+	}
+
+	reply("set k 5 0 1\r\na")
+	if got := reply("gat 100 k missing"); len(got) != 3 || got[0] != "VALUE k 5 1" || got[1] != "a" || got[2] != "END" {
+		t.Fatalf("gat: %q", got)
+	}
+	if at := expireAt("k"); at <= time.Now().UnixNano() {
+		t.Fatalf("gat 100 did not set a future expiry: %d", at)
+	}
+	got := reply("gats 0 k")
+	if len(got) != 3 || !strings.HasPrefix(got[0], "VALUE k 5 1 ") {
+		t.Fatalf("gats: %q", got)
+	}
+	if at := expireAt("k"); at != 0 {
+		t.Fatalf("gats 0 should clear the expiry, got %d", at)
+	}
+	if got := reply("gat 100 missing"); len(got) != 1 || got[0] != "END" {
+		t.Fatalf("gat missing: %q", got)
+	}
+	if got := reply("gat abc k"); got[0] != "CLIENT_ERROR bad command line format" {
+		t.Fatalf("gat bad exptime: %q", got)
+	}
+	if got := reply("gat 100"); got[0] != "ERROR" {
+		t.Fatalf("gat without keys: %q", got)
+	}
+
+	// Absolute Unix time more than 30 days ahead.
+	future := time.Now().Add(40 * 24 * time.Hour).Unix()
+	reply(fmt.Sprintf("touch k %d", future))
+	if at := expireAt("k"); at != time.Unix(future, 0).UnixNano() {
+		t.Fatalf("absolute touch: got %d, want %d", at, time.Unix(future, 0).UnixNano())
+	}
+	// Negative exptime expires at once.
+	if got := reply("touch k -1"); got[0] != "TOUCHED" {
+		t.Fatalf("touch -1: %q", got)
+	}
+	if expireAt("k") != -1 {
+		t.Fatal("touch -1 should expire the key")
+	}
+	if got := reply("set n 0 -1 1\r\nx"); got[0] != "STORED" {
+		t.Fatalf("set -1: %q", got)
+	}
+	if got := reply("get n"); len(got) != 1 || got[0] != "END" {
+		t.Fatalf("set with negative exptime should be expired: %q", got)
+	}
+
+	if got := reply("verbosity 1"); got[0] != "OK" {
+		t.Fatalf("verbosity: %q", got)
+	}
+	send("verbosity 1 noreply")
+	if got := reply("version"); !strings.HasPrefix(got[0], "VERSION ") {
+		t.Fatalf("verbosity noreply should not reply, next line was %q", got)
+	}
+	if got := reply("verbosity"); got[0] != "ERROR" {
+		t.Fatalf("verbosity without level: %q", got)
+	}
+}

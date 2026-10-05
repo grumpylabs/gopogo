@@ -115,6 +115,17 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 		case "touch":
 			h.handleTouch(writer, parts)
 			
+		case "gat", "gats":
+			h.handleGAT(writer, parts, cmd == "gats")
+			
+		case "verbosity":
+			// Logging levels are not configurable; accept and acknowledge.
+			if len(parts) < 2 || len(parts) > 3 {
+				writer.WriteString("ERROR\r\n")
+			} else if !(len(parts) == 3 && parts[2] == "noreply") {
+				writer.WriteString("OK\r\n")
+			}
+			
 		case "flush_all":
 			h.cache.Clear()
 			writer.WriteString("OK\r\n")
@@ -138,10 +149,35 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 }
 
 func (h *MemcacheHandler) handleGet(reader *bufio.Reader, writer *bufio.Writer, keys []string, withCAS bool) {
+	h.writeValues(writer, keys, withCAS, nil)
+}
+
+// handleGAT implements gat/gats <exptime> <key>*: return the found keys, like
+// get/gets, and set their expiration.
+func (h *MemcacheHandler) handleGAT(writer *bufio.Writer, parts []string, withCAS bool) {
+	if len(parts) < 3 {
+		writer.WriteString("ERROR\r\n")
+		return
+	}
+	exptime, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
+		return
+	}
+	expireAt := memcacheExpireAt(exptime)
+	h.writeValues(writer, parts[2:], withCAS, func(e *cache.Entry) { e.SetExpireAt(expireAt) })
+}
+
+// writeValues writes a VALUE block for each found key, then END. touch, if
+// set, is applied to each found entry after its value is read.
+func (h *MemcacheHandler) writeValues(writer *bufio.Writer, keys []string, withCAS bool, touch func(*cache.Entry)) {
 	for _, key := range keys {
 		entry, found := h.cache.Load([]byte(key))
 		if !found {
 			continue
+		}
+		if touch != nil {
+			touch(entry)
 		}
 		
 		if withCAS {
@@ -156,6 +192,43 @@ func (h *MemcacheHandler) handleGet(reader *bufio.Reader, writer *bufio.Writer, 
 		writer.WriteString("\r\n")
 	}
 	writer.WriteString("END\r\n")
+}
+
+// memcacheMaxRelative is memcached's limit for a relative exptime (30 days);
+// larger values are absolute Unix times.
+const memcacheMaxRelative = 60 * 60 * 24 * 30
+
+// memcacheExpireAt converts a memcache exptime to an absolute expiry in Unix
+// nanoseconds: 0 never expires, a negative value or a past Unix time has
+// already expired, up to 30 days is relative, and more is a Unix time.
+func memcacheExpireAt(exptime int64) int64 {
+	now := time.Now()
+	switch {
+	case exptime == 0:
+		return 0
+	case exptime < 0:
+		return 1 // in the past: expired
+	case exptime > memcacheMaxRelative:
+		if at := time.Unix(exptime, 0); at.After(now) {
+			return at.UnixNano()
+		}
+		return 1
+	default:
+		return now.Add(time.Duration(exptime) * time.Second).UnixNano()
+	}
+}
+
+// memcacheTTL converts a memcache exptime to a StoreOptions TTL: 0 for none,
+// and 1ns (expired at once) for a negative or past exptime.
+func memcacheTTL(exptime int64) time.Duration {
+	switch at := memcacheExpireAt(exptime); at {
+	case 0:
+		return 0
+	case 1:
+		return time.Nanosecond
+	default:
+		return time.Until(time.Unix(0, at))
+	}
 }
 
 func (h *MemcacheHandler) handleStore(reader *bufio.Reader, writer *bufio.Writer, parts []string, addOnly, replaceOnly bool) {
@@ -214,13 +287,7 @@ func (h *MemcacheHandler) handleStore(reader *bufio.Reader, writer *bufio.Writer
 		Flags: uint32(flags),
 	}
 	
-	if exptime > 0 {
-		if exptime < 2592000 {
-			opts.TTL = time.Duration(exptime) * time.Second
-		} else {
-			opts.TTL = time.Until(time.Unix(exptime, 0))
-		}
-	}
+	opts.TTL = memcacheTTL(exptime)
 	
 	h.cache.Store([]byte(key), data, opts)
 	
@@ -275,13 +342,7 @@ func (h *MemcacheHandler) handleCAS(reader *bufio.Reader, writer *bufio.Writer, 
 		Flags: uint32(flags),
 	}
 	
-	if exptime > 0 {
-		if exptime < 2592000 {
-			opts.TTL = time.Duration(exptime) * time.Second
-		} else {
-			opts.TTL = time.Until(time.Unix(exptime, 0))
-		}
-	}
+	opts.TTL = memcacheTTL(exptime)
 	
 	success, err := h.cache.CompareAndSwap([]byte(key), data, cas, opts)
 	if err != nil {
@@ -450,15 +511,7 @@ func (h *MemcacheHandler) handleTouch(writer *bufio.Writer, parts []string) {
 		return
 	}
 	
-	if exptime > 0 {
-		if exptime < 2592000 {
-			entry.SetExpireAt(time.Now().Add(time.Duration(exptime) * time.Second).UnixNano())
-		} else {
-			entry.SetExpireAt(time.Unix(exptime, 0).UnixNano())
-		}
-	} else {
-		entry.SetExpireAt(0)
-	}
+	entry.SetExpireAt(memcacheExpireAt(exptime))
 	
 	if !noreply {
 		writer.WriteString("TOUCHED\r\n")

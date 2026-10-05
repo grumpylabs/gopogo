@@ -202,6 +202,8 @@ curl http://localhost:8080/@stats
 
 ### Memcache Protocol
 
+Text protocol commands: `get`, `gets`, `gat`, `gats`, `set`, `add`, `replace`, `append`, `prepend`, `cas`, `delete`, `incr`, `decr`, `touch`, `flush_all`, `stats`, `version`, `verbosity` and `quit`. Expiration times follow memcached: 0 never expires, a negative value expires at once, and values over 30 days are Unix times.
+
 ```bash
 gopogo --memcache -p 11211
 
