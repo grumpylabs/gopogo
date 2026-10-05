@@ -23,7 +23,6 @@ type Config struct {
 	Socket        string
 	Auth          string
 	Persist       string
-	Threads       int
 	TLSPort       int
 	TLSCert       string
 	TLSKey        string

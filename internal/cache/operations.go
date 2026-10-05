@@ -13,6 +13,9 @@ var (
 	ErrOverflow   = errors.New("increment or decrement would overflow")
 	ErrNotInteger = errors.New("value is not an integer or out of range")
 	ErrNotFound   = errors.New("not found")
+	// ErrOutOfMemory is returned for a write that would exceed MaxMemory
+	// when eviction is disabled (NoEvict).
+	ErrOutOfMemory = errors.New("out of memory")
 )
 
 // nextCAS returns the CAS token for a new write to shard, or 0 when CAS is
@@ -39,6 +42,7 @@ const (
 	Inserted  StoreResult = iota // new entry was inserted
 	Replaced                     // existing entry was replaced
 	NotStored                    // NX/XX condition not met
+	NoMemory                     // eviction is disabled and the cache is full
 )
 
 type StoreOptions struct {
@@ -100,7 +104,10 @@ func (c *Cache) Store(key, value []byte, opts *StoreOptions) (StoreResult, error
 		entry.cas = c.nextCAS(shard, 0)
 	}
 
-	c.evictIfNeeded(shard, entry.Size(), hashKey(storeKey))
+	if !c.makeRoom(shard, c.growth(shard, entry), hashKey(storeKey)) {
+		c.recordStore(start, "no_memory")
+		return NoMemory, ErrOutOfMemory
+	}
 
 	oldEntry := shard.m.insert(entry)
 
@@ -337,7 +344,13 @@ func (c *Cache) CompareAndSwap(key, value []byte, cas uint64, opts *StoreOptions
 	}
 
 	sizeDelta := newEntry.Size() - existing.Size()
-	c.evictIfNeeded(shard, sizeDelta, hashKey(lk))
+	if !c.makeRoom(shard, sizeDelta, hashKey(lk)) {
+		return false, ErrOutOfMemory
+	}
+	// Eviction can shift entries in the table; find the bucket again.
+	if _, idx = shard.m.getWithIndex(lk, packed); idx < 0 {
+		return false, ErrNotFound
+	}
 
 	// Replace entry pointer in bucket — old pointer remains valid for concurrent readers
 	shard.m.buckets[idx].entry = newEntry
@@ -430,6 +443,13 @@ func (c *Cache) Update(key []byte, fn func(cur []byte, found bool) ([]byte, erro
 			flags:      existing.flags,
 			cas:        c.nextCAS(shard, 0),
 		}
+		if !c.makeRoom(shard, newEntry.Size()-existing.Size(), hashKey(storeKey)) {
+			return ErrOutOfMemory
+		}
+		// makeRoom may have moved entries; find the bucket again.
+		if _, idx = shard.m.getWithIndex(storeKey, origLen > 0); idx < 0 {
+			return ErrOutOfMemory
+		}
 		// Replace entry pointer in bucket
 		shard.m.buckets[idx].entry = newEntry
 		shard.addMemUsed(newEntry.Size() - existing.Size())
@@ -447,7 +467,9 @@ func (c *Cache) Update(key []byte, fn func(cur []byte, found bool) ([]byte, erro
 		accessedAt: now,
 		cas:        c.nextCAS(shard, 0),
 	}
-	c.evictIfNeeded(shard, entry.Size(), hashKey(storeKey))
+	if !c.makeRoom(shard, c.growth(shard, entry), hashKey(storeKey)) {
+		return ErrOutOfMemory
+	}
 	if old := shard.m.insert(entry); old != nil {
 		shard.addMemUsed(-old.Size())
 	}
@@ -659,10 +681,33 @@ func (c *Cache) clearShard(shard *Shard) {
 	shard.mu.Unlock()
 }
 
-func (c *Cache) evictIfNeeded(shard *Shard, requiredSpace int64, skipHash uint64) {
-	if shard.maxMemory <= 0 || c.noEvict {
-		return
+// growth returns how much storing entry would add to shard's memory: its size,
+// less the size of an entry it replaces. Only no-evict mode needs the exact
+// figure; with eviction the entry's full size is used, as before.
+func (c *Cache) growth(shard *Shard, entry *Entry) int64 {
+	if c.noEvict && shard.maxMemory > 0 {
+		if old := shard.m.get(entry.key, entry.origKeyLen > 0); old != nil {
+			return entry.Size() - old.Size()
+		}
 	}
+	return entry.Size()
+}
+
+// makeRoom makes space for requiredSpace more bytes in shard. With eviction it
+// evicts entries as needed and always succeeds; with NoEvict it evicts
+// nothing and reports false when the write would exceed the shard's limit.
+func (c *Cache) makeRoom(shard *Shard, requiredSpace int64, skipHash uint64) bool {
+	if shard.maxMemory <= 0 || requiredSpace <= 0 {
+		return true
+	}
+	if c.noEvict {
+		return shard.MemUsed()+requiredSpace <= shard.maxMemory
+	}
+	c.evictIfNeeded(shard, requiredSpace, skipHash)
+	return true
+}
+
+func (c *Cache) evictIfNeeded(shard *Shard, requiredSpace int64, skipHash uint64) {
 	for shard.MemUsed()+requiredSpace > shard.maxMemory && shard.m.numItems > 0 {
 		entries := shard.m.randomEntries(2, skipHash)
 		if len(entries) == 0 {

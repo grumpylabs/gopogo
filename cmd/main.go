@@ -32,6 +32,14 @@ var rootCmd = &cobra.Command{
 on low latency and cpu efficiency. It supports multiple protocols including
 HTTP, Redis, Memcache, and Postgres.`,
 	Run: runServer,
+	// Reject stray arguments: with pogocache-style "--cas no", cobra parses
+	// --cas as true and "no" as an argument, which would be silently ignored.
+	Args: func(cmd *cobra.Command, args []string) error {
+		if len(args) > 0 {
+			return fmt.Errorf("unexpected argument %q: boolean flags take =true or =false, e.g. --cas=false", args[0])
+		}
+		return nil
+	},
 }
 
 func init() {
@@ -43,10 +51,10 @@ func init() {
 	rootCmd.PersistentFlags().String("auth", "", "Authentication password")
 	rootCmd.PersistentFlags().String("persist", "", "Persistence file to load at startup and save at shutdown")
 
-	rootCmd.PersistentFlags().Int("threads", runtime.NumCPU(), "Number of threads")
+	rootCmd.PersistentFlags().Int("threads", 0, "Number of OS threads running Go code (GOMAXPROCS); 0 uses Go's default, which honors container CPU limits")
 	rootCmd.PersistentFlags().Int("shards", 16, "Number of cache shards")
-	rootCmd.PersistentFlags().String("maxmemory", "0", "Maximum memory: bytes with k/m/g/t suffix (e.g. 1GB), a percentage of available memory (e.g. 80%), or 0 for unlimited")
-	rootCmd.PersistentFlags().String("evict", "2random", "Eviction policy (noevict, 2random, lru)")
+	rootCmd.PersistentFlags().String("maxmemory", "80%", "Maximum memory: bytes with k/m/g/t suffix (e.g. 1GB), a percentage of available memory (e.g. 80%), or 0 for unlimited")
+	rootCmd.PersistentFlags().String("evict", "yes", "Evict keys when maxmemory is reached (yes/no); no rejects writes instead")
 	rootCmd.PersistentFlags().Bool("autosweep", true, "Enable automatic background sweeping of evicted entries")
 	rootCmd.PersistentFlags().Duration("sweepinterval", 10*time.Second, "Interval for automatic background sweeping")
 
@@ -73,7 +81,7 @@ func init() {
 	rootCmd.PersistentFlags().Bool("telemetry", false, "Enable OpenTelemetry metrics")
 	rootCmd.PersistentFlags().String("telemetry-exporter", "otlp", "Telemetry exporter (otlp, stdout)")
 	rootCmd.PersistentFlags().String("otlp-endpoint", "localhost:4317", "OTLP gRPC endpoint")
-	rootCmd.PersistentFlags().Bool("noevict", false, "Disable eviction (reject writes when full)")
+	rootCmd.PersistentFlags().Bool("noevict", false, "Same as --evict=no")
 	rootCmd.PersistentFlags().Bool("nosixpack", false, "Disable sixpack key compression")
 	rootCmd.PersistentFlags().Int("loadfactor", 75, "Hashmap load factor percent (55-95)")
 	rootCmd.PersistentFlags().Bool("cas", false, "Assign compare-and-swap tokens on every write")
@@ -113,6 +121,18 @@ func runServer(cmd *cobra.Command, args []string) {
 	validateFlags()
 	protocol.ConnStats.Max = int64(viper.GetInt("maxconns"))
 	viper.Set("loadfactor", loadFactorPercent())
+	if n := viper.GetInt("threads"); n > 0 {
+		runtime.GOMAXPROCS(n)
+	}
+	noEvict := viper.GetBool("noevict")
+	switch strings.ToLower(viper.GetString("evict")) {
+	case "yes", "true":
+	case "no", "false":
+		noEvict = true
+	default:
+		fmt.Fprintln(os.Stderr, "Option --evict is invalid: use yes or no")
+		os.Exit(1)
+	}
 	maxMemory, err := parseMemorySize(viper.GetString("maxmemory"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Option --maxmemory is invalid: %v\n", err)
@@ -124,7 +144,7 @@ func runServer(cmd *cobra.Command, args []string) {
 		MaxMemory:  maxMemory,
 		LoadFactor: float64(viper.GetInt("loadfactor")) / 100,
 		NoSixpack:  viper.GetBool("nosixpack"),
-		NoEvict:    viper.GetBool("noevict"),
+		NoEvict:    noEvict,
 		UseCAS:     viper.GetBool("cas"),
 	})
 
@@ -157,7 +177,6 @@ func runServer(cmd *cobra.Command, args []string) {
 		Socket:   viper.GetString("socket"),
 		Auth:     viper.GetString("auth"),
 		Persist:  persist,
-		Threads:  viper.GetInt("threads"),
 		TLSPort:  viper.GetInt("tlsport"),
 		TLSCert:  viper.GetString("tlscert"),
 		TLSKey:   viper.GetString("tlskey"),
@@ -292,7 +311,9 @@ func parseMemorySize(s string) (int64, error) {
 	if unit == "%" {
 		avail := sysmem.Available()
 		if avail == 0 {
-			return 0, fmt.Errorf("maxmemory %q: cannot determine available memory", s)
+			// Unknown platform: run unlimited rather than refuse to start.
+			fmt.Fprintf(os.Stderr, "maxmemory %s: cannot determine available memory, using unlimited\n", s)
+			return 0, nil
 		}
 		return int64(n / 100 * float64(avail)), nil
 	}
@@ -307,7 +328,7 @@ func parseMemorySize(s string) (int64, error) {
 func printStartupBanner(c *cache.Cache, maxMemory int64) {
 	fmt.Printf("Version: %s (commit: %s)\n", version, commit)
 	fmt.Printf("Host: %s:%d\n", viper.GetString("host"), viper.GetInt("port"))
-	fmt.Printf("Threads: %d\n", viper.GetInt("threads"))
+	fmt.Printf("Threads: %d\n", runtime.GOMAXPROCS(0))
 	fmt.Printf("Shards: %d\n", viper.GetInt("shards"))
 	fmt.Printf("Load factor: %d%%, CAS: %v\n", viper.GetInt("loadfactor"), viper.GetBool("cas"))
 	if p := viper.GetString("persist"); p != "" {

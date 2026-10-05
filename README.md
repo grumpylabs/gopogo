@@ -62,6 +62,8 @@ gopogo --persist /var/lib/gopogo/data.pogo
 
 ## Configuration
 
+Boolean flags take `=true` or `=false` (e.g. `--cas=false`); pogocache-style `--cas no` is rejected rather than silently enabling the flag.
+
 | Flag | Environment | Default | Description |
 |------|-------------|---------|-------------|
 | `--host` | `GOPOGO_HOST` | `127.0.0.1` | Listening hostname |
@@ -69,10 +71,11 @@ gopogo --persist /var/lib/gopogo/data.pogo
 | `-s, --socket` | `GOPOGO_SOCKET` | | Unix socket path |
 | `--auth` | `GOPOGO_AUTH` | | Authentication password. The memcache protocol cannot authenticate, so with a password set every memcache command is refused |
 | `--persist` | `GOPOGO_PERSIST` | | Persistence file loaded at startup and saved at shutdown |
-| `--threads` | `GOPOGO_THREADS` | CPU count | Number of threads |
+| `--threads` | `GOPOGO_THREADS` | `0` | OS threads running Go code (GOMAXPROCS); 0 uses Go's default, which honors container CPU limits |
 | `--shards` | `GOPOGO_SHARDS` | `16` | Number of cache shards |
-| `--maxmemory` | `GOPOGO_MAXMEMORY` | `0` | Maximum memory: bytes with a k/m/g/t suffix (e.g. 1GB), a percentage of available memory (e.g. 80%; the container memory limit when set), or 0 for unlimited |
-| `--noevict` | `GOPOGO_NOEVICT` | `false` | Disable eviction |
+| `--maxmemory` | `GOPOGO_MAXMEMORY` | `80%` | Maximum memory: bytes with a k/m/g/t suffix (e.g. 1GB), a percentage of available memory (e.g. 80%; the container memory limit when set), or 0 for unlimited |
+| `--evict` | `GOPOGO_EVICT` | `yes` | Evict keys when maxmemory is reached; `no` rejects writes instead (`ERR out of memory`) |
+| `--noevict` | `GOPOGO_NOEVICT` | `false` | Same as `--evict=no` |
 | `--nosixpack` | `GOPOGO_NOSIXPACK` | `false` | Disable sixpack key compression |
 | `--loadfactor` | `GOPOGO_LOADFACTOR` | `75` | Hashmap load factor percent (55-95) |
 | `--cas` | `GOPOGO_CAS` | `false` | Assign compare-and-swap tokens on every write. When off, memcache `cas` and HTTP `X-CAS` writes always fail |

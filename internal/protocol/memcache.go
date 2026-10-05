@@ -29,6 +29,10 @@ func NewMemcacheHandler(cache *cache.Cache, auth string) *MemcacheHandler {
 	}
 }
 
+// memcacheNoMemory is memcached's reply when a write does not fit and eviction
+// is disabled.
+const memcacheNoMemory = "SERVER_ERROR out of memory storing object\r\n"
+
 // memcacheStorageCmds are the commands followed by a data block.
 var memcacheStorageCmds = map[string]bool{
 	"set": true, "add": true, "replace": true, "append": true, "prepend": true, "cas": true,
@@ -289,7 +293,12 @@ func (h *MemcacheHandler) handleStore(reader *bufio.Reader, writer *bufio.Writer
 	
 	opts.TTL = memcacheTTL(exptime)
 	
-	h.cache.Store([]byte(key), data, opts)
+	if _, err := h.cache.Store([]byte(key), data, opts); err != nil {
+		if !noreply {
+			writer.WriteString(memcacheNoMemory)
+		}
+		return
+	}
 	
 	if !noreply {
 		writer.WriteString("STORED\r\n")
@@ -347,7 +356,11 @@ func (h *MemcacheHandler) handleCAS(reader *bufio.Reader, writer *bufio.Writer, 
 	success, err := h.cache.CompareAndSwap([]byte(key), data, cas, opts)
 	if err != nil {
 		if !noreply {
-			writer.WriteString("NOT_FOUND\r\n")
+			if err == cache.ErrOutOfMemory {
+				writer.WriteString(memcacheNoMemory)
+			} else {
+				writer.WriteString("NOT_FOUND\r\n")
+			}
 		}
 		return
 	}
@@ -403,7 +416,11 @@ func (h *MemcacheHandler) handleAppend(reader *bufio.Reader, writer *bufio.Write
 	})
 	if err != nil {
 		if !noreply {
-			writer.WriteString("NOT_STORED\r\n")
+			if err == cache.ErrOutOfMemory {
+				writer.WriteString(memcacheNoMemory)
+			} else {
+				writer.WriteString("NOT_STORED\r\n")
+			}
 		}
 		return
 	}
@@ -483,6 +500,8 @@ func (h *MemcacheHandler) handleIncr(writer *bufio.Writer, parts []string, incr 
 		fmt.Fprintf(writer, "%d\r\n", newVal)
 	case errMemcacheNotFound:
 		writer.WriteString("NOT_FOUND\r\n")
+	case cache.ErrOutOfMemory:
+		writer.WriteString(memcacheNoMemory)
 	default:
 		writer.WriteString("CLIENT_ERROR cannot increment or decrement non-numeric value\r\n")
 	}

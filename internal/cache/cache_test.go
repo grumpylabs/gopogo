@@ -214,6 +214,71 @@ func TestSixpackRawKeysDistinct(t *testing.T) {
 	}
 }
 
+func TestNoEvictRejectsWhenFull(t *testing.T) {
+	c := New(&Options{NumShards: 1, MaxMemory: 4096, NoEvict: true, UseCAS: true})
+	val := bytes.Repeat([]byte("x"), 100)
+
+	stored := 0
+	for i := 0; ; i++ {
+		res, err := c.Store([]byte(fmt.Sprintf("k%d", i)), val, nil)
+		if err != nil {
+			if err != ErrOutOfMemory || res != NoMemory {
+				t.Fatalf("got %v, %v; want NoMemory, ErrOutOfMemory", res, err)
+			}
+			break
+		}
+		stored++
+		if i > 1000 {
+			t.Fatal("NoEvict never rejected a write")
+		}
+	}
+	if stored == 0 || c.NumItems() != stored || c.MemUsed() > 4096 {
+		t.Fatalf("stored=%d items=%d mem=%d", stored, c.NumItems(), c.MemUsed())
+	}
+
+	// Overwriting with a value of the same size does not grow, so it fits.
+	if _, err := c.Store([]byte("k0"), bytes.Repeat([]byte("y"), 100), nil); err != nil {
+		t.Fatalf("same-size overwrite rejected: %v", err)
+	}
+	// Growing an existing value, a new counter and a growing CAS are refused.
+	if err := c.Update([]byte("k0"), func(cur []byte, _ bool) ([]byte, error) {
+		return append(cur, bytes.Repeat([]byte("z"), 4096)...), nil
+	}); err != ErrOutOfMemory {
+		t.Fatalf("growing Update: got %v", err)
+	}
+	if _, err := c.Increment([]byte("newcounter"), 1); err != ErrOutOfMemory {
+		t.Fatalf("Increment on a full cache: got %v", err)
+	}
+	e, _ := c.Load([]byte("k1"))
+	if _, err := c.CompareAndSwap([]byte("k1"), bytes.Repeat([]byte("z"), 4096), e.CAS(), nil); err != ErrOutOfMemory {
+		t.Fatalf("growing CAS: got %v", err)
+	}
+	b := c.Begin()
+	if res := b.Store([]byte("batchkey"), val, nil); res != NoMemory {
+		t.Fatalf("Batch.Store on a full cache: got %v", res)
+	}
+	b.End()
+
+	// Deleting frees room for a new key.
+	c.Delete([]byte("k1"))
+	if _, err := c.Store([]byte("fresh"), val, nil); err != nil {
+		t.Fatalf("store after delete: %v", err)
+	}
+}
+
+func TestEvictionKeepsAcceptingWrites(t *testing.T) {
+	c := New(&Options{NumShards: 1, MaxMemory: 4096})
+	val := bytes.Repeat([]byte("x"), 100)
+	for i := 0; i < 500; i++ {
+		if _, err := c.Store([]byte(fmt.Sprintf("k%d", i)), val, nil); err != nil {
+			t.Fatalf("store %d with eviction: %v", i, err)
+		}
+	}
+	if c.MemUsed() > 4096+256 {
+		t.Fatalf("eviction did not bound memory: %d", c.MemUsed())
+	}
+}
+
 func TestCASDisabled(t *testing.T) {
 	c := New(nil)
 	c.Store([]byte("k"), []byte("v"), &StoreOptions{CAS: 5})

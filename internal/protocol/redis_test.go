@@ -582,3 +582,22 @@ func TestMemcacheGATAndExptime(t *testing.T) {
 		t.Fatalf("verbosity without level: %q", got)
 	}
 }
+
+func TestNoEvictOutOfMemoryReplies(t *testing.T) {
+	ch := cache.New(&cache.Options{NumShards: 1, MaxMemory: 2048, NoEvict: true})
+	ch.Store([]byte("big"), make([]byte, 1800), nil)
+
+	c := newRESPClient(t, ch)
+	c.expect(errReply("ERR out of memory"), "SET", "k", strings.Repeat("v", 500))
+	c.expect(errReply("ERR out of memory"), "APPEND", "big", strings.Repeat("v", 500))
+	c.expect(errReply("ERR out of memory"), "MSET", "a", strings.Repeat("v", 500))
+
+	server, client := net.Pipe()
+	go NewMemcacheHandler(ch, "").Handle(server)
+	defer client.Close()
+	client.SetDeadline(time.Now().Add(5 * time.Second))
+	client.Write([]byte("set m 0 0 500\r\n" + strings.Repeat("v", 500) + "\r\n"))
+	if l, _ := bufio.NewReader(client).ReadString('\n'); l != "SERVER_ERROR out of memory storing object\r\n" {
+		t.Fatalf("memcache set when full: got %q", l)
+	}
+}

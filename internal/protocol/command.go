@@ -100,6 +100,7 @@ const (
 	errSyntax     = "ERR syntax error"
 	errNotInteger = "ERR value is not an integer or out of range"
 	errExpire     = "ERR invalid expire time"
+	errNoMemory   = "ERR out of memory"
 )
 
 func wrongArgs(name string) result {
@@ -339,7 +340,10 @@ func cmdSet(x *Executor, s *session, name string, args []string) result {
 	var old *string
 	switch {
 	case withCAS:
-		ok, _ := x.cache.CompareAndSwap(key, val, cas, opts)
+		ok, err := x.cache.CompareAndSwap(key, val, cas, opts)
+		if err == cache.ErrOutOfMemory {
+			return errResult(errNoMemory)
+		}
 		stored = ok
 	case get:
 		b := x.cache.Begin()
@@ -347,10 +351,17 @@ func cmdSet(x *Executor, s *session, name string, args []string) result {
 			v := string(e.Value())
 			old = &v
 		}
-		stored = b.Store(key, val, opts) != cache.NotStored
+		res := b.Store(key, val, opts)
 		b.End()
+		if res == cache.NoMemory {
+			return errResult(errNoMemory)
+		}
+		stored = res != cache.NotStored
 	default:
-		res, _ := x.cache.Store(key, val, opts)
+		res, err := x.cache.Store(key, val, opts)
+		if err == cache.ErrOutOfMemory {
+			return errResult(errNoMemory)
+		}
 		stored = res != cache.NotStored
 	}
 
@@ -382,7 +393,9 @@ func cmdSetEx(x *Executor, s *session, name string, args []string) result {
 	if !ok {
 		return errResult(errExpire)
 	}
-	x.cache.Store([]byte(args[1]), []byte(args[3]), &cache.StoreOptions{TTL: ttl})
+	if _, err := x.cache.Store([]byte(args[1]), []byte(args[3]), &cache.StoreOptions{TTL: ttl}); err != nil {
+		return errResult(errNoMemory)
+	}
 	return result{resp: rvOK(), pg: pgTag("SETEX 1")}
 }
 
@@ -454,7 +467,9 @@ func cmdMSet(x *Executor, s *session, name string, args []string) result {
 		return wrongArgs(name)
 	}
 	for i := 1; i < len(args); i += 2 {
-		x.cache.Store([]byte(args[i]), []byte(args[i+1]), nil)
+		if _, err := x.cache.Store([]byte(args[i]), []byte(args[i+1]), nil); err != nil {
+			return errResult(errNoMemory)
+		}
 	}
 	return result{resp: rvOK(), pg: pgTag(fmt.Sprintf("MSET %d", (len(args)-1)/2))}
 }
@@ -512,7 +527,7 @@ func cmdAppend(x *Executor, s *session, name string, args []string) result {
 	prepend := name == "PREPEND"
 	value := args[2]
 	var n int
-	x.cache.Update([]byte(args[1]), func(cur []byte, found bool) ([]byte, error) {
+	err := x.cache.Update([]byte(args[1]), func(cur []byte, found bool) ([]byte, error) {
 		out := make([]byte, 0, len(cur)+len(value))
 		if prepend {
 			out = append(append(out, value...), cur...)
@@ -522,6 +537,9 @@ func cmdAppend(x *Executor, s *session, name string, args []string) result {
 		n = len(out)
 		return out, nil
 	})
+	if err != nil {
+		return errResult(errNoMemory)
+	}
 	return result{resp: rvInt(int64(n)), pg: pgTag(fmt.Sprintf("%s %d", name, n))}
 }
 

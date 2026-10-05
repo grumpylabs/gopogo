@@ -95,7 +95,10 @@ func (b *Batch) Store(key, value []byte, opts *StoreOptions) StoreResult {
 		entry.cas = c.nextCAS(shard, 0)
 	}
 
-	c.evictIfNeeded(shard, entry.Size(), hashKey(storeKey))
+	if !c.makeRoom(shard, c.growth(shard, entry), hashKey(storeKey)) {
+		c.recordStore(start, "no_memory")
+		return NoMemory
+	}
 
 	oldEntry := shard.m.insert(entry)
 	if oldEntry != nil {
