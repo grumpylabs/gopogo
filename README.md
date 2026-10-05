@@ -83,8 +83,10 @@ Boolean flags take `=true` or `=false` (e.g. `--cas=false`); pogocache-style `--
 | `--sweepinterval` | `GOPOGO_SWEEPINTERVAL` | `10s` | Sweep interval |
 | `--telemetry` | `GOPOGO_TELEMETRY` | `false` | Enable OpenTelemetry metrics and traces (see Telemetry) |
 | `--telemetry-exporter` | `GOPOGO_TELEMETRY_EXPORTER` | `otlp` | Exporter type (otlp, stdout) |
-| `--otlp-endpoint` | `GOPOGO_OTLP_ENDPOINT` | | OTLP gRPC endpoint (default `OTEL_EXPORTER_OTLP_ENDPOINT`, else `localhost:4317`) |
-| `--otlp-insecure` | `GOPOGO_OTLP_INSECURE` | `true` | Plaintext OTLP; `false` uses TLS |
+| `--otlp-protocol` | `GOPOGO_OTLP_PROTOCOL` | `grpc` | OTLP protocol: `grpc` or `http` |
+| `--otlp-endpoint` | `GOPOGO_OTLP_ENDPOINT` | | OTLP endpoint: `host:port` or base URL (default `OTEL_EXPORTER_OTLP_ENDPOINT`, else localhost) |
+| `--otlp-insecure` | `GOPOGO_OTLP_INSECURE` | `true` | Plaintext to a `host:port` endpoint |
+| `--otlp-headers` | `GOPOGO_OTLP_HEADERS` | | OTLP request headers, `key=value,...` |
 | `--telemetry-environment` | `GOPOGO_TELEMETRY_ENVIRONMENT` | | `deployment.environment` resource attribute |
 | `--trace-sample-ratio` | `GOPOGO_TRACE_SAMPLE_RATIO` | `1.0` | Fraction of new traces sampled |
 | `--tlsport` | `GOPOGO_TLSPORT` | `0` | TLS listening port |
@@ -240,16 +242,27 @@ psql -h localhost -p 5432 -U user dbname
 
 ## Telemetry
 
-With `--telemetry`, Gopogo exports OpenTelemetry metrics and traces over OTLP gRPC (`--telemetry-exporter otlp`, the default) or to stdout. Metrics are exported every 30 seconds, and pending metrics and spans are flushed on shutdown.
+With `--telemetry`, Gopogo exports OpenTelemetry metrics and traces over OTLP (`--telemetry-exporter otlp`, the default) or to stdout. Metrics are exported every 30 seconds, and pending metrics and spans are flushed on shutdown.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--otlp-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT`, else `localhost:4317` | Collector host:port |
-| `--otlp-insecure` | `true` | Plaintext OTLP; `false` uses TLS |
+| `--otlp-protocol` | `OTEL_EXPORTER_OTLP_PROTOCOL`, else `grpc` | `grpc` or `http` (OTLP/HTTP protobuf) |
+| `--otlp-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT`, else localhost | `host:port`, or a base URL; OTLP/HTTP posts to `<base>/v1/metrics` and `<base>/v1/traces` |
+| `--otlp-insecure` | `true` | Plaintext to a `host:port` endpoint; a URL endpoint's scheme decides |
+| `--otlp-headers` | `OTEL_EXPORTER_OTLP_HEADERS` | Request headers, `key=value,...` |
 | `--telemetry-environment` | | `deployment.environment` resource attribute |
 | `--trace-sample-ratio` | `1.0` | Fraction of new traces sampled; a caller's sampling decision is respected |
 
 `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` override the resource attributes.
+
+For an OTLP/HTTP endpoint that takes a bearer token, pass the token in the environment rather than on the command line:
+
+```bash
+GOPOGO_OTLP_HEADERS="Authorization=Bearer <token>" gopogo --telemetry \
+  --otlp-protocol http --otlp-endpoint https://ingest.example.com/src-abc
+```
+
+In the Helm chart, put the header in a Secret and set `telemetry.headersSecret.name`.
 
 ### Traces
 

@@ -84,8 +84,10 @@ func init() {
 
 	rootCmd.PersistentFlags().Bool("telemetry", false, "Enable OpenTelemetry metrics and traces")
 	rootCmd.PersistentFlags().String("telemetry-exporter", "otlp", "Telemetry exporter (otlp, stdout)")
-	rootCmd.PersistentFlags().String("otlp-endpoint", "", "OTLP gRPC endpoint host:port (default OTEL_EXPORTER_OTLP_ENDPOINT, else localhost:4317)")
-	rootCmd.PersistentFlags().Bool("otlp-insecure", true, "Send OTLP in plaintext; false uses TLS")
+	rootCmd.PersistentFlags().String("otlp-protocol", "", "OTLP protocol: grpc or http (default OTEL_EXPORTER_OTLP_PROTOCOL, else grpc)")
+	rootCmd.PersistentFlags().String("otlp-endpoint", "", "OTLP endpoint: host:port, or a base URL such as https://collector/prefix (default OTEL_EXPORTER_OTLP_ENDPOINT, else localhost)")
+	rootCmd.PersistentFlags().Bool("otlp-insecure", true, "Plaintext OTLP to a host:port endpoint; a URL endpoint's scheme decides")
+	rootCmd.PersistentFlags().String("otlp-headers", "", "OTLP request headers as key=value,... e.g. \"Authorization=Bearer <token>\" (default OTEL_EXPORTER_OTLP_HEADERS)")
 	rootCmd.PersistentFlags().String("telemetry-environment", "", "deployment.environment resource attribute")
 	rootCmd.PersistentFlags().Float64("trace-sample-ratio", 1.0, "Fraction of new traces to sample (0-1); a caller's sampling decision is respected")
 	rootCmd.PersistentFlags().Bool("noevict", false, "Same as --evict=no")
@@ -157,10 +159,17 @@ func runServer(cmd *cobra.Command, args []string) {
 	})
 
 	// Initialize telemetry
+	otlpHeaders, err := telemetry.ParseHeaders(viper.GetString("otlp-headers"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Option --otlp-headers is invalid: %v\n", err)
+		os.Exit(1)
+	}
 	telemetryCfg := &telemetry.Config{
 		Enabled:        viper.GetBool("telemetry"),
 		ExporterType:   viper.GetString("telemetry-exporter"),
+		Protocol:       viper.GetString("otlp-protocol"),
 		OTLPEndpoint:   viper.GetString("otlp-endpoint"),
+		Headers:        otlpHeaders,
 		Insecure:       viper.GetBool("otlp-insecure"),
 		ServiceName:    "gopogo",
 		ServiceVersion: version,

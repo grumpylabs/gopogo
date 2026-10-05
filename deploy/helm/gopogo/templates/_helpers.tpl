@@ -93,6 +93,9 @@ password
 {{- if .Values.telemetry.enabled }}
 - --telemetry
 - --telemetry-exporter={{ .Values.telemetry.exporter }}
+{{- with .Values.telemetry.protocol }}
+- --otlp-protocol={{ . }}
+{{- end }}
 {{- with .Values.telemetry.otlpEndpoint }}
 - --otlp-endpoint={{ . }}
 {{- end }}

@@ -9,7 +9,6 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/stdout/stdoutmetric"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -22,8 +21,10 @@ import (
 type Config struct {
 	Enabled        bool
 	ExporterType   string // "otlp", "stdout"
-	OTLPEndpoint   string // host:port; empty uses OTEL_EXPORTER_OTLP_* or localhost:4317
-	Insecure       bool   // plaintext OTLP instead of TLS
+	Protocol       string            // "grpc" or "http"; empty uses OTEL_EXPORTER_OTLP_PROTOCOL, else grpc
+	OTLPEndpoint   string            // host:port or base URL; empty uses OTEL_EXPORTER_OTLP_*
+	Insecure       bool              // plaintext OTLP to a host:port endpoint
+	Headers        map[string]string // extra OTLP request headers, e.g. Authorization
 	ServiceName    string
 	ServiceVersion string
 	Environment    string
@@ -101,14 +102,7 @@ func NewMetrics(ctx context.Context, cfg *Config) (*Metrics, error) {
 	var exporter sdkmetric.Exporter
 	switch cfg.ExporterType {
 	case "otlp":
-		opts := []otlpmetricgrpc.Option{}
-		if cfg.OTLPEndpoint != "" {
-			opts = append(opts, otlpmetricgrpc.WithEndpoint(cfg.OTLPEndpoint))
-		}
-		if cfg.Insecure {
-			opts = append(opts, otlpmetricgrpc.WithInsecure())
-		}
-		exporter, err = otlpmetricgrpc.New(ctx, opts...)
+		exporter, err = newOTLPMetricExporter(ctx, cfg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create OTLP exporter: %w", err)
 		}

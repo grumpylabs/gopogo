@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -36,14 +35,7 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 	var exporter sdktrace.SpanExporter
 	switch cfg.ExporterType {
 	case "otlp":
-		opts := []otlptracegrpc.Option{}
-		if cfg.OTLPEndpoint != "" {
-			opts = append(opts, otlptracegrpc.WithEndpoint(cfg.OTLPEndpoint))
-		}
-		if cfg.Insecure {
-			opts = append(opts, otlptracegrpc.WithInsecure())
-		}
-		exporter, err = otlptracegrpc.New(ctx, opts...)
+		exporter, err = newOTLPTraceExporter(ctx, cfg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create OTLP trace exporter: %w", err)
 		}

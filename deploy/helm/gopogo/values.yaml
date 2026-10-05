@@ -76,11 +76,22 @@ telemetry:
   enabled: false
   # otlp or stdout
   exporter: otlp
-  # OTLP gRPC host:port, e.g. otel-collector.observability:4317. Empty uses
-  # OTEL_EXPORTER_OTLP_ENDPOINT (set it in extraEnv) or localhost:4317.
+  # OTLP protocol: grpc or http.
+  protocol: grpc
+  # host:port (e.g. otel-collector.observability:4317), or for OTLP/HTTP a
+  # base URL such as https://ingest.example.com/src-abc; metrics and traces go
+  # to <base>/v1/metrics and <base>/v1/traces. Empty uses
+  # OTEL_EXPORTER_OTLP_ENDPOINT (set it in extraEnv) or localhost.
   otlpEndpoint: ""
-  # Plaintext OTLP; set false for a collector that requires TLS.
+  # Plaintext OTLP to a host:port endpoint; a URL endpoint's scheme decides.
   insecure: true
+  # OTLP request headers from a Secret, e.g. a bearer token. The key's value
+  # is key=value pairs, e.g. "Authorization=Bearer <token>":
+  #   kubectl create secret generic gopogo-otlp \
+  #     --from-literal=headers="Authorization=Bearer <token>"
+  headersSecret:
+    name: ""
+    key: headers
   # deployment.environment resource attribute, e.g. stage or prod.
   environment: ""
   # Fraction of new traces to sample (0-1). A caller's sampling decision
