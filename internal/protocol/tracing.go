@@ -2,7 +2,6 @@ package protocol
 
 import (
 	"context"
-	"log/slog"
 	"math"
 	"math/rand/v2"
 	"net"
@@ -16,6 +15,8 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // Each command runs in a server span named after the command (unknown
@@ -67,24 +68,31 @@ func beginCommand(ctx context.Context, proto Type, addr, name string) commandObs
 // end records the command's outcome. errMsg is the error reply, or "".
 func (o commandObs) end(errMsg string) {
 	endCommandSpan(o.span, errMsg)
-	logger := slog.Default()
-	if !logger.Enabled(o.ctx, slog.LevelDebug) {
+	ce := zap.L().Check(zapcore.DebugLevel, "command")
+	if ce == nil {
 		return
 	}
 	if r := math.Float64frombits(debugLogSample.Load()); r < 1 && rand.Float64() >= r {
 		return
 	}
-	attrs := []slog.Attr{
-		slog.String("command", o.name),
-		slog.String("protocol", o.proto.String()),
-		slog.String("client", o.addr),
-		slog.Int64("duration_us", time.Since(o.start).Microseconds()),
+	fields := []zap.Field{
+		zap.String("command", o.name),
+		zap.String("protocol", o.proto.String()),
+		zap.String("client", o.addr),
+		zap.Int64("duration_us", time.Since(o.start).Microseconds()),
+		// Links the record to the command's trace.
+		logContext(o.ctx),
 	}
 	if errMsg != "" {
-		attrs = append(attrs, slog.String("error", errMsg))
+		fields = append(fields, zap.String("error", errMsg))
 	}
-	// The span context in o.ctx links the record to the command's trace.
-	logger.LogAttrs(o.ctx, slog.LevelDebug, "command", attrs...)
+	ce.Write(fields...)
+}
+
+// logContext carries ctx to the log cores without encoding it; they take
+// the trace and span from it.
+func logContext(ctx context.Context) zap.Field {
+	return zap.Field{Key: "context", Type: zapcore.SkipType, Interface: ctx}
 }
 
 // startCommandSpan starts the span for one command, or returns ctx and nil

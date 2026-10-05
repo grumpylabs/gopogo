@@ -4,15 +4,17 @@ import (
 	"context"
 	"io"
 	"log"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace/noop"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 func TestParseHeaders(t *testing.T) {
@@ -68,8 +70,12 @@ func TestOTLPHTTPBaseURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lg.Install(slog.LevelInfo)
-	t.Cleanup(func() { slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil))) })
+	lg.Install(zapcore.InfoLevel)
+	t.Cleanup(func() {
+		zap.ReplaceGlobals(zap.NewNop())
+		log.SetOutput(os.Stderr)
+		log.SetFlags(log.LstdFlags)
+	})
 	log.Printf("hello from the log package")
 	t.Cleanup(func() { otel.SetTracerProvider(noop.NewTracerProvider()) })
 	m.CacheStoreCount.Add(ctx, 1)
@@ -87,8 +93,8 @@ func TestOTLPHTTPBaseURL(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if !strings.Contains(string(logBody), "hello from the log package") {
-		t.Errorf("log record body not exported")
+	if !strings.Contains(string(logBody), `"msg":"hello from the log package"`) {
+		t.Errorf("log record JSON body not exported")
 	}
 	for _, path := range []string{"/src-test/v1/metrics", "/src-test/v1/traces", "/src-test/v1/logs"} {
 		if auth, ok := got[path]; !ok || auth != "Bearer t0ken" {

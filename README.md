@@ -275,7 +275,7 @@ Every command runs in a server span named after the command (`GET`, `SET`, memca
 
 `--log-level debug` adds a debug record per command (command, protocol, client, `duration_us`, and `error` when it failed), written with the command's span context so each record links to its trace, plus a `cache stats` record every 30 seconds. `--debug-log-sample` (0-1) bounds the volume under load.
 
-Everything Gopogo logs (startup and shutdown events, `--verbose` output such as telemetry export results) is written to stderr as before and exported as OpenTelemetry log records, with warnings at WARN severity. OpenTelemetry's own error reports go to stderr only, so a failing log export cannot feed itself.
+Gopogo logs with zap as one JSON object per line on stderr (`level`, `time`, `caller`, `msg`, then the fields), including startup and shutdown events and `--verbose` output such as telemetry export results. Records logged in a traced command also carry `trace_id` and `span_id`. With `--telemetry`, each entry is also exported as an OpenTelemetry log record whose body is that same JSON line, with the matching severity and, for command records, the command's trace and span. OpenTelemetry's own error reports and the `--verbose` log-export results go to stderr only, so a failing log export cannot feed itself.
 
 ### Metrics
 

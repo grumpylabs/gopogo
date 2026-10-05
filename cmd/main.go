@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
-	"log/slog"
 	"math"
 	"os"
 	"strconv"
@@ -24,6 +22,8 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"github.com/spf13/viper"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 var (
@@ -181,9 +181,6 @@ func runServer(cmd *cobra.Command, args []string) {
 		SampleRatio:    viper.GetFloat64("trace-sample-ratio"),
 		Debug:          viper.GetBool("verbose"),
 	}
-	if viper.GetBool("verbose") {
-		log.Print(telemetryCfg.Describe())
-	}
 	metrics, err := telemetry.NewMetrics(context.Background(), telemetryCfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize telemetry: %v\n", err)
@@ -200,12 +197,15 @@ func runServer(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 	// Log output goes to stderr and, with telemetry, to OTLP logs.
-	var level slog.Level
+	var level zapcore.Level
 	if err := level.UnmarshalText([]byte(viper.GetString("log-level"))); err != nil {
 		fmt.Fprintf(os.Stderr, "Option --log-level is invalid: %v\n", err)
 		os.Exit(1)
 	}
 	logger.Install(level)
+	if viper.GetBool("verbose") {
+		zap.L().Info(telemetryCfg.Describe())
+	}
 	protocol.SetDebugLogSample(viper.GetFloat64("debug-log-sample"))
 	// Flush metrics, spans and logs on every exit path after this point.
 	// Logs go last so the other flushes' errors are exported too.
@@ -213,14 +213,15 @@ func runServer(cmd *cobra.Command, args []string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := tracer.Shutdown(ctx); err != nil {
-			slog.Warn("telemetry: flushing traces: " + err.Error())
+			zap.L().Warn("telemetry: flushing traces", zap.Error(err))
 		}
 		if err := metrics.Shutdown(ctx); err != nil {
-			slog.Warn("telemetry: flushing metrics: " + err.Error())
+			zap.L().Warn("telemetry: flushing metrics", zap.Error(err))
 		}
 		if err := logger.Shutdown(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "telemetry: flushing logs: %v\n", err)
 		}
+		zap.L().Sync()
 	}
 	if telemetryCfg.Enabled {
 		protocol.EnableTracing()
@@ -270,23 +271,23 @@ func runServer(cmd *cobra.Command, args []string) {
 		printStartupBanner(c, maxMemory)
 	}
 
-	if level <= slog.LevelDebug {
+	if level <= zapcore.DebugLevel {
 		go func() {
 			for range time.Tick(30 * time.Second) {
 				protocol.LogStats(c)
 			}
 		}()
 	}
-	slog.Info("gopogo starting",
-		"version", version, "commit", commit,
-		"port", viper.GetInt("port"), "protocols", strings.Join(enabledProtocols(), ","))
+	zap.L().Info("gopogo starting",
+		zap.String("version", version), zap.String("commit", commit),
+		zap.Int("port", viper.GetInt("port")), zap.Strings("protocols", enabledProtocols()))
 	if err := srv.Start(); err != nil {
-		slog.Error("gopogo failed to start: " + err.Error())
+		zap.L().Error("gopogo failed to start", zap.Error(err))
 		fmt.Fprintf(os.Stderr, "Error starting server: %v\n", err)
 		shutdownTelemetry()
 		os.Exit(1)
 	}
-	slog.Info("gopogo stopped")
+	zap.L().Info("gopogo stopped")
 
 	if persist != "" {
 		if !viper.GetBool("quiet") {

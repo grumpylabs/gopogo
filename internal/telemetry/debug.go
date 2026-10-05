@@ -2,8 +2,6 @@ package telemetry
 
 import (
 	"context"
-	"fmt"
-	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -11,6 +9,7 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.uber.org/zap"
 )
 
 // With Config.Debug, every export is logged with its item count, duration
@@ -27,7 +26,7 @@ func (e loggingMetricExporter) Export(ctx context.Context, rm *metricdata.Resour
 	for _, sm := range rm.ScopeMetrics {
 		n += len(sm.Metrics)
 	}
-	logExport("metrics", n, start, err)
+	reportExport(zap.L(), "metrics", n, start, err)
 	return err
 }
 
@@ -38,17 +37,17 @@ type loggingSpanExporter struct {
 func (e loggingSpanExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
 	start := time.Now()
 	err := e.SpanExporter.ExportSpans(ctx, spans)
-	logExport("spans", len(spans), start, err)
+	reportExport(zap.L(), "spans", len(spans), start, err)
 	return err
 }
 
-func logExport(signal string, n int, start time.Time, err error) {
-	took := time.Since(start).Round(time.Millisecond)
+func reportExport(logger *zap.Logger, signal string, n int, start time.Time, err error) {
+	fields := []zap.Field{zap.String("signal", signal), zap.Int("count", n), zap.Duration("took", time.Since(start).Round(time.Millisecond))}
 	if err != nil {
-		slog.Warn(fmt.Sprintf("telemetry: export %d %s failed after %s: %v", n, signal, took, err))
+		logger.Warn("telemetry export failed", append(fields, zap.Error(err))...)
 		return
 	}
-	slog.Info(fmt.Sprintf("telemetry: exported %d %s in %s", n, signal, took))
+	logger.Info("telemetry exported", fields...)
 }
 
 // Describe summarizes where telemetry goes, naming headers but never showing

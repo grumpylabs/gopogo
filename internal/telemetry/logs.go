@@ -3,27 +3,34 @@ package telemetry
 import (
 	"context"
 	"fmt"
-	"io"
-	"log/slog"
 	"os"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
-	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	"go.opentelemetry.io/otel/exporters/stdout/stdoutlog"
+	otellog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/global"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // Logger exports gopogo's log output as OpenTelemetry log records, alongside
-// the usual stderr output.
+// JSON lines on stderr.
 type Logger struct {
 	provider *sdklog.LoggerProvider
 }
+
+// stderrLogger writes to stderr only. Telemetry's own reports use it, so a
+// failing or busy log export never produces more log records to export.
+var stderrLogger atomic.Pointer[zap.Logger]
+
+func init() { stderrLogger.Store(zap.NewNop()) }
 
 // NewLogger creates an OpenTelemetry logger provider using the same exporter
 // settings as metrics and traces. When telemetry is disabled it does nothing.
@@ -53,6 +60,9 @@ func NewLogger(ctx context.Context, cfg *Config) (*Logger, error) {
 	default:
 		return nil, fmt.Errorf("unsupported exporter type: %s", cfg.ExporterType)
 	}
+	if cfg.Debug {
+		exporter = loggingLogExporter{exporter}
+	}
 
 	l.provider = sdklog.NewLoggerProvider(
 		sdklog.WithResource(res),
@@ -62,41 +72,41 @@ func NewLogger(ctx context.Context, cfg *Config) (*Logger, error) {
 	return l, nil
 }
 
-// Install makes the standard log package and slog's default logger write to
-// stderr in the log package's usual format and, when telemetry is enabled,
-// emit each entry as an OpenTelemetry log record.
-//
-// OpenTelemetry's own error reports (such as a failed export) go to stderr
-// only; routing them through the log package would turn a failing log
-// export into more log records to export.
-func (l *Logger) Install(level slog.Level) {
-	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
-		fmt.Fprintf(os.Stderr, "%s %v\n", time.Now().Format("2006/01/02 15:04:05"), err)
-	}))
-	handlers := []slog.Handler{&stderrHandler{w: os.Stderr}}
+// Install builds the process logger: JSON lines on stderr and, when
+// telemetry is enabled, an OpenTelemetry log record per entry whose body is
+// the same JSON line, so a backend that shows only the body still shows
+// every field. It becomes zap's global logger, and the standard log package
+// writes through it at info level. Entries below level are dropped.
+func (l *Logger) Install(level zapcore.Level) *zap.Logger {
+	enabled := zap.NewAtomicLevelAt(level)
+	enc := zapcore.NewJSONEncoder(encoderConfig())
+	stderr := zapcore.NewCore(enc, zapcore.Lock(os.Stderr), enabled)
+	stderrLogger.Store(zap.New(traceCore{stderr}, zap.AddCaller()))
+
+	core := stderr
 	if l.provider != nil {
-		handlers = append(handlers, otelslog.NewHandler("github.com/grumpylabs/gopogo",
-			otelslog.WithLoggerProvider(l.provider)))
+		core = zapcore.NewTee(stderr, otelCore{
+			LevelEnabler: enabled,
+			enc:          enc.Clone(),
+			logger:       l.provider.Logger("github.com/grumpylabs/gopogo"),
+		})
 	}
-	slog.SetDefault(slog.New(levelHandler{min: level, Handler: fanoutHandler(handlers)}))
+	logger := zap.New(traceCore{core}, zap.AddCaller())
+	zap.ReplaceGlobals(logger)
+	zap.RedirectStdLog(logger)
+
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		stderrLogger.Load().Error("telemetry error", zap.Error(err))
+	}))
+	return logger
 }
 
-// levelHandler drops records below min.
-type levelHandler struct {
-	slog.Handler
-	min slog.Level
-}
-
-func (h levelHandler) Enabled(ctx context.Context, l slog.Level) bool {
-	return l >= h.min && h.Handler.Enabled(ctx, l)
-}
-
-func (h levelHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return levelHandler{min: h.min, Handler: h.Handler.WithAttrs(attrs)}
-}
-
-func (h levelHandler) WithGroup(name string) slog.Handler {
-	return levelHandler{min: h.min, Handler: h.Handler.WithGroup(name)}
+func encoderConfig() zapcore.EncoderConfig {
+	cfg := zap.NewProductionEncoderConfig()
+	cfg.TimeKey = "time"
+	cfg.EncodeTime = zapcore.RFC3339NanoTimeEncoder
+	cfg.EncodeDuration = zapcore.StringDurationEncoder
+	return cfg
 }
 
 // Shutdown flushes pending log records and shuts down the provider.
@@ -105,6 +115,117 @@ func (l *Logger) Shutdown(ctx context.Context) error {
 		return l.provider.Shutdown(ctx)
 	}
 	return nil
+}
+
+// otelCore emits each entry as an OpenTelemetry log record with the
+// entry's JSON encoding as its body. A Context field supplies the record's
+// trace and span.
+type otelCore struct {
+	zapcore.LevelEnabler
+	enc    zapcore.Encoder
+	logger otellog.Logger
+}
+
+func (c otelCore) With(fields []zapcore.Field) zapcore.Core {
+	enc := c.enc.Clone()
+	for _, f := range fields {
+		f.AddTo(enc)
+	}
+	return otelCore{LevelEnabler: c.LevelEnabler, enc: enc, logger: c.logger}
+}
+
+func (c otelCore) Check(e zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	if c.Enabled(e.Level) {
+		return ce.AddCore(e, c)
+	}
+	return ce
+}
+
+func (c otelCore) Write(e zapcore.Entry, fields []zapcore.Field) error {
+	buf, err := c.enc.EncodeEntry(e, fields)
+	if err != nil {
+		return err
+	}
+	body := strings.TrimSuffix(buf.String(), "\n")
+	buf.Free()
+
+	ctx := context.Background()
+	for _, f := range fields {
+		if fc, ok := f.Interface.(context.Context); ok {
+			ctx = fc
+			break
+		}
+	}
+	var r otellog.Record
+	r.SetTimestamp(e.Time)
+	r.SetSeverity(severity(e.Level))
+	r.SetSeverityText(e.Level.CapitalString())
+	r.SetBody(otellog.StringValue(body))
+	c.logger.Emit(ctx, r)
+	return nil
+}
+
+func (otelCore) Sync() error { return nil }
+
+func severity(l zapcore.Level) otellog.Severity {
+	switch {
+	case l <= zapcore.DebugLevel:
+		return otellog.SeverityDebug
+	case l == zapcore.InfoLevel:
+		return otellog.SeverityInfo
+	case l == zapcore.WarnLevel:
+		return otellog.SeverityWarn
+	case l == zapcore.ErrorLevel:
+		return otellog.SeverityError
+	default:
+		return otellog.SeverityFatal
+	}
+}
+
+// traceCore adds trace_id and span_id fields for an entry logged with a
+// Context field whose context holds a valid span.
+type traceCore struct {
+	zapcore.Core
+}
+
+func (c traceCore) With(fields []zapcore.Field) zapcore.Core {
+	return traceCore{c.Core.With(fields)}
+}
+
+func (c traceCore) Check(e zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	if c.Enabled(e.Level) {
+		return ce.AddCore(e, c)
+	}
+	return ce
+}
+
+func (c traceCore) Write(e zapcore.Entry, fields []zapcore.Field) error {
+	for _, f := range fields {
+		ctx, ok := f.Interface.(context.Context)
+		if !ok {
+			continue
+		}
+		if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+			fields = append(fields[:len(fields):len(fields)],
+				zap.String("trace_id", sc.TraceID().String()),
+				zap.String("span_id", sc.SpanID().String()))
+		}
+		break
+	}
+	return c.Core.Write(e, fields)
+}
+
+// loggingLogExporter reports each log export on stderr only; reporting it
+// through the exported logger would itself produce a record per export.
+type loggingLogExporter struct {
+	sdklog.Exporter
+}
+
+func (e loggingLogExporter) Export(ctx context.Context, records []sdklog.Record) error {
+	start := time.Now()
+	err := e.Exporter.Export(ctx, records)
+	reportExport(stderrLogger.Load(), "logs", len(records), start, err)
+	return err
 }
 
 func newOTLPLogExporter(ctx context.Context, cfg *Config) (sdklog.Exporter, error) {
@@ -147,84 +268,4 @@ func newOTLPLogExporter(ctx context.Context, cfg *Config) (sdklog.Exporter, erro
 		opts = append(opts, otlploggrpc.WithHeaders(cfg.Headers))
 	}
 	return otlploggrpc.New(ctx, opts...)
-}
-
-// stderrHandler writes records as "2006/01/02 15:04:05 message key=value",
-// matching the log package's default output.
-type stderrHandler struct {
-	mu    sync.Mutex
-	w     io.Writer
-	attrs []slog.Attr
-}
-
-func (h *stderrHandler) Enabled(context.Context, slog.Level) bool { return true }
-
-func (h *stderrHandler) Handle(_ context.Context, r slog.Record) error {
-	var b strings.Builder
-	b.WriteString(r.Time.Format("2006/01/02 15:04:05"))
-	b.WriteByte(' ')
-	if r.Level >= slog.LevelWarn || r.Level < slog.LevelInfo {
-		b.WriteString(r.Level.String())
-		b.WriteByte(' ')
-	}
-	b.WriteString(r.Message)
-	write := func(a slog.Attr) bool {
-		fmt.Fprintf(&b, " %s=%v", a.Key, a.Value)
-		return true
-	}
-	for _, a := range h.attrs {
-		write(a)
-	}
-	r.Attrs(write)
-	b.WriteByte('\n')
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	_, err := io.WriteString(h.w, b.String())
-	return err
-}
-
-func (h *stderrHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &stderrHandler{w: h.w, attrs: append(append([]slog.Attr{}, h.attrs...), attrs...)}
-}
-
-func (h *stderrHandler) WithGroup(string) slog.Handler { return h }
-
-// fanoutHandler sends each record to every handler.
-type fanoutHandler []slog.Handler
-
-func (f fanoutHandler) Enabled(ctx context.Context, l slog.Level) bool {
-	for _, h := range f {
-		if h.Enabled(ctx, l) {
-			return true
-		}
-	}
-	return false
-}
-
-func (f fanoutHandler) Handle(ctx context.Context, r slog.Record) error {
-	var first error
-	for _, h := range f {
-		if h.Enabled(ctx, r.Level) {
-			if err := h.Handle(ctx, r.Clone()); err != nil && first == nil {
-				first = err
-			}
-		}
-	}
-	return first
-}
-
-func (f fanoutHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	out := make(fanoutHandler, len(f))
-	for i, h := range f {
-		out[i] = h.WithAttrs(attrs)
-	}
-	return out
-}
-
-func (f fanoutHandler) WithGroup(name string) slog.Handler {
-	out := make(fanoutHandler, len(f))
-	for i, h := range f {
-		out[i] = h.WithGroup(name)
-	}
-	return out
 }
