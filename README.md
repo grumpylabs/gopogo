@@ -275,8 +275,22 @@ make integration    # Run pogocache's protocol tests against a live server
 ## Docker
 
 ```bash
-docker build -t gopogo .
-docker run -p 6379:6379 -e GOPOGO_MAXMEMORY=512MB gopogo
+make container
+docker run -p 6379:6379 -e GOPOGO_MAXMEMORY=512MB ghcr.io/grumpylabs/gopogo:dev
+```
+
+## Container Image
+
+The version is stamped from git: the nearest `v*` tag (`v1.2.3` builds report `1.2.3`; later commits `1.2.3-<n>-g<commit>`). The `image` workflow publishes `ghcr.io/grumpylabs/gopogo` for linux/amd64 and linux/arm64 on every push to `main` (`:latest` and `:<commit>`) and for `v1.2.3` git tags (`:1.2.3`). Each arch is built natively on its own runner: `make amd64` / `make arm64` build a static binary, `make ci-pkg-<arch>` packages and pushes `:<commit>-<arch>`, and `make ci-pkg` joins them into the multi-arch tags with `docker manifest`.
+
+```bash
+make container   # local image ghcr.io/grumpylabs/gopogo:dev for this machine
+make run-ports   # run it
+make dev         # push ghcr.io/grumpylabs/gopogo:<user>-<commit> (amd64 + arm64)
+make images      # build the CI images :<commit>-amd64 and :<commit>-arm64 locally, no push
+make push        # the whole CI publish from this machine (needs `make login`)
+
+docker run -p 6379:6379 ghcr.io/grumpylabs/gopogo --host 0.0.0.0 --http --memcache --postgres
 ```
 
 ## Kubernetes
@@ -291,7 +305,7 @@ helm install cache deploy/helm/gopogo \
 helm test cache
 ```
 
-See `deploy/helm/gopogo/values.yaml` for all options. The chart uses the `grumpylabs/gopogo` image, tagged with the chart's `appVersion`; override `image.repository` and `image.tag` to use your own registry.
+See `deploy/helm/gopogo/values.yaml` for all options. The chart uses `ghcr.io/grumpylabs/gopogo`, tagged with the chart's `appVersion`; override `image.repository` and `image.tag` to use your own registry.
 
 ## License
 

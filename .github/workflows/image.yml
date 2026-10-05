@@ -1,0 +1,96 @@
+name: image
+
+# Publishes ghcr.io/grumpylabs/gopogo. Each arch is built natively on its own
+# runner (`make amd64` / `make arm64`, then `make ci-pkg-<arch>` pushes
+# :<commit>-<arch>), and `make ci-pkg` joins them into multi-arch :<commit>
+# and :latest manifests. A v1.2.3 git tag also publishes :1.2.3, the Helm
+# chart's appVersion tag.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GHCR_USER: ${{ github.actor }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: make
+        run: make vet test
+
+  build-amd64:
+    needs: test
+    name: Build (AMD64)
+    runs-on: ubuntu-latest
+    steps:
+      # Full history so `git describe` finds the version tag.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Generate Go Binaries
+        run: make amd64
+
+      - name: Build Docker Images
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: make ci-pkg-amd64
+
+  build-arm64:
+    needs: test
+    name: Build (ARM64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      # Full history so `git describe` finds the version tag.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Generate Go Binaries
+        run: make arm64
+
+      - name: Build Docker Images
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: make ci-pkg-arm64
+
+  push-images:
+    name: Create Manifest/Push
+    needs: [build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      # Full history so the Makefile sees a v* tag on this commit.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Build and push manifest
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: make ci-pkg

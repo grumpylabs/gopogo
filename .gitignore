@@ -1,3 +1,5 @@
 /.claude
 /.docker-build-1.0.0
 /bin/gopogo
+/bin/gopogo-amd64
+/bin/gopogo-arm64

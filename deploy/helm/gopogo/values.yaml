@@ -1,8 +1,9 @@
 # Default values for gopogo.
 
 image:
-  repository: grumpylabs/gopogo
-  # Defaults to the chart appVersion.
+  repository: ghcr.io/grumpylabs/gopogo
+  # Defaults to the chart appVersion, published by pushing the git tag
+  # v<appVersion>. Use "latest" for the newest build of main.
   tag: ""
   pullPolicy: IfNotPresent
 

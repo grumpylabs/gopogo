@@ -1,0 +1,4 @@
+# The image only needs the static binaries from `make amd64` / `make arm64`.
+*
+!bin/gopogo-amd64
+!bin/gopogo-arm64
