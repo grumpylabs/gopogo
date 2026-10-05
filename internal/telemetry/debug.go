@@ -2,7 +2,8 @@ package telemetry
 
 import (
 	"context"
-	"log"
+	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -42,11 +43,12 @@ func (e loggingSpanExporter) ExportSpans(ctx context.Context, spans []sdktrace.R
 }
 
 func logExport(signal string, n int, start time.Time, err error) {
+	took := time.Since(start).Round(time.Millisecond)
 	if err != nil {
-		log.Printf("telemetry: export %d %s failed after %s: %v", n, signal, time.Since(start).Round(time.Millisecond), err)
+		slog.Warn(fmt.Sprintf("telemetry: export %d %s failed after %s: %v", n, signal, took, err))
 		return
 	}
-	log.Printf("telemetry: exported %d %s in %s", n, signal, time.Since(start).Round(time.Millisecond))
+	slog.Info(fmt.Sprintf("telemetry: exported %d %s in %s", n, signal, took))
 }
 
 // Describe summarizes where telemetry goes, naming headers but never showing

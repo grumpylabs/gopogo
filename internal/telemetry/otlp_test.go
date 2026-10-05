@@ -2,8 +2,12 @@ package telemetry
 
 import (
 	"context"
+	"io"
+	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -29,9 +33,14 @@ func TestParseHeaders(t *testing.T) {
 func TestOTLPHTTPBaseURL(t *testing.T) {
 	var mu sync.Mutex
 	got := map[string]string{} // path -> Authorization header
+	var logBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		got[r.URL.Path] = r.Header.Get("Authorization")
+		if strings.HasSuffix(r.URL.Path, "/v1/logs") {
+			logBody = append(logBody, body...)
+		}
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -55,6 +64,13 @@ func TestOTLPHTTPBaseURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	lg, err := NewLogger(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg.Install()
+	t.Cleanup(func() { slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil))) })
+	log.Printf("hello from the log package")
 	t.Cleanup(func() { otel.SetTracerProvider(noop.NewTracerProvider()) })
 	m.CacheStoreCount.Add(ctx, 1)
 	_, span := otel.Tracer("test").Start(ctx, "op")
@@ -65,10 +81,16 @@ func TestOTLPHTTPBaseURL(t *testing.T) {
 	if err := m.Shutdown(ctx); err != nil {
 		t.Fatalf("metric export: %v", err)
 	}
+	if err := lg.Shutdown(ctx); err != nil {
+		t.Fatalf("log export: %v", err)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	for _, path := range []string{"/src-test/v1/metrics", "/src-test/v1/traces"} {
+	if !strings.Contains(string(logBody), "hello from the log package") {
+		t.Errorf("log record body not exported")
+	}
+	for _, path := range []string{"/src-test/v1/metrics", "/src-test/v1/traces", "/src-test/v1/logs"} {
 		if auth, ok := got[path]; !ok || auth != "Bearer t0ken" {
 			t.Errorf("%s: received=%v auth=%q (all: %v)", path, ok, auth, got)
 		}

@@ -81,7 +81,7 @@ Boolean flags take `=true` or `=false` (e.g. `--cas=false`); pogocache-style `--
 | `--cas` | `GOPOGO_CAS` | `false` | Assign compare-and-swap tokens on every write. When off, memcache `cas` and HTTP `X-CAS` writes always fail |
 | `--autosweep` | `GOPOGO_AUTOSWEEP` | `true` | Enable background sweeping |
 | `--sweepinterval` | `GOPOGO_SWEEPINTERVAL` | `10s` | Sweep interval |
-| `--telemetry` | `GOPOGO_TELEMETRY` | `false` | Enable OpenTelemetry metrics and traces (see Telemetry) |
+| `--telemetry` | `GOPOGO_TELEMETRY` | `false` | Enable OpenTelemetry metrics, traces and logs (see Telemetry) |
 | `--telemetry-exporter` | `GOPOGO_TELEMETRY_EXPORTER` | `otlp` | Exporter type (otlp, stdout) |
 | `--otlp-protocol` | `GOPOGO_OTLP_PROTOCOL` | `grpc` | OTLP protocol: `grpc` or `http` |
 | `--otlp-endpoint` | `GOPOGO_OTLP_ENDPOINT` | | OTLP endpoint: `host:port` or base URL (default `OTEL_EXPORTER_OTLP_ENDPOINT`, else localhost) |
@@ -242,7 +242,7 @@ psql -h localhost -p 5432 -U user dbname
 
 ## Telemetry
 
-With `--telemetry`, Gopogo exports OpenTelemetry metrics and traces over OTLP (`--telemetry-exporter otlp`, the default) or to stdout. Metrics are exported every 30 seconds, and pending metrics and spans are flushed on shutdown.
+With `--telemetry`, Gopogo exports OpenTelemetry metrics, traces and logs over OTLP (`--telemetry-exporter otlp`, the default) or to stdout. Metrics are exported every 30 seconds, and pending metrics, spans and logs are flushed on shutdown.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -267,6 +267,10 @@ In the Helm chart, put the header in a Secret and set `telemetry.headersSecret.n
 ### Traces
 
 Every command runs in a server span named after the command (`GET`, `SET`, memcache `get`; unrecognized commands are `UNKNOWN`), with `db.system.name`, `db.operation.name`, `network.protocol.name` (redis, http, memcache, postgres), `client.address` and `client.port`. Failed commands set the span status to error and `error.type` to the error reply's first word (`ERR`, `WRONGPASS`, `CLIENT_ERROR`, ...). Keys and values are never recorded. HTTP requests continue the caller's trace from a W3C `traceparent` header; the other protocols cannot carry trace context, so their spans start new traces. Loading and saving the persistence file run in `persist.load` and `persist.save` spans.
+
+### Logs
+
+Everything Gopogo logs (startup and shutdown events, `--verbose` output such as telemetry export results) is written to stderr as before and exported as OpenTelemetry log records, with warnings at WARN severity. OpenTelemetry's own error reports go to stderr only, so a failing log export cannot feed itself.
 
 ### Metrics
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"math"
 	"os"
 	"strconv"
@@ -83,7 +84,7 @@ func init() {
 	rootCmd.PersistentFlags().Bool("verbose", false, "Verbose output, including every telemetry export")
 	rootCmd.PersistentFlags().Bool("version", false, "Show version")
 
-	rootCmd.PersistentFlags().Bool("telemetry", false, "Enable OpenTelemetry metrics and traces")
+	rootCmd.PersistentFlags().Bool("telemetry", false, "Enable OpenTelemetry metrics, traces and logs")
 	rootCmd.PersistentFlags().String("telemetry-exporter", "otlp", "Telemetry exporter (otlp, stdout)")
 	rootCmd.PersistentFlags().String("otlp-protocol", "", "OTLP protocol: grpc or http (default OTEL_EXPORTER_OTLP_PROTOCOL, else grpc)")
 	rootCmd.PersistentFlags().String("otlp-endpoint", "", "OTLP endpoint: host:port, or a base URL such as https://collector/prefix (default OTEL_EXPORTER_OTLP_ENDPOINT, else localhost)")
@@ -191,15 +192,26 @@ func runServer(cmd *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "Failed to initialize tracing: %v\n", err)
 		os.Exit(1)
 	}
-	// Flush metrics and spans on every exit path after this point.
+	logger, err := telemetry.NewLogger(context.Background(), telemetryCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize log export: %v\n", err)
+		os.Exit(1)
+	}
+	// Log output goes to stderr and, with telemetry, to OTLP logs.
+	logger.Install()
+	// Flush metrics, spans and logs on every exit path after this point.
+	// Logs go last so the other flushes' errors are exported too.
 	shutdownTelemetry := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := tracer.Shutdown(ctx); err != nil {
-			log.Printf("telemetry: flushing traces: %v", err)
+			slog.Warn("telemetry: flushing traces: " + err.Error())
 		}
 		if err := metrics.Shutdown(ctx); err != nil {
-			log.Printf("telemetry: flushing metrics: %v", err)
+			slog.Warn("telemetry: flushing metrics: " + err.Error())
+		}
+		if err := logger.Shutdown(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "telemetry: flushing logs: %v\n", err)
 		}
 	}
 	if telemetryCfg.Enabled {
@@ -250,11 +262,16 @@ func runServer(cmd *cobra.Command, args []string) {
 		printStartupBanner(c, maxMemory)
 	}
 
+	slog.Info("gopogo starting",
+		"version", version, "commit", commit,
+		"port", viper.GetInt("port"), "protocols", strings.Join(enabledProtocols(), ","))
 	if err := srv.Start(); err != nil {
+		slog.Error("gopogo failed to start: " + err.Error())
 		fmt.Fprintf(os.Stderr, "Error starting server: %v\n", err)
 		shutdownTelemetry()
 		os.Exit(1)
 	}
+	slog.Info("gopogo stopped")
 
 	if persist != "" {
 		if !viper.GetBool("quiet") {
@@ -391,6 +408,17 @@ func parseMemorySize(s string) (int64, error) {
 		return 0, fmt.Errorf("invalid maxmemory %q", s)
 	}
 	return int64(n * mult), nil
+}
+
+// enabledProtocols lists the protocols turned on by flags.
+func enabledProtocols() []string {
+	var out []string
+	for _, p := range []string{"redis", "http", "memcache", "postgres"} {
+		if viper.GetBool(p) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func printStartupBanner(c *cache.Cache, maxMemory int64) {
