@@ -68,7 +68,7 @@ func TestOTLPHTTPBaseURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lg.Install()
+	lg.Install(slog.LevelInfo)
 	t.Cleanup(func() { slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil))) })
 	log.Printf("hello from the log package")
 	t.Cleanup(func() { otel.SetTracerProvider(noop.NewTracerProvider()) })

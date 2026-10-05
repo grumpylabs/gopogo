@@ -3,3 +3,4 @@
 /bin/gopogo
 /bin/gopogo-amd64
 /bin/gopogo-arm64
+/bin/gopogo-loadgen

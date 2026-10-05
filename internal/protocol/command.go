@@ -187,9 +187,9 @@ func (x *Executor) exec(s *session, args []string) result {
 	if parent == nil {
 		parent = context.Background()
 	}
-	_, span := startCommandSpan(parent, s.proto, s.addr, spanName)
+	obs := beginCommand(parent, s.proto, s.addr, spanName)
 	r := x.run(s, name, args)
-	endCommandSpan(span, r.err)
+	obs.end(r.err)
 	return r
 }
 

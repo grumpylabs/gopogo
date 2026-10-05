@@ -111,6 +111,8 @@ password
 {{- if .Values.verbose }}
 - --verbose
 {{- end }}
+- --log-level={{ .Values.logLevel | default "info" }}
+- --debug-log-sample={{ if hasKey .Values "debugLogSample" }}{{ .Values.debugLogSample }}{{ else }}1{{ end }}
 {{- range .Values.extraArgs }}
 - {{ . | quote }}
 {{- end }}

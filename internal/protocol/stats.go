@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"context"
+	"log/slog"
 	"os"
 	"runtime"
 	"strconv"
@@ -103,6 +105,28 @@ func CounterSnapshot() []ProtocolCounters {
 		})
 	}
 	return out
+}
+
+// LogStats writes a debug log record with the main STATS counters, for
+// following load in the log stream.
+func LogStats(c *cache.Cache) {
+	if !slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		return
+	}
+	want := map[string]bool{
+		"curr_items": true, "bytes": true, "total_items": true, "cmd_get": true,
+		"cmd_set": true, "get_hits": true, "get_misses": true, "evictions": true,
+		"curr_connections": true, "total_connections": true, "store_no_memory": true,
+	}
+	var attrs []slog.Attr
+	for _, kv := range statLines(c) {
+		if want[kv[0]] {
+			if n, err := strconv.ParseInt(kv[1], 10, 64); err == nil {
+				attrs = append(attrs, slog.Int64(kv[0], n))
+			}
+		}
+	}
+	slog.LogAttrs(context.Background(), slog.LevelDebug, "cache stats", attrs...)
 }
 
 // statLines returns server stats as name/value pairs in the order pogocache's

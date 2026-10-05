@@ -69,7 +69,7 @@ func NewLogger(ctx context.Context, cfg *Config) (*Logger, error) {
 // OpenTelemetry's own error reports (such as a failed export) go to stderr
 // only; routing them through the log package would turn a failing log
 // export into more log records to export.
-func (l *Logger) Install() {
+func (l *Logger) Install(level slog.Level) {
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
 		fmt.Fprintf(os.Stderr, "%s %v\n", time.Now().Format("2006/01/02 15:04:05"), err)
 	}))
@@ -78,7 +78,25 @@ func (l *Logger) Install() {
 		handlers = append(handlers, otelslog.NewHandler("github.com/grumpylabs/gopogo",
 			otelslog.WithLoggerProvider(l.provider)))
 	}
-	slog.SetDefault(slog.New(fanoutHandler(handlers)))
+	slog.SetDefault(slog.New(levelHandler{min: level, Handler: fanoutHandler(handlers)}))
+}
+
+// levelHandler drops records below min.
+type levelHandler struct {
+	slog.Handler
+	min slog.Level
+}
+
+func (h levelHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	return l >= h.min && h.Handler.Enabled(ctx, l)
+}
+
+func (h levelHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return levelHandler{min: h.min, Handler: h.Handler.WithAttrs(attrs)}
+}
+
+func (h levelHandler) WithGroup(name string) slog.Handler {
+	return levelHandler{min: h.min, Handler: h.Handler.WithGroup(name)}
 }
 
 // Shutdown flushes pending log records and shuts down the provider.
@@ -145,7 +163,7 @@ func (h *stderrHandler) Handle(_ context.Context, r slog.Record) error {
 	var b strings.Builder
 	b.WriteString(r.Time.Format("2006/01/02 15:04:05"))
 	b.WriteByte(' ')
-	if r.Level >= slog.LevelWarn {
+	if r.Level >= slog.LevelWarn || r.Level < slog.LevelInfo {
 		b.WriteString(r.Level.String())
 		b.WriteByte(' ')
 	}

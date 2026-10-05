@@ -83,11 +83,11 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 		if !memcacheCmds[cmd] {
 			spanName = "UNKNOWN"
 		}
-		_, span := startCommandSpan(context.Background(), TypeMemcache, addr, spanName)
+		obs := beginCommand(context.Background(), TypeMemcache, addr, spanName)
 		peek.reset()
 		if h.auth != "" {
 			if cmd == "quit" {
-				endCommandSpan(span, "")
+				obs.end("")
 				return
 			}
 			// Consume a storage command's data block so the next command
@@ -102,7 +102,7 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 			countAuth(TypeMemcache, false)
 			writer.WriteString("CLIENT_ERROR Authentication required\r\n")
 			writer.Flush()
-			endCommandSpan(span, peek.errorReply())
+			obs.end(peek.errorReply())
 			continue
 		}
 		monitors.publish(addr, parts)
@@ -165,7 +165,7 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 			
 		case "quit":
 			writer.Flush()
-			endCommandSpan(span, "")
+			obs.end("")
 			return
 			
 		default:
@@ -173,7 +173,7 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 		}
 		
 		writer.Flush()
-		endCommandSpan(span, peek.errorReply())
+		obs.end(peek.errorReply())
 	}
 }
 

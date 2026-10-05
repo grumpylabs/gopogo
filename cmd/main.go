@@ -82,6 +82,8 @@ func init() {
 	rootCmd.PersistentFlags().String("config", "", "Config file path")
 	rootCmd.PersistentFlags().Bool("quiet", false, "Quiet mode")
 	rootCmd.PersistentFlags().Bool("verbose", false, "Verbose output, including every telemetry export")
+	rootCmd.PersistentFlags().String("log-level", "info", "Log level: debug, info, warn or error. debug logs every command (see --debug-log-sample) and cache stats every 30s")
+	rootCmd.PersistentFlags().Float64("debug-log-sample", 1.0, "Fraction of commands logged at debug level (0-1)")
 	rootCmd.PersistentFlags().Bool("version", false, "Show version")
 
 	rootCmd.PersistentFlags().Bool("telemetry", false, "Enable OpenTelemetry metrics, traces and logs")
@@ -198,7 +200,13 @@ func runServer(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 	// Log output goes to stderr and, with telemetry, to OTLP logs.
-	logger.Install()
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(viper.GetString("log-level"))); err != nil {
+		fmt.Fprintf(os.Stderr, "Option --log-level is invalid: %v\n", err)
+		os.Exit(1)
+	}
+	logger.Install(level)
+	protocol.SetDebugLogSample(viper.GetFloat64("debug-log-sample"))
 	// Flush metrics, spans and logs on every exit path after this point.
 	// Logs go last so the other flushes' errors are exported too.
 	shutdownTelemetry := func() {
@@ -262,6 +270,13 @@ func runServer(cmd *cobra.Command, args []string) {
 		printStartupBanner(c, maxMemory)
 	}
 
+	if level <= slog.LevelDebug {
+		go func() {
+			for range time.Tick(30 * time.Second) {
+				protocol.LogStats(c)
+			}
+		}()
+	}
 	slog.Info("gopogo starting",
 		"version", version, "commit", commit,
 		"port", viper.GetInt("port"), "protocols", strings.Join(enabledProtocols(), ","))

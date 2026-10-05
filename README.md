@@ -81,6 +81,9 @@ Boolean flags take `=true` or `=false` (e.g. `--cas=false`); pogocache-style `--
 | `--cas` | `GOPOGO_CAS` | `false` | Assign compare-and-swap tokens on every write. When off, memcache `cas` and HTTP `X-CAS` writes always fail |
 | `--autosweep` | `GOPOGO_AUTOSWEEP` | `true` | Enable background sweeping |
 | `--sweepinterval` | `GOPOGO_SWEEPINTERVAL` | `10s` | Sweep interval |
+| `--log-level` | `GOPOGO_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`; `debug` logs every command and cache stats |
+| `--debug-log-sample` | `GOPOGO_DEBUG_LOG_SAMPLE` | `1.0` | Fraction of commands logged at debug level |
+| `--verbose` | `GOPOGO_VERBOSE` | `false` | Log telemetry exports and other detail |
 | `--telemetry` | `GOPOGO_TELEMETRY` | `false` | Enable OpenTelemetry metrics, traces and logs (see Telemetry) |
 | `--telemetry-exporter` | `GOPOGO_TELEMETRY_EXPORTER` | `otlp` | Exporter type (otlp, stdout) |
 | `--otlp-protocol` | `GOPOGO_OTLP_PROTOCOL` | `grpc` | OTLP protocol: `grpc` or `http` |
@@ -270,6 +273,8 @@ Every command runs in a server span named after the command (`GET`, `SET`, memca
 
 ### Logs
 
+`--log-level debug` adds a debug record per command (command, protocol, client, `duration_us`, and `error` when it failed), written with the command's span context so each record links to its trace, plus a `cache stats` record every 30 seconds. `--debug-log-sample` (0-1) bounds the volume under load.
+
 Everything Gopogo logs (startup and shutdown events, `--verbose` output such as telemetry export results) is written to stderr as before and exported as OpenTelemetry log records, with warnings at WARN severity. OpenTelemetry's own error reports go to stderr only, so a failing log export cannot feed itself.
 
 ### Metrics
@@ -340,6 +345,7 @@ The version is stamped from git: the nearest `v*` tag (`v1.2.3` builds report `1
 make container   # local image ghcr.io/grumpylabs/gopogo:dev for this machine
 make run-ports   # run it
 make dev         # push ghcr.io/grumpylabs/gopogo:<user>-<commit> (amd64 + arm64)
+make loadgen     # bin/gopogo-loadgen: drive a server with a mixed RESP workload
 make images      # build the CI images :<commit>-amd64 and :<commit>-arm64 locally, no push
 make push        # the whole CI publish from this machine (needs `make login`)
 

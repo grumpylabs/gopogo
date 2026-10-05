@@ -2,10 +2,14 @@ package protocol
 
 import (
 	"context"
+	"log/slog"
+	"math"
+	"math/rand/v2"
 	"net"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -29,6 +33,58 @@ var tracingEnabled atomic.Bool
 // provider; until this is called no spans are created.
 func EnableTracing() {
 	tracingEnabled.Store(true)
+}
+
+// debugLogSample is the fraction of commands logged at debug level, stored
+// as float64 bits.
+var debugLogSample atomic.Uint64
+
+func init() { SetDebugLogSample(1) }
+
+// SetDebugLogSample sets the fraction (0-1) of commands logged at debug
+// level when the log level is debug.
+func SetDebugLogSample(ratio float64) {
+	debugLogSample.Store(math.Float64bits(min(max(ratio, 0), 1)))
+}
+
+// commandObs follows one command: its span, when tracing is on, and a debug
+// log record when debug logging is on and the command is sampled.
+type commandObs struct {
+	ctx   context.Context
+	span  trace.Span
+	start time.Time
+	proto Type
+	addr  string
+	name  string
+}
+
+// beginCommand starts observing a command. name must already be normalized.
+func beginCommand(ctx context.Context, proto Type, addr, name string) commandObs {
+	ctx, span := startCommandSpan(ctx, proto, addr, name)
+	return commandObs{ctx: ctx, span: span, start: time.Now(), proto: proto, addr: addr, name: name}
+}
+
+// end records the command's outcome. errMsg is the error reply, or "".
+func (o commandObs) end(errMsg string) {
+	endCommandSpan(o.span, errMsg)
+	logger := slog.Default()
+	if !logger.Enabled(o.ctx, slog.LevelDebug) {
+		return
+	}
+	if r := math.Float64frombits(debugLogSample.Load()); r < 1 && rand.Float64() >= r {
+		return
+	}
+	attrs := []slog.Attr{
+		slog.String("command", o.name),
+		slog.String("protocol", o.proto.String()),
+		slog.String("client", o.addr),
+		slog.Int64("duration_us", time.Since(o.start).Microseconds()),
+	}
+	if errMsg != "" {
+		attrs = append(attrs, slog.String("error", errMsg))
+	}
+	// The span context in o.ctx links the record to the command's trace.
+	logger.LogAttrs(o.ctx, slog.LevelDebug, "command", attrs...)
 }
 
 // startCommandSpan starts the span for one command, or returns ctx and nil

@@ -1,4 +1,4 @@
-.PHONY: all build amd64 arm64 clean test integration integration-run helm-lint bench install run run-ports help container login dock-amd64 dock-arm64 dev-manifest dev images ci-pkg-amd64 ci-pkg-arm64 ci-pkg push
+.PHONY: all build loadgen amd64 arm64 clean test integration integration-run helm-lint bench install run run-ports help container login dock-amd64 dock-arm64 dev-manifest dev images ci-pkg-amd64 ci-pkg-arm64 ci-pkg push
 
 # Version stamped into the binary: the nearest v* git tag (v1.2.3 -> 1.2.3),
 # with -<n>-g<commit> after it and -dirty for uncommitted changes.
@@ -41,6 +41,9 @@ amd64: ## Build a static linux/amd64 binary (bin/gopogo-amd64)
 
 arm64: ## Build a static linux/arm64 binary (bin/gopogo-arm64)
 	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o bin/gopogo-arm64 cmd/main.go
+
+loadgen: ## Build the load generator (bin/gopogo-loadgen)
+	@go build -o bin/gopogo-loadgen ./cmd/loadgen
 
 build-race: ## Build with race detector enabled
 	@go build -race -ldflags "$(LDFLAGS)" -o bin/gopogo-race cmd/main.go
