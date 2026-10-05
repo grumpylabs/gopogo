@@ -108,6 +108,9 @@ password
 {{- end }}
 - --trace-sample-ratio={{ if hasKey $t "traceSampleRatio" }}{{ $t.traceSampleRatio }}{{ else }}1{{ end }}
 {{- end }}
+{{- if .Values.verbose }}
+- --verbose
+{{- end }}
 {{- range .Values.extraArgs }}
 - {{ . | quote }}
 {{- end }}

@@ -29,6 +29,7 @@ type Config struct {
 	ServiceVersion string
 	Environment    string
 	SampleRatio    float64 // fraction of new traces to sample, 0-1
+	Debug          bool    // log every export
 }
 
 // Metrics holds the metric instruments for gopogo
@@ -115,6 +116,9 @@ func NewMetrics(ctx context.Context, cfg *Config) (*Metrics, error) {
 		return nil, fmt.Errorf("unsupported exporter type: %s", cfg.ExporterType)
 	}
 
+	if cfg.Debug {
+		exporter = loggingMetricExporter{exporter}
+	}
 	reader := sdkmetric.NewPeriodicReader(exporter,
 		sdkmetric.WithInterval(30*time.Second),
 	)

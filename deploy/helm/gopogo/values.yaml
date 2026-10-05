@@ -98,6 +98,9 @@ telemetry:
   # (HTTP traceparent) is always respected.
   traceSampleRatio: 1.0
 
+# Verbose logging, including every telemetry export and its result.
+verbose: false
+
 # Extra command-line flags, e.g. ["--tcpnodelay=false"].
 extraArgs: []
 extraEnv: []

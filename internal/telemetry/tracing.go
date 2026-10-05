@@ -54,6 +54,9 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 	if ratio < 0 || ratio > 1 {
 		return nil, fmt.Errorf("trace sample ratio %v is not between 0 and 1", ratio)
 	}
+	if cfg.Debug {
+		exporter = loggingSpanExporter{exporter}
+	}
 	t.provider = sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"strconv"
@@ -79,7 +80,7 @@ func init() {
 
 	rootCmd.PersistentFlags().String("config", "", "Config file path")
 	rootCmd.PersistentFlags().Bool("quiet", false, "Quiet mode")
-	rootCmd.PersistentFlags().Bool("verbose", false, "Verbose output")
+	rootCmd.PersistentFlags().Bool("verbose", false, "Verbose output, including every telemetry export")
 	rootCmd.PersistentFlags().Bool("version", false, "Show version")
 
 	rootCmd.PersistentFlags().Bool("telemetry", false, "Enable OpenTelemetry metrics and traces")
@@ -175,6 +176,10 @@ func runServer(cmd *cobra.Command, args []string) {
 		ServiceVersion: version,
 		Environment:    viper.GetString("telemetry-environment"),
 		SampleRatio:    viper.GetFloat64("trace-sample-ratio"),
+		Debug:          viper.GetBool("verbose"),
+	}
+	if viper.GetBool("verbose") {
+		log.Print(telemetryCfg.Describe())
 	}
 	metrics, err := telemetry.NewMetrics(context.Background(), telemetryCfg)
 	if err != nil {
@@ -190,8 +195,12 @@ func runServer(cmd *cobra.Command, args []string) {
 	shutdownTelemetry := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		tracer.Shutdown(ctx)
-		metrics.Shutdown(ctx)
+		if err := tracer.Shutdown(ctx); err != nil {
+			log.Printf("telemetry: flushing traces: %v", err)
+		}
+		if err := metrics.Shutdown(ctx); err != nil {
+			log.Printf("telemetry: flushing metrics: %v", err)
+		}
 	}
 	if telemetryCfg.Enabled {
 		protocol.EnableTracing()
