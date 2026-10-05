@@ -75,7 +75,7 @@ func New(config *Config) *Server {
 		s.httpHandler = protocol.NewHTTPHandler(config.Cache, config.Auth)
 	}
 	if config.Memcache {
-		s.memcacheHandler = protocol.NewMemcacheHandler(config.Cache)
+		s.memcacheHandler = protocol.NewMemcacheHandler(config.Cache, config.Auth)
 	}
 	if config.Postgres {
 		s.postgresHandler = protocol.NewPostgresHandler(config.Cache, config.Auth, config.Persist)

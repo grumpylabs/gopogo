@@ -9,7 +9,7 @@ Protocols on that port:
   http      curl http://{{ include "gopogo.fullname" . }}:{{ .Values.port }}/<key>{{ if .Values.auth.enabled }}?auth=<password>{{ end }}
 {{- end }}
 {{- if .Values.protocols.memcache }}
-  memcache  {{ include "gopogo.fullname" . }}:{{ .Values.port }}
+  memcache  {{ include "gopogo.fullname" . }}:{{ .Values.port }}{{ if .Values.auth.enabled }}  (refuses every command: memcache cannot authenticate){{ end }}
 {{- end }}
 {{- if .Values.protocols.postgres }}
   postgres  psql -h {{ include "gopogo.fullname" . }} -p {{ .Values.port }}

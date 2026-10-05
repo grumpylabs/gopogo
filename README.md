@@ -67,7 +67,7 @@ gopogo --persist /var/lib/gopogo/data.pogo
 | `--host` | `GOPOGO_HOST` | `127.0.0.1` | Listening hostname |
 | `-p, --port` | `GOPOGO_PORT` | `6379` | Listening port |
 | `-s, --socket` | `GOPOGO_SOCKET` | | Unix socket path |
-| `--auth` | `GOPOGO_AUTH` | | Authentication password |
+| `--auth` | `GOPOGO_AUTH` | | Authentication password. The memcache protocol cannot authenticate, so with a password set every memcache command is refused |
 | `--persist` | `GOPOGO_PERSIST` | | Persistence file loaded at startup and saved at shutdown |
 | `--threads` | `GOPOGO_THREADS` | CPU count | Number of threads |
 | `--shards` | `GOPOGO_SHARDS` | `16` | Number of cache shards |

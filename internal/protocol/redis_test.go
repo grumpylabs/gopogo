@@ -264,7 +264,7 @@ func TestRedisAuth(t *testing.T) {
 func TestMemcacheIncrDecr(t *testing.T) {
 	ch := cache.New(nil)
 	server, client := net.Pipe()
-	go NewMemcacheHandler(ch).Handle(server)
+	go NewMemcacheHandler(ch, "").Handle(server)
 	defer client.Close()
 	r := bufio.NewReader(client)
 
@@ -299,7 +299,7 @@ func TestMemcacheCAS(t *testing.T) {
 	for _, useCAS := range []bool{true, false} {
 		ch := cache.New(&cache.Options{UseCAS: useCAS})
 		server, client := net.Pipe()
-		go NewMemcacheHandler(ch).Handle(server)
+		go NewMemcacheHandler(ch, "").Handle(server)
 		r := bufio.NewReader(client)
 
 		send := func(cmd string) {
@@ -359,7 +359,7 @@ func TestMemcacheAppendAtomic(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			server, client := net.Pipe()
-			go NewMemcacheHandler(ch).Handle(server)
+			go NewMemcacheHandler(ch, "").Handle(server)
 			defer client.Close()
 			r := bufio.NewReader(client)
 			for i := 0; i < perWorker; i++ {
@@ -382,7 +382,7 @@ func TestMemcacheAppendAtomic(t *testing.T) {
 	}
 
 	server, client := net.Pipe()
-	go NewMemcacheHandler(ch).Handle(server)
+	go NewMemcacheHandler(ch, "").Handle(server)
 	defer client.Close()
 	client.Write([]byte("prepend missing 0 0 1\r\nx\r\n"))
 	if l, _ := bufio.NewReader(client).ReadString('\n'); l != "NOT_STORED\r\n" {
@@ -410,7 +410,7 @@ func TestRedisMonitor(t *testing.T) {
 
 	// Commands from other protocols are shown too.
 	server, client := net.Pipe()
-	go NewMemcacheHandler(ch).Handle(server)
+	go NewMemcacheHandler(ch, "").Handle(server)
 	defer client.Close()
 	client.Write([]byte("get k\r\n"))
 	if line, _ = mon.r.ReadString('\n'); !strings.HasSuffix(line, `"get" "k"`+"\r\n") {
@@ -436,5 +436,52 @@ func TestRedisDebug(t *testing.T) {
 	c.expect(errReply("ERR unknown subcommand"), "DEBUG", "NOPE")
 	if v, ok := c.do("DEBUG", "DETACH").(string); !ok || !strings.Contains(v, ":") {
 		t.Fatalf("DEBUG DETACH got %#v", v)
+	}
+}
+
+func TestMemcacheAuthRequired(t *testing.T) {
+	ch := cache.New(nil)
+	ch.Store([]byte("secret"), []byte("value"), nil)
+	server, client := net.Pipe()
+	go NewMemcacheHandler(ch, "s3cret").Handle(server)
+	defer client.Close()
+	r := bufio.NewReader(client)
+
+	do := func(cmd string) string {
+		t.Helper()
+		client.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := client.Write([]byte(cmd + "\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		line, err := r.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		return line
+	}
+	const denied = "CLIENT_ERROR Authentication required\r\n"
+	for _, cmd := range []string{
+		"get secret",
+		"set k 0 0 5\r\nhello", // data block is consumed, not read as a command
+		"cas k 0 0 2 1\r\nhi",
+		"delete secret",
+		"incr n 1",
+		"flush_all",
+		"stats",
+		"version",
+	} {
+		if got := do(cmd); got != denied {
+			t.Fatalf("%q: got %q, want %q", cmd, got, denied)
+		}
+	}
+	if _, found := ch.Load([]byte("k")); found {
+		t.Fatal("unauthenticated set stored a value")
+	}
+	if _, found := ch.Load([]byte("secret")); !found {
+		t.Fatal("unauthenticated delete removed a value")
+	}
+	client.Write([]byte("quit\r\n"))
+	if _, err := r.ReadString('\n'); err == nil {
+		t.Fatal("quit should close the connection")
 	}
 }

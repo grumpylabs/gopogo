@@ -15,12 +15,23 @@ import (
 
 type MemcacheHandler struct {
 	cache *cache.Cache
+	auth  string
 }
 
-func NewMemcacheHandler(cache *cache.Cache) *MemcacheHandler {
+// NewMemcacheHandler creates a Memcache text protocol handler. The memcache
+// protocol has no way to authenticate, so when auth is set every command is
+// refused, as in pogocache; use another protocol for password-protected
+// access.
+func NewMemcacheHandler(cache *cache.Cache, auth string) *MemcacheHandler {
 	return &MemcacheHandler{
 		cache: cache,
+		auth:  auth,
 	}
+}
+
+// memcacheStorageCmds are the commands followed by a data block.
+var memcacheStorageCmds = map[string]bool{
+	"set": true, "add": true, "replace": true, "append": true, "prepend": true, "cas": true,
 }
 
 func (h *MemcacheHandler) Handle(conn net.Conn) {
@@ -51,6 +62,23 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 		}
 		
 		cmd := strings.ToLower(parts[0])
+		if h.auth != "" {
+			if cmd == "quit" {
+				return
+			}
+			// Consume a storage command's data block so the next command
+			// line is read correctly.
+			if memcacheStorageCmds[cmd] && len(parts) >= 5 {
+				if n, err := strconv.Atoi(parts[4]); err == nil && n >= 0 {
+					if _, err := io.CopyN(io.Discard, reader, int64(n)+2); err != nil {
+						return
+					}
+				}
+			}
+			writer.WriteString("CLIENT_ERROR Authentication required\r\n")
+			writer.Flush()
+			continue
+		}
 		monitors.publish(addr, parts)
 		
 		switch cmd {
