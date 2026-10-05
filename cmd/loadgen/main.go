@@ -2,13 +2,12 @@
 // writes, counters, expirations, misses and a few deliberate errors, at a
 // target rate, printing throughput and latency as it runs.
 //
-//	gopogo-loadgen -addr 127.0.0.1:6379 -auth s3cret -rate 500 -duration 2m
+//	gopogo-loadgen --addr 127.0.0.1:6379 --auth s3cret --rate 500 --duration 2m
 package main
 
 import (
 	"bufio"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -22,6 +21,9 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
 
 type op struct {
@@ -30,23 +32,70 @@ type op struct {
 	args   func(r *rand.Rand) []string
 }
 
-func main() {
-	addr := flag.String("addr", "127.0.0.1:6379", "server address")
-	auth := flag.String("auth", os.Getenv("GOPOGO_AUTH"), "password (default $GOPOGO_AUTH)")
-	workers := flag.Int("workers", 8, "concurrent connections")
-	rate := flag.Int("rate", 500, "total commands per second (0 = as fast as possible)")
-	duration := flag.Duration("duration", time.Minute, "how long to run (0 = until interrupted)")
-	keys := flag.Int("keys", 10000, "key space size")
-	minVal := flag.Int("min-value", 16, "minimum value size in bytes")
-	maxVal := flag.Int("max-value", 1024, "maximum value size in bytes")
-	prefix := flag.String("prefix", "load:", "key prefix")
-	flag.Parse()
+var rootCmd = &cobra.Command{
+	Use:   "gopogo-loadgen",
+	Short: "Drive a gopogo server with a mixed RESP workload",
+	Long: `gopogo-loadgen drives a gopogo server over RESP with a weighted mix of
+SET, SET EX, GET, MGET, INCR, APPEND, EXPIRE, DEL, TTL and a few deliberate
+errors, at a target rate, printing throughput and latency every 5 seconds.
 
-	key := func(r *rand.Rand) string { return *prefix + strconv.Itoa(r.IntN(*keys)) }
+Flags can also be set as GOPOGO_LOADGEN_<FLAG> environment variables
+(e.g. GOPOGO_LOADGEN_RATE); the password also falls back to GOPOGO_AUTH.`,
+	Args: func(cmd *cobra.Command, args []string) error {
+		if len(args) > 0 {
+			return fmt.Errorf("unexpected argument %q", args[0])
+		}
+		return nil
+	},
+	Run: func(cmd *cobra.Command, args []string) { run() },
+}
+
+func init() {
+	f := rootCmd.Flags()
+	f.String("addr", "127.0.0.1:6379", "server address")
+	f.String("auth", "", "password (default $GOPOGO_LOADGEN_AUTH, else $GOPOGO_AUTH)")
+	f.Int("workers", 8, "concurrent connections")
+	f.Int("rate", 500, "total commands per second (0 = as fast as possible)")
+	f.Duration("duration", time.Minute, "how long to run (0 = until interrupted)")
+	f.Int("keys", 10000, "key space size")
+	f.Int("min-value", 16, "minimum value size in bytes")
+	f.Int("max-value", 1024, "maximum value size in bytes")
+	f.String("prefix", "load:", "key prefix")
+	viper.BindPFlags(f)
+	viper.SetEnvPrefix("GOPOGO_LOADGEN")
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	viper.AutomaticEnv()
+}
+
+func main() {
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func run() {
+	addr := viper.GetString("addr")
+	auth := viper.GetString("auth")
+	if auth == "" {
+		auth = os.Getenv("GOPOGO_AUTH")
+	}
+	workers := viper.GetInt("workers")
+	rate := viper.GetInt("rate")
+	duration := viper.GetDuration("duration")
+	keys := viper.GetInt("keys")
+	minVal := viper.GetInt("min-value")
+	maxVal := viper.GetInt("max-value")
+	prefix := viper.GetString("prefix")
+	if workers < 1 || keys < 1 || rate < 0 || minVal < 0 || maxVal < minVal {
+		fmt.Fprintln(os.Stderr, "invalid settings: need workers>=1, keys>=1, rate>=0, 0<=min-value<=max-value")
+		os.Exit(1)
+	}
+
+	key := func(r *rand.Rand) string { return prefix + strconv.Itoa(r.IntN(keys)) }
 	value := func(r *rand.Rand) string {
-		n := *minVal
-		if *maxVal > *minVal {
-			n += r.IntN(*maxVal - *minVal)
+		n := minVal
+		if maxVal > minVal {
+			n += r.IntN(maxVal - minVal)
 		}
 		return strings.Repeat(string(rune('a'+r.IntN(26))), n)
 	}
@@ -60,14 +109,14 @@ func main() {
 			return []string{"MGET", key(r), key(r), key(r), key(r), key(r)}
 		}},
 		{"INCR", 8, func(r *rand.Rand) []string {
-			return []string{"INCR", *prefix + "counter:" + strconv.Itoa(r.IntN(100))}
+			return []string{"INCR", prefix + "counter:" + strconv.Itoa(r.IntN(100))}
 		}},
 		{"APPEND", 4, func(r *rand.Rand) []string { return []string{"APPEND", key(r), "+"} }},
 		{"EXPIRE", 4, func(r *rand.Rand) []string { return []string{"EXPIRE", key(r), strconv.Itoa(10 + r.IntN(60))} }},
 		{"DEL", 5, func(r *rand.Rand) []string { return []string{"DEL", key(r)} }},
 		{"TTL", 3, func(r *rand.Rand) []string { return []string{"TTL", key(r)} }},
 		// Deliberate errors: INCR on a non-numeric value and an unknown command.
-		{"INCR (bad)", 1, func(r *rand.Rand) []string { return []string{"INCR", *prefix + "not-a-number"} }},
+		{"INCR (bad)", 1, func(r *rand.Rand) []string { return []string{"INCR", prefix + "not-a-number"} }},
 		{"BOGUS", 1, func(r *rand.Rand) []string { return []string{"BOGUS", key(r)} }},
 	}
 	total := 0
@@ -93,8 +142,8 @@ func main() {
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
 	var timeout <-chan time.Time
-	if *duration > 0 {
-		timeout = time.After(*duration)
+	if duration > 0 {
+		timeout = time.After(duration)
 	}
 	go func() {
 		select {
@@ -105,20 +154,20 @@ func main() {
 	}()
 
 	// Seed the non-numeric key used for INCR errors.
-	if c, err := dial(*addr, *auth); err == nil {
-		c.do("SET", *prefix+"not-a-number", "abc")
+	if c, err := dial(addr, auth); err == nil {
+		c.do("SET", prefix+"not-a-number", "abc")
 		c.close()
 	}
 
 	var wg sync.WaitGroup
-	for w := 0; w < *workers; w++ {
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func(seed uint64) {
 			defer wg.Done()
 			r := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
 			var tick <-chan time.Time
-			if *rate > 0 {
-				per := time.Duration(float64(time.Second) * float64(*workers) / float64(*rate))
+			if rate > 0 {
+				per := time.Duration(float64(time.Second) * float64(workers) / float64(rate))
 				t := time.NewTicker(per)
 				defer t.Stop()
 				tick = t.C
@@ -145,7 +194,7 @@ func main() {
 				}
 				if c == nil {
 					var err error
-					if c, err = dial(*addr, *auth); err != nil {
+					if c, err = dial(addr, auth); err != nil {
 						connErrs.Add(1)
 						time.Sleep(time.Second)
 						continue
@@ -194,7 +243,7 @@ func main() {
 			label, elapsed, sent.Load(), failed.Load(), connErrs.Load(), len(l),
 			pct(0.5).Round(time.Microsecond), pct(0.99).Round(time.Microsecond), pct(1).Round(time.Microsecond))
 	}
-	fmt.Printf("loadgen: %s, %d workers, rate %d/s, %s, %d keys\n", *addr, *workers, *rate, *duration, *keys)
+	fmt.Printf("loadgen: %s, %d workers, rate %d/s, %s, %d keys\n", addr, workers, rate, duration, keys)
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
 	done := make(chan struct{})

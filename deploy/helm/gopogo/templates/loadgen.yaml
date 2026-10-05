@@ -1,4 +1,5 @@
-{{- if .Values.loadgen.enabled }}
+{{- $lg := .Values.loadgen | default dict }}
+{{- if $lg.enabled }}
 # Continuous load against this release's Service, for exercising the cache
 # and its telemetry. Its pods carry their own name label, so the cache's
 # Service never selects them.
@@ -34,15 +35,16 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/app/gopogo-loadgen"]
+          {{- /* Defaults for each value: upgrades with --reuse-values may lack them. */}}
           args:
-            - -addr={{ include "gopogo.fullname" . }}:{{ .Values.port }}
-            - -rate={{ .Values.loadgen.rate }}
-            - -workers={{ .Values.loadgen.workers }}
-            - -keys={{ .Values.loadgen.keys }}
-            - -duration={{ .Values.loadgen.duration }}
+            - --addr={{ include "gopogo.fullname" . }}:{{ .Values.port }}
+            - --rate={{ if hasKey $lg "rate" }}{{ $lg.rate }}{{ else }}100{{ end }}
+            - --workers={{ $lg.workers | default 4 }}
+            - --keys={{ $lg.keys | default 10000 }}
+            - --duration={{ $lg.duration | default "0" }}
           {{- if .Values.auth.enabled }}
           env:
-            - name: GOPOGO_AUTH
+            - name: GOPOGO_LOADGEN_AUTH
               valueFrom:
                 secretKeyRef:
                   name: {{ include "gopogo.authSecretName" . }}
@@ -51,7 +53,7 @@ spec:
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:
-            {{- toYaml .Values.loadgen.resources | nindent 12 }}
+            {{- toYaml ($lg.resources | default (dict "requests" (dict "cpu" "50m" "memory" "32Mi") "limits" (dict "memory" "64Mi"))) | nindent 12 }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
