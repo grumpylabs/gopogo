@@ -50,14 +50,27 @@ func reportExport(logger *zap.Logger, signal string, n int, start time.Time, err
 	logger.Info("telemetry exported", fields...)
 }
 
+// exporterFor returns a signal's exporter: its own setting, else
+// ExporterType.
+func (cfg *Config) exporterFor(signal string) string {
+	if signal != "" {
+		return signal
+	}
+	return cfg.ExporterType
+}
+
 // Describe summarizes where telemetry goes, naming headers but never showing
 // their values.
 func (cfg *Config) Describe() string {
 	if !cfg.Enabled {
 		return "telemetry: disabled"
 	}
-	if cfg.ExporterType != "otlp" {
-		return "telemetry: exporter " + cfg.ExporterType
+	signals := "metrics " + cfg.exporterFor(cfg.MetricsExporter) +
+		", traces " + cfg.exporterFor(cfg.TracesExporter) +
+		", logs " + cfg.ExporterType
+	if cfg.ExporterType != "otlp" && cfg.exporterFor(cfg.MetricsExporter) != "otlp" &&
+		cfg.exporterFor(cfg.TracesExporter) != "otlp" {
+		return "telemetry: " + signals
 	}
 	proto := "grpc"
 	if useHTTP, err := cfg.useHTTP(); err == nil && useHTTP {
@@ -76,5 +89,5 @@ func (cfg *Config) Describe() string {
 	if len(names) > 0 {
 		headers = strings.Join(names, ",")
 	}
-	return "telemetry: otlp/" + proto + " to " + endpoint + ", headers: " + headers
+	return "telemetry: " + signals + "; otlp/" + proto + " to " + endpoint + ", headers: " + headers
 }

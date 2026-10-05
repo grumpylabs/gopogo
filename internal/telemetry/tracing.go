@@ -33,7 +33,7 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 	}
 
 	var exporter sdktrace.SpanExporter
-	switch cfg.ExporterType {
+	switch kind := cfg.exporterFor(cfg.TracesExporter); kind {
 	case "otlp":
 		exporter, err = newOTLPTraceExporter(ctx, cfg)
 		if err != nil {
@@ -44,8 +44,11 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to create stdout trace exporter: %w", err)
 		}
+	case "none":
+		// Spans are still created, so log records keep their trace and
+		// span IDs, but none are exported.
 	default:
-		return nil, fmt.Errorf("unsupported exporter type: %s", cfg.ExporterType)
+		return nil, fmt.Errorf("unsupported traces exporter: %s", kind)
 	}
 
 	// Respect the caller's sampling decision; sample new traces at the
@@ -54,14 +57,17 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 	if ratio < 0 || ratio > 1 {
 		return nil, fmt.Errorf("trace sample ratio %v is not between 0 and 1", ratio)
 	}
-	if cfg.Debug {
-		exporter = loggingSpanExporter{exporter}
-	}
-	t.provider = sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
+	opts := []sdktrace.TracerProviderOption{
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))),
-	)
+	}
+	if exporter != nil {
+		if cfg.Debug {
+			exporter = loggingSpanExporter{exporter}
+		}
+		opts = append(opts, sdktrace.WithBatcher(exporter))
+	}
+	t.provider = sdktrace.NewTracerProvider(opts...)
 
 	otel.SetTracerProvider(t.provider)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(

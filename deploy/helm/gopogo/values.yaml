@@ -76,6 +76,11 @@ telemetry:
   enabled: false
   # otlp or stdout
   exporter: otlp
+  # Per-signal overrides: otlp, stdout or none; empty uses exporter. With
+  # stdout, metrics and spans are JSON lines on the container's stdout. Logs
+  # always use exporter.
+  metricsExporter: ""
+  tracesExporter: ""
   # OTLP protocol: grpc or http.
   protocol: grpc
   # host:port (e.g. otel-collector.observability:4317), or for OTLP/HTTP a

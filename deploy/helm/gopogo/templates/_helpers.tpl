@@ -96,6 +96,12 @@ password
      --reuse-values, so each has a fallback (hasKey keeps an explicit false or 0). */}}
 {{- $t := .Values.telemetry }}
 - --telemetry-exporter={{ $t.exporter | default "otlp" }}
+{{- with $t.metricsExporter }}
+- --metrics-exporter={{ . }}
+{{- end }}
+{{- with $t.tracesExporter }}
+- --traces-exporter={{ . }}
+{{- end }}
 {{- with $t.protocol }}
 - --otlp-protocol={{ . }}
 {{- end }}

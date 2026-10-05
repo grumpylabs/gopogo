@@ -88,6 +88,8 @@ func init() {
 
 	rootCmd.PersistentFlags().Bool("telemetry", false, "Enable OpenTelemetry metrics, traces and logs")
 	rootCmd.PersistentFlags().String("telemetry-exporter", "otlp", "Telemetry exporter (otlp, stdout)")
+	rootCmd.PersistentFlags().String("metrics-exporter", "", "Metrics exporter: otlp, stdout or none (default --telemetry-exporter)")
+	rootCmd.PersistentFlags().String("traces-exporter", "", "Traces exporter: otlp, stdout or none (default --telemetry-exporter)")
 	rootCmd.PersistentFlags().String("otlp-protocol", "", "OTLP protocol: grpc or http (default OTEL_EXPORTER_OTLP_PROTOCOL, else grpc)")
 	rootCmd.PersistentFlags().String("otlp-endpoint", "", "OTLP endpoint: host:port, or a base URL such as https://collector/prefix (default OTEL_EXPORTER_OTLP_ENDPOINT, else localhost)")
 	rootCmd.PersistentFlags().Bool("otlp-insecure", true, "Plaintext OTLP to a host:port endpoint; a URL endpoint's scheme decides")
@@ -171,6 +173,8 @@ func runServer(cmd *cobra.Command, args []string) {
 	telemetryCfg := &telemetry.Config{
 		Enabled:        viper.GetBool("telemetry"),
 		ExporterType:   viper.GetString("telemetry-exporter"),
+		MetricsExporter: viper.GetString("metrics-exporter"),
+		TracesExporter:  viper.GetString("traces-exporter"),
 		Protocol:       viper.GetString("otlp-protocol"),
 		OTLPEndpoint:   viper.GetString("otlp-endpoint"),
 		Headers:        otlpHeaders,

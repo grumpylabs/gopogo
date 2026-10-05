@@ -86,6 +86,8 @@ Boolean flags take `=true` or `=false` (e.g. `--cas=false`); pogocache-style `--
 | `--verbose` | `GOPOGO_VERBOSE` | `false` | Log telemetry exports and other detail |
 | `--telemetry` | `GOPOGO_TELEMETRY` | `false` | Enable OpenTelemetry metrics, traces and logs (see Telemetry) |
 | `--telemetry-exporter` | `GOPOGO_TELEMETRY_EXPORTER` | `otlp` | Exporter type (otlp, stdout) |
+| `--metrics-exporter` | `GOPOGO_METRICS_EXPORTER` | `--telemetry-exporter` | Metrics exporter (otlp, stdout, none) |
+| `--traces-exporter` | `GOPOGO_TRACES_EXPORTER` | `--telemetry-exporter` | Traces exporter (otlp, stdout, none) |
 | `--otlp-protocol` | `GOPOGO_OTLP_PROTOCOL` | `grpc` | OTLP protocol: `grpc` or `http` |
 | `--otlp-endpoint` | `GOPOGO_OTLP_ENDPOINT` | | OTLP endpoint: `host:port` or base URL (default `OTEL_EXPORTER_OTLP_ENDPOINT`, else localhost) |
 | `--otlp-insecure` | `GOPOGO_OTLP_INSECURE` | `true` | Plaintext to a `host:port` endpoint |
@@ -245,7 +247,7 @@ psql -h localhost -p 5432 -U user dbname
 
 ## Telemetry
 
-With `--telemetry`, Gopogo exports OpenTelemetry metrics, traces and logs over OTLP (`--telemetry-exporter otlp`, the default) or to stdout. Metrics are exported every 30 seconds, and pending metrics, spans and logs are flushed on shutdown.
+With `--telemetry`, Gopogo exports OpenTelemetry metrics, traces and logs over OTLP (`--telemetry-exporter otlp`, the default) or to stdout. Metrics are exported every 30 seconds, and pending metrics, spans and logs are flushed on shutdown. `--metrics-exporter` and `--traces-exporter` override the exporter for one signal, for example to keep logs on OTLP while metrics and spans go to stdout as JSON lines; `none` exports nothing for that signal (spans are still created, so log records keep their trace IDs).
 
 | Flag | Default | Description |
 |------|---------|-------------|

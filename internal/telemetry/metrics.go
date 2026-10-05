@@ -19,17 +19,19 @@ import (
 
 // Config holds telemetry configuration
 type Config struct {
-	Enabled        bool
-	ExporterType   string // "otlp", "stdout"
-	Protocol       string            // "grpc" or "http"; empty uses OTEL_EXPORTER_OTLP_PROTOCOL, else grpc
-	OTLPEndpoint   string            // host:port or base URL; empty uses OTEL_EXPORTER_OTLP_*
-	Insecure       bool              // plaintext OTLP to a host:port endpoint
-	Headers        map[string]string // extra OTLP request headers, e.g. Authorization
-	ServiceName    string
-	ServiceVersion string
-	Environment    string
-	SampleRatio    float64 // fraction of new traces to sample, 0-1
-	Debug          bool    // log every export
+	Enabled         bool
+	ExporterType    string            // "otlp", "stdout"
+	MetricsExporter string            // "otlp", "stdout" or "none"; empty uses ExporterType
+	TracesExporter  string            // "otlp", "stdout" or "none"; empty uses ExporterType
+	Protocol        string            // "grpc" or "http"; empty uses OTEL_EXPORTER_OTLP_PROTOCOL, else grpc
+	OTLPEndpoint    string            // host:port or base URL; empty uses OTEL_EXPORTER_OTLP_*
+	Insecure        bool              // plaintext OTLP to a host:port endpoint
+	Headers         map[string]string // extra OTLP request headers, e.g. Authorization
+	ServiceName     string
+	ServiceVersion  string
+	Environment     string
+	SampleRatio     float64 // fraction of new traces to sample, 0-1
+	Debug           bool    // log every export
 }
 
 // Metrics holds the metric instruments for gopogo
@@ -56,14 +58,14 @@ type Metrics struct {
 	CacheItemCount  metric.Int64ObservableGauge
 
 	// Eviction and expiration
-	CacheEvictionCount  metric.Int64Counter
+	CacheEvictionCount   metric.Int64Counter
 	CacheExpirationCount metric.Int64Counter
 
 	// Persistence
-	CacheSaveDuration metric.Float64Histogram
+	CacheSaveDuration     metric.Float64Histogram
 	CacheLoadFileDuration metric.Float64Histogram
-	CacheSaveErrors   metric.Int64Counter
-	CacheLoadFileErrors metric.Int64Counter
+	CacheSaveErrors       metric.Int64Counter
+	CacheLoadFileErrors   metric.Int64Counter
 
 	// Sweep
 	CacheSweepDuration metric.Float64Histogram
@@ -100,8 +102,9 @@ func NewMetrics(ctx context.Context, cfg *Config) (*Metrics, error) {
 		return nil, fmt.Errorf("failed to create resource: %w", err)
 	}
 
+	opts := []sdkmetric.Option{sdkmetric.WithResource(res)}
 	var exporter sdkmetric.Exporter
-	switch cfg.ExporterType {
+	switch kind := cfg.exporterFor(cfg.MetricsExporter); kind {
 	case "otlp":
 		exporter, err = newOTLPMetricExporter(ctx, cfg)
 		if err != nil {
@@ -112,21 +115,20 @@ func NewMetrics(ctx context.Context, cfg *Config) (*Metrics, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to create stdout exporter: %w", err)
 		}
+	case "none":
 	default:
-		return nil, fmt.Errorf("unsupported exporter type: %s", cfg.ExporterType)
+		return nil, fmt.Errorf("unsupported metrics exporter: %s", kind)
+	}
+	if exporter != nil {
+		if cfg.Debug {
+			exporter = loggingMetricExporter{exporter}
+		}
+		opts = append(opts, sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter,
+			sdkmetric.WithInterval(30*time.Second),
+		)))
 	}
 
-	if cfg.Debug {
-		exporter = loggingMetricExporter{exporter}
-	}
-	reader := sdkmetric.NewPeriodicReader(exporter,
-		sdkmetric.WithInterval(30*time.Second),
-	)
-
-	m.meterProvider = sdkmetric.NewMeterProvider(
-		sdkmetric.WithResource(res),
-		sdkmetric.WithReader(reader),
-	)
+	m.meterProvider = sdkmetric.NewMeterProvider(opts...)
 
 	otel.SetMeterProvider(m.meterProvider)
 	m.meter = m.meterProvider.Meter(cfg.ServiceName)
