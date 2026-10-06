@@ -1,0 +1,23 @@
+# .github/workflows/dstl8-codegraph.yml
+name: dstl8 code graph
+on:
+  push:
+    branches: [main]        # default branch only — other branches are skipped
+  schedule:
+    - cron: "17 6 * * 1"    # weekly refresh keeps low-traffic repos current
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  codegraph:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 50    # enough history to diff against the last push
+      - uses: control-theory/dstl8-codegraph-action@v1
+        with:
+          api-url: ${{ vars.DSTL8_API_URL }}
+          token: ${{ secrets.DSTL8_API_TOKEN }}
