@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bufio"
+	"context"
 	"net"
 	"net/http"
 	"strings"
@@ -16,6 +17,9 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func recordSpans(t *testing.T) *tracetest.SpanRecorder {
@@ -134,5 +138,30 @@ func TestHTTPSpanContinuesTrace(t *testing.T) {
 	}
 	if got := spans[0].Parent().SpanID().String(); got != "00f067aa0ba902b7" {
 		t.Fatalf("parent span %s, want the caller's", got)
+	}
+}
+
+func TestDebugLogSampleKeepsFailures(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	t.Cleanup(zap.ReplaceGlobals(zap.New(core)))
+	SetDebugLogSample(0)
+	t.Cleanup(func() { SetDebugLogSample(1) })
+
+	ctx := context.Background()
+	for i := 0; i < 50; i++ {
+		beginCommand(ctx, TypeRedis, "10.0.0.1:5000", "GET").end("")
+	}
+	beginCommand(ctx, TypeRedis, "10.0.0.1:5000", "INCR").end("ERR value is not an integer or out of range")
+
+	if logs.Len() != 1 {
+		t.Fatalf("got %d records, want only the failure", logs.Len())
+	}
+	e := logs.All()[0]
+	if !strings.HasPrefix(e.Message, "redis INCR failed in ") ||
+		!strings.HasSuffix(e.Message, "from 10.0.0.1: ERR value is not an integer or out of range") {
+		t.Errorf("message %q", e.Message)
+	}
+	if got := e.ContextMap()["error.type"]; got != "ERR" {
+		t.Errorf("error.type = %v", got)
 	}
 }

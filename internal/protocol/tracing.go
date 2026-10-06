@@ -73,7 +73,9 @@ func (o commandObs) end(errMsg string) {
 	if ce == nil {
 		return
 	}
-	if r := math.Float64frombits(debugLogSample.Load()); r < 1 && rand.Float64() >= r {
+	// Sampling bounds the volume of successful commands; failures are
+	// always logged.
+	if r := math.Float64frombits(debugLogSample.Load()); errMsg == "" && r < 1 && rand.Float64() >= r {
 		return
 	}
 	took := time.Since(o.start).Microseconds()

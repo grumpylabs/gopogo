@@ -83,7 +83,7 @@ func init() {
 	rootCmd.PersistentFlags().Bool("quiet", false, "Quiet mode")
 	rootCmd.PersistentFlags().Bool("verbose", false, "Verbose output, including every telemetry export")
 	rootCmd.PersistentFlags().String("log-level", "info", "Log level: debug, info, warn or error. debug logs every command (see --debug-log-sample) and cache stats every 30s")
-	rootCmd.PersistentFlags().Float64("debug-log-sample", 1.0, "Fraction of commands logged at debug level (0-1)")
+	rootCmd.PersistentFlags().Float64("debug-log-sample", 1.0, "Fraction of successful commands logged at debug level (0-1); failed commands are always logged")
 	rootCmd.PersistentFlags().Bool("version", false, "Show version")
 
 	rootCmd.PersistentFlags().Bool("telemetry", false, "Enable OpenTelemetry metrics, traces and logs")
