@@ -70,6 +70,9 @@ spec:
                   key: {{ dig "headersSecret" "key" "headers" $.Values.telemetry | default "headers" }}
             {{- end }}
             {{- end }}
+            {{- if .Values.telemetry.enabled }}
+            {{- include "gopogo.resourceEnv" . | nindent 12 }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

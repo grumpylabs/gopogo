@@ -92,7 +92,7 @@ Boolean flags take `=true` or `=false` (e.g. `--cas=false`); pogocache-style `--
 | `--otlp-endpoint` | `GOPOGO_OTLP_ENDPOINT` | | OTLP endpoint: `host:port` or base URL (default `OTEL_EXPORTER_OTLP_ENDPOINT`, else localhost) |
 | `--otlp-insecure` | `GOPOGO_OTLP_INSECURE` | `true` | Plaintext to a `host:port` endpoint |
 | `--otlp-headers` | `GOPOGO_OTLP_HEADERS` | | OTLP request headers, `key=value,...` |
-| `--telemetry-environment` | `GOPOGO_TELEMETRY_ENVIRONMENT` | | `deployment.environment` resource attribute |
+| `--telemetry-environment` | `GOPOGO_TELEMETRY_ENVIRONMENT` | | `deployment.environment.name` resource attribute |
 | `--trace-sample-ratio` | `GOPOGO_TRACE_SAMPLE_RATIO` | `1.0` | Fraction of new traces sampled |
 | `--tlsport` | `GOPOGO_TLSPORT` | `0` | TLS listening port |
 | `--tlscert` | `GOPOGO_TLSCERT` | | TLS certificate file |
@@ -255,10 +255,10 @@ With `--telemetry`, Gopogo exports OpenTelemetry metrics, traces and logs over O
 | `--otlp-endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT`, else localhost | `host:port`, or a base URL; OTLP/HTTP posts to `<base>/v1/metrics` and `<base>/v1/traces` |
 | `--otlp-insecure` | `true` | Plaintext to a `host:port` endpoint; a URL endpoint's scheme decides |
 | `--otlp-headers` | `OTEL_EXPORTER_OTLP_HEADERS` | Request headers, `key=value,...` |
-| `--telemetry-environment` | | `deployment.environment` resource attribute |
+| `--telemetry-environment` | | `deployment.environment.name` resource attribute |
 | `--trace-sample-ratio` | `1.0` | Fraction of new traces sampled; a caller's sampling decision is respected |
 
-`OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` override the resource attributes.
+Telemetry follows the OpenTelemetry semantic conventions (v1.40.0). The resource carries `service.name`, `service.version`, `service.instance.id` (the host name, which is the pod name in Kubernetes), `deployment.environment.name` (and the older `deployment.environment`, which some backends still read), `host.name`, `os.*`, `process.*`, `telemetry.sdk.*` and, in a container, `container.id`. `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` add to or override these; the Helm chart uses `OTEL_RESOURCE_ATTRIBUTES` to add the pod's `k8s.*` attributes, `telemetry.clusterName`, `telemetry.serviceNamespace` and any `telemetry.resourceAttributes`.
 
 For an OTLP/HTTP endpoint that takes a bearer token, pass the token in the environment rather than on the command line:
 
@@ -271,11 +271,11 @@ In the Helm chart, put the header in a Secret and set `telemetry.headersSecret.n
 
 ### Traces
 
-Every command runs in a server span named after the command (`GET`, `SET`, memcache `get`; unrecognized commands are `UNKNOWN`), with `db.system.name`, `db.operation.name`, `network.protocol.name` (redis, http, memcache, postgres), `client.address` and `client.port`. Failed commands set the span status to error and `error.type` to the error reply's first word (`ERR`, `WRONGPASS`, `CLIENT_ERROR`, ...). Keys and values are never recorded. HTTP requests continue the caller's trace from a W3C `traceparent` header; the other protocols cannot carry trace context, so their spans start new traces. Loading and saving the persistence file run in `persist.load` and `persist.save` spans.
+Every command runs in a server span named after the command (`GET`, `SET`, memcache `get`; unrecognized commands are `UNKNOWN`), with `db.system.name` (`gopogo`), `db.operation.name`, `network.protocol.name` (redis, http, memcache, postgres), `network.transport` (tcp or unix), `client.address` and `client.port`. Failed commands set the span status to error and `error.type` to the error reply's first word (`ERR`, `WRONGPASS`, `CLIENT_ERROR`, ...). Keys and values are never recorded. HTTP requests continue the caller's trace from a W3C `traceparent` header; the other protocols cannot carry trace context, so their spans start new traces. Loading and saving the persistence file run in `persist.load` and `persist.save` spans.
 
 ### Logs
 
-`--log-level debug` adds a debug record per command (command, protocol, client, `duration_us`, and `error` when it failed), written with the command's span context so each record links to its trace, plus a `cache stats` record every 30 seconds. `--debug-log-sample` (0-1) bounds the volume under load.
+`--log-level debug` adds a debug record per command, such as `redis SET ok in 91us from 10.42.6.21` or `redis INCR failed in 64us from 10.42.6.21: ERR value is not an integer or out of range`. Its fields use the span's attribute names (`db.system.name`, `db.operation.name`, `network.protocol.name`, `client.address`, `client.port`, and `error.type` and `exception.message` when it failed) plus `duration_us`, and it is written with the command's span context so each record links to its trace. Every 30 seconds a stats record summarizes the cache (`cache holds 1234 items in 5.2 MiB; 9000 gets (87.5% hits), ...`) with the counters as fields. Exported log records also carry each field as an attribute, and `code.file.path`, `code.line.number` and `code.function.name`. `--debug-log-sample` (0-1) bounds the volume under load.
 
 Gopogo logs with zap as one JSON object per line on stderr (`level`, `time`, `caller`, `msg`, then the fields), including startup and shutdown events and `--verbose` output such as telemetry export results. Records logged in a traced command also carry `trace_id` and `span_id`. With `--telemetry`, each entry is also exported as an OpenTelemetry log record whose body is that same JSON line, with the matching severity and, for command records, the command's trace and span. OpenTelemetry's own error reports and the `--verbose` log-export results go to stderr only, so a failing log export cannot feed itself.
 
@@ -283,10 +283,10 @@ Gopogo logs with zap as one JSON object per line on stderr (`level`, `time`, `ca
 
 | Metric | Type | Attributes / description |
 |--------|------|-------------|
-| `gopogo.commands` | Counter | `protocol`, `command` (get, set, flush, touch); STATS `cmd_*` |
-| `gopogo.keyspace.lookups` | Counter | `protocol`, `operation` (get, delete, incr, decr, touch), `result` (hit, miss) |
-| `gopogo.store.rejected` | Counter | `protocol`, `reason` (no_memory, too_large) |
-| `gopogo.auth.attempts` | Counter | `protocol`, `result` (success, failure) |
+| `gopogo.commands` | Counter | `network.protocol.name`, `db.operation.name` (get, set, flush, touch); STATS `cmd_*` |
+| `gopogo.keyspace.lookups` | Counter | `network.protocol.name`, `operation` (get, delete, incr, decr, touch), `result` (hit, miss) |
+| `gopogo.store.rejected` | Counter | `network.protocol.name`, `reason` (no_memory, too_large) |
+| `gopogo.auth.attempts` | Counter | `network.protocol.name`, `result` (success, failure) |
 | `gopogo.connections.active` / `.limit` | Gauge | Open connections and `--maxconns` |
 | `gopogo.connections.accepted` / `.rejected` | Counter | Connections accepted and refused at the limit |
 | `cache.items.stored` | Counter | Successful writes (STATS `total_items`) |

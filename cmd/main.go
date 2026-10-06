@@ -217,10 +217,10 @@ func runServer(cmd *cobra.Command, args []string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := tracer.Shutdown(ctx); err != nil {
-			zap.L().Warn("telemetry: flushing traces", zap.Error(err))
+			zap.L().Warn("telemetry: flushing traces failed: "+err.Error(), zap.Error(err))
 		}
 		if err := metrics.Shutdown(ctx); err != nil {
-			zap.L().Warn("telemetry: flushing metrics", zap.Error(err))
+			zap.L().Warn("telemetry: flushing metrics failed: "+err.Error(), zap.Error(err))
 		}
 		if err := logger.Shutdown(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "telemetry: flushing logs: %v\n", err)
@@ -282,11 +282,12 @@ func runServer(cmd *cobra.Command, args []string) {
 			}
 		}()
 	}
-	zap.L().Info("gopogo starting",
+	zap.L().Info(fmt.Sprintf("gopogo %s (%s) starting on port %d for %s",
+		version, commit, viper.GetInt("port"), strings.Join(enabledProtocols(), ", ")),
 		zap.String("version", version), zap.String("commit", commit),
 		zap.Int("port", viper.GetInt("port")), zap.Strings("protocols", enabledProtocols()))
 	if err := srv.Start(); err != nil {
-		zap.L().Error("gopogo failed to start", zap.Error(err))
+		zap.L().Error("gopogo failed to start: "+err.Error(), zap.Error(err))
 		fmt.Fprintf(os.Stderr, "Error starting server: %v\n", err)
 		shutdownTelemetry()
 		os.Exit(1)

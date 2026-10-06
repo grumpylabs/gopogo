@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -42,12 +43,14 @@ func (e loggingSpanExporter) ExportSpans(ctx context.Context, spans []sdktrace.R
 }
 
 func reportExport(logger *zap.Logger, signal string, n int, start time.Time, err error) {
-	fields := []zap.Field{zap.String("signal", signal), zap.Int("count", n), zap.Duration("took", time.Since(start).Round(time.Millisecond))}
+	took := time.Since(start).Round(time.Millisecond)
+	fields := []zap.Field{zap.String("signal", signal), zap.Int("count", n), zap.Duration("took", took)}
 	if err != nil {
-		logger.Warn("telemetry export failed", append(fields, zap.Error(err))...)
+		logger.Warn(fmt.Sprintf("telemetry export of %d %s failed after %s: %v", n, signal, took, err),
+			append(fields, zap.Error(err))...)
 		return
 	}
-	logger.Info("telemetry exported", fields...)
+	logger.Info(fmt.Sprintf("telemetry exported %d %s in %s", n, signal, took), fields...)
 }
 
 // exporterFor returns a signal's exporter: its own setting, else

@@ -97,8 +97,17 @@ telemetry:
   headersSecret:
     name: ""
     key: headers
-  # deployment.environment resource attribute, e.g. stage or prod.
+  # deployment.environment.name resource attribute, e.g. stage or prod.
   environment: ""
+  # The pod's k8s.pod.name, k8s.pod.uid, k8s.namespace.name, k8s.node.name,
+  # k8s.container.name, k8s.statefulset.name (or k8s.deployment.name) and
+  # service.instance.id are always set. Optional:
+  # k8s.cluster.name, e.g. mini.
+  clusterName: ""
+  # service.namespace, grouping gopogo with related services.
+  serviceNamespace: ""
+  # Any other resource attributes, e.g. {"team": "cache", "cloud.region": "us-east-1"}.
+  resourceAttributes: {}
   # Fraction of new traces to sample (0-1). A caller's sampling decision
   # (HTTP traceparent) is always respected.
   traceSampleRatio: 1.0

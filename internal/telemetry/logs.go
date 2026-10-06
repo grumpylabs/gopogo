@@ -15,6 +15,7 @@ import (
 	otellog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/global"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -118,11 +119,13 @@ func (l *Logger) Shutdown(ctx context.Context) error {
 }
 
 // otelCore emits each entry as an OpenTelemetry log record with the
-// entry's JSON encoding as its body. A Context field supplies the record's
-// trace and span.
+// entry's JSON encoding as its body, its fields as attributes, and its
+// caller as code.* attributes. A Context field supplies the record's trace
+// and span.
 type otelCore struct {
 	zapcore.LevelEnabler
 	enc    zapcore.Encoder
+	with   []zapcore.Field
 	logger otellog.Logger
 }
 
@@ -131,7 +134,12 @@ func (c otelCore) With(fields []zapcore.Field) zapcore.Core {
 	for _, f := range fields {
 		f.AddTo(enc)
 	}
-	return otelCore{LevelEnabler: c.LevelEnabler, enc: enc, logger: c.logger}
+	return otelCore{
+		LevelEnabler: c.LevelEnabler,
+		enc:          enc,
+		with:         append(c.with[:len(c.with):len(c.with)], fields...),
+		logger:       c.logger,
+	}
 }
 
 func (c otelCore) Check(e zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
@@ -150,19 +158,72 @@ func (c otelCore) Write(e zapcore.Entry, fields []zapcore.Field) error {
 	buf.Free()
 
 	ctx := context.Background()
-	for _, f := range fields {
+	attrs := zapcore.NewMapObjectEncoder()
+	for _, f := range append(c.with[:len(c.with):len(c.with)], fields...) {
 		if fc, ok := f.Interface.(context.Context); ok {
 			ctx = fc
-			break
+			continue
 		}
+		f.AddTo(attrs)
 	}
 	var r otellog.Record
 	r.SetTimestamp(e.Time)
 	r.SetSeverity(severity(e.Level))
 	r.SetSeverityText(e.Level.CapitalString())
 	r.SetBody(otellog.StringValue(body))
+	for k, v := range attrs.Fields {
+		r.AddAttributes(otellog.KeyValue{Key: k, Value: logValue(v)})
+	}
+	if e.Caller.Defined {
+		r.AddAttributes(
+			otellog.String(string(semconv.CodeFilePathKey), e.Caller.File),
+			otellog.Int(string(semconv.CodeLineNumberKey), e.Caller.Line),
+			otellog.String(string(semconv.CodeFunctionNameKey), e.Caller.Function))
+	}
 	c.logger.Emit(ctx, r)
 	return nil
+}
+
+// logValue converts a value from zap's map encoder.
+func logValue(v any) otellog.Value {
+	switch v := v.(type) {
+	case string:
+		return otellog.StringValue(v)
+	case bool:
+		return otellog.BoolValue(v)
+	case int:
+		return otellog.IntValue(v)
+	case int64:
+		return otellog.Int64Value(v)
+	case int32:
+		return otellog.Int64Value(int64(v))
+	case uint64:
+		return otellog.Int64Value(int64(v))
+	case uint32:
+		return otellog.Int64Value(int64(v))
+	case float64:
+		return otellog.Float64Value(v)
+	case float32:
+		return otellog.Float64Value(float64(v))
+	case time.Duration:
+		return otellog.StringValue(v.String())
+	case time.Time:
+		return otellog.StringValue(v.Format(time.RFC3339Nano))
+	case []any:
+		vals := make([]otellog.Value, len(v))
+		for i, x := range v {
+			vals[i] = logValue(x)
+		}
+		return otellog.SliceValue(vals...)
+	case map[string]any:
+		kvs := make([]otellog.KeyValue, 0, len(v))
+		for k, x := range v {
+			kvs = append(kvs, otellog.KeyValue{Key: k, Value: logValue(x)})
+		}
+		return otellog.MapValue(kvs...)
+	default:
+		return otellog.StringValue(fmt.Sprint(v))
+	}
 }
 
 func (otelCore) Sync() error { return nil }

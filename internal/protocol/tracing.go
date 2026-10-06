@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"net"
@@ -13,7 +14,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -75,18 +76,58 @@ func (o commandObs) end(errMsg string) {
 	if r := math.Float64frombits(debugLogSample.Load()); r < 1 && rand.Float64() >= r {
 		return
 	}
+	took := time.Since(o.start).Microseconds()
+	host, port := splitClient(o.addr)
+	// Field names follow the OpenTelemetry semantic conventions, matching
+	// the command's span.
 	fields := []zap.Field{
-		zap.String("command", o.name),
-		zap.String("protocol", o.proto.String()),
-		zap.String("client", o.addr),
-		zap.Int64("duration_us", time.Since(o.start).Microseconds()),
+		zap.String(string(semconv.DBSystemNameKey), dbSystem),
+		zap.String(string(semconv.DBOperationNameKey), o.name),
+		zap.String(string(semconv.NetworkProtocolNameKey), o.proto.String()),
+		zap.Int64("duration_us", took),
 		// Links the record to the command's trace.
 		logContext(o.ctx),
 	}
+	if host != "" {
+		fields = append(fields, zap.String(string(semconv.ClientAddressKey), host))
+	}
+	if port != 0 {
+		fields = append(fields, zap.Int(string(semconv.ClientPortKey), port))
+	}
+	from := ""
+	if host != "" {
+		from = " from " + host
+	}
 	if errMsg != "" {
-		fields = append(fields, zap.String("error", errMsg))
+		ce.Message = fmt.Sprintf("%s %s failed in %dus%s: %s", o.proto, o.name, took, from, errMsg)
+		fields = append(fields,
+			zap.String(string(semconv.ErrorTypeKey), errorType(errMsg)),
+			zap.String(string(semconv.ExceptionMessageKey), errMsg))
+	} else {
+		ce.Message = fmt.Sprintf("%s %s ok in %dus%s", o.proto, o.name, took, from)
 	}
 	ce.Write(fields...)
+}
+
+// dbSystem is the db.system.name of gopogo's spans and logs.
+const dbSystem = "gopogo"
+
+// splitClient splits a client's host:port; a Unix socket client has neither.
+func splitClient(addr string) (host string, port int) {
+	h, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", 0
+	}
+	port, _ = strconv.Atoi(p)
+	return h, port
+}
+
+// errorType is an error reply's code, e.g. ERR or WRONGTYPE.
+func errorType(errMsg string) string {
+	if i := strings.IndexByte(errMsg, ' '); i > 0 {
+		return errMsg[:i]
+	}
+	return errMsg
 }
 
 // logContext carries ctx to the log cores without encoding it; they take
@@ -102,15 +143,17 @@ func startCommandSpan(ctx context.Context, proto Type, addr, name string) (conte
 		return ctx, nil
 	}
 	attrs := []attribute.KeyValue{
-		attribute.String("db.system.name", "gopogo"),
-		attribute.String("db.operation.name", name),
+		semconv.DBSystemNameKey.String(dbSystem),
+		semconv.DBOperationName(name),
 		semconv.NetworkProtocolName(proto.String()),
 	}
-	if host, port, err := net.SplitHostPort(addr); err == nil {
-		attrs = append(attrs, semconv.ClientAddress(host))
-		if p, err := strconv.Atoi(port); err == nil {
-			attrs = append(attrs, semconv.ClientPort(p))
+	if host, port := splitClient(addr); host != "" {
+		attrs = append(attrs, semconv.ClientAddress(host), semconv.NetworkTransportTCP)
+		if port != 0 {
+			attrs = append(attrs, semconv.ClientPort(port))
 		}
+	} else {
+		attrs = append(attrs, semconv.NetworkTransportUnix)
 	}
 	return otel.Tracer(instrumentationName).Start(ctx, name,
 		trace.WithSpanKind(trace.SpanKindServer),
@@ -125,11 +168,7 @@ func endCommandSpan(span trace.Span, errMsg string) {
 		return
 	}
 	if errMsg != "" {
-		errType := errMsg
-		if i := strings.IndexByte(errMsg, ' '); i > 0 {
-			errType = errMsg[:i]
-		}
-		span.SetAttributes(attribute.String("error.type", errType))
+		span.SetAttributes(semconv.ErrorTypeKey.String(errorType(errMsg)))
 		span.SetStatus(codes.Error, errMsg)
 	}
 	span.End()

@@ -123,3 +123,54 @@ password
 - {{ . | quote }}
 {{- end }}
 {{- end }}
+
+{{/*
+OpenTelemetry resource attributes for the pod, from the downward API, plus
+telemetry.clusterName, telemetry.serviceNamespace and
+telemetry.resourceAttributes. Kubernetes expands $(VAR) from the variables
+defined before it. An attribute also set by the image's
+OTEL_RESOURCE_ATTRIBUTES (e.g. via extraEnv) takes the later value.
+*/}}
+{{- define "gopogo.resourceEnv" -}}
+{{- $t := .Values.telemetry -}}
+{{- $attrs := list
+  "k8s.pod.name=$(K8S_POD_NAME)"
+  "k8s.pod.uid=$(K8S_POD_UID)"
+  "k8s.namespace.name=$(K8S_NAMESPACE_NAME)"
+  "k8s.node.name=$(K8S_NODE_NAME)"
+  "k8s.container.name=gopogo"
+  "service.instance.id=$(K8S_POD_NAME)"
+-}}
+{{- if .Values.persistence.enabled }}
+{{- $attrs = append $attrs (printf "k8s.statefulset.name=%s" (include "gopogo.fullname" .)) -}}
+{{- else }}
+{{- $attrs = append $attrs (printf "k8s.deployment.name=%s" (include "gopogo.fullname" .)) -}}
+{{- end }}
+{{- with $t.clusterName }}
+{{- $attrs = append $attrs (printf "k8s.cluster.name=%s" .) -}}
+{{- end }}
+{{- with $t.serviceNamespace }}
+{{- $attrs = append $attrs (printf "service.namespace=%s" .) -}}
+{{- end }}
+{{- range $k, $v := $t.resourceAttributes }}
+{{- $attrs = append $attrs (printf "%s=%s" $k (toString $v)) -}}
+{{- end }}
+- name: K8S_POD_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.name
+- name: K8S_POD_UID
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.uid
+- name: K8S_NAMESPACE_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.namespace
+- name: K8S_NODE_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: spec.nodeName
+- name: OTEL_RESOURCE_ATTRIBUTES
+  value: {{ join "," $attrs | quote }}
+{{- end }}

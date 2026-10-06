@@ -80,12 +80,12 @@ func TestServerMetrics(t *testing.T) {
 	}
 	// Counters are process-wide, so check lower bounds.
 	for k, min := range map[string]float64{
-		key("gopogo.commands", "command=get", "protocol=redis"):                            2,
-		key("gopogo.commands", "command=set", "protocol=redis"):                            1,
-		key("gopogo.commands", "command=get", "protocol=memcache"):                         1,
-		key("gopogo.keyspace.lookups", "operation=get", "protocol=redis", "result=hit"):    1,
-		key("gopogo.keyspace.lookups", "operation=get", "protocol=redis", "result=miss"):   1,
-		key("gopogo.keyspace.lookups", "operation=get", "protocol=memcache", "result=hit"): 1,
+		key("gopogo.commands", "db.operation.name=get", "network.protocol.name=redis"):                  2,
+		key("gopogo.commands", "db.operation.name=set", "network.protocol.name=redis"):                  1,
+		key("gopogo.commands", "db.operation.name=get", "network.protocol.name=memcache"):               1,
+		key("gopogo.keyspace.lookups", "network.protocol.name=redis", "operation=get", "result=hit"):    1,
+		key("gopogo.keyspace.lookups", "network.protocol.name=redis", "operation=get", "result=miss"):   1,
+		key("gopogo.keyspace.lookups", "network.protocol.name=memcache", "operation=get", "result=hit"): 1,
 		key("cache.items.stored"):   1,
 		key("process.memory.usage"): 1,
 	} {

@@ -9,6 +9,7 @@ import (
 	"github.com/grumpylabs/gopogo/internal/sysmem"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 )
 
 // RegisterServerMetrics exports the server counters shown by STATS, the
@@ -64,13 +65,13 @@ func (m *Metrics) RegisterServerMetrics(c *cache.Cache) error {
 			if p.Protocol == "unknown" {
 				continue
 			}
-			proto := attribute.String("protocol", p.Protocol)
+			proto := semconv.NetworkProtocolName(p.Protocol)
 			obs := func(inst metric.Int64Observable, v uint64, attrs ...attribute.KeyValue) {
 				if v > 0 {
 					o.ObserveInt64(inst, int64(v), metric.WithAttributes(append(attrs, proto)...))
 				}
 			}
-			cmd := func(name string) attribute.KeyValue { return attribute.String("command", name) }
+			cmd := func(name string) attribute.KeyValue { return semconv.DBOperationName(name) }
 			obs(commands, p.CmdGet, cmd("get"))
 			obs(commands, p.CmdSet, cmd("set"))
 			obs(commands, p.CmdFlush, cmd("flush"))
@@ -100,8 +101,8 @@ func (m *Metrics) RegisterServerMetrics(c *cache.Cache) error {
 		o.ObserveInt64(connRejected, cs.Rejected.Load())
 		o.ObserveInt64(stored, int64(c.TotalItems()))
 		if user, system, ok := protocol.CPUSeconds(); ok {
-			o.ObserveFloat64(cpu, user, metric.WithAttributes(attribute.String("cpu.mode", "user")))
-			o.ObserveFloat64(cpu, system, metric.WithAttributes(attribute.String("cpu.mode", "system")))
+			o.ObserveFloat64(cpu, user, metric.WithAttributes(semconv.CPUModeUser))
+			o.ObserveFloat64(cpu, system, metric.WithAttributes(semconv.CPUModeSystem))
 		}
 		o.ObserveInt64(rss, sysmem.RSS())
 		return nil

@@ -219,7 +219,7 @@ func (s *Server) serve(listener net.Listener) {
 				return
 			default:
 				if s.config.Verbose {
-					zap.L().Warn("accept error", zap.Error(err))
+					zap.L().Warn("accept failed: "+err.Error(), zap.Error(err))
 				}
 				continue
 			}
@@ -265,7 +265,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 	protoType, err := detector.Detect()
 	if err != nil {
 		if s.config.Verbose {
-			zap.L().Warn("protocol detection error", zap.String("client", conn.RemoteAddr().String()), zap.Error(err))
+			zap.L().Warn(fmt.Sprintf("protocol detection failed for %s: %v", conn.RemoteAddr(), err),
+				zap.String("client.address", conn.RemoteAddr().String()), zap.Error(err))
 		}
 		return
 	}
@@ -310,7 +311,8 @@ func (s *Server) startSweeper() {
 				expired := s.cache.Sweep()
 				evicted := s.cache.SweepEvicted()
 				if (expired > 0 || evicted > 0) && s.config.Verbose {
-					zap.L().Info("sweep", zap.Int("expired", expired), zap.Int("evicted", evicted))
+					zap.L().Info(fmt.Sprintf("sweep removed %d expired and %d evicted entries", expired, evicted),
+						zap.Int("expired", expired), zap.Int("evicted", evicted))
 				}
 			}
 		}

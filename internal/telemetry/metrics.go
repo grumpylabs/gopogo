@@ -3,7 +3,11 @@ package telemetry
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
@@ -14,7 +18,7 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 )
 
 // Config holds telemetry configuration
@@ -77,15 +81,45 @@ func createResource(cfg *Config) (*resource.Resource, error) {
 	attrs := []attribute.KeyValue{
 		semconv.ServiceName(cfg.ServiceName),
 		semconv.ServiceVersion(cfg.ServiceVersion),
+		semconv.ServiceInstanceID(instanceID()),
 	}
 	if cfg.Environment != "" {
-		attrs = append(attrs, semconv.DeploymentEnvironment(cfg.Environment))
+		attrs = append(attrs,
+			semconv.DeploymentEnvironmentName(cfg.Environment),
+			// The key before deployment.environment.name; some backends
+			// still read it.
+			attribute.String("deployment.environment", cfg.Environment))
 	}
 	// OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME override the defaults.
-	return resource.New(context.Background(),
+	res, err := resource.New(context.Background(),
+		resource.WithTelemetrySDK(),
+		resource.WithHost(),
+		resource.WithOS(),
+		resource.WithProcessPID(),
+		resource.WithProcessExecutableName(),
+		resource.WithProcessRuntimeName(),
+		resource.WithProcessRuntimeVersion(),
+		resource.WithContainer(),
 		resource.WithAttributes(attrs...),
 		resource.WithFromEnv(),
 	)
+	// A detector that finds nothing (e.g. no container ID outside a
+	// container) leaves a partial resource, which is still usable.
+	if errors.Is(err, resource.ErrPartialResource) {
+		err = nil
+	}
+	return res, err
+}
+
+// instanceID is the default service.instance.id: the host name, which is
+// the pod name in Kubernetes, else a random ID.
+func instanceID() string {
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h
+	}
+	var b [16]byte
+	rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 // NewMetrics creates and initializes OpenTelemetry metrics

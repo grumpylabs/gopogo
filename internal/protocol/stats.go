@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"fmt"
 	"os"
 	"runtime"
 	"strconv"
@@ -120,13 +121,24 @@ func LogStats(c *cache.Cache) {
 		"curr_connections": true, "total_connections": true, "store_no_memory": true,
 	}
 	var fields []zap.Field
+	stat := map[string]string{}
 	for _, kv := range statLines(c) {
+		stat[kv[0]] = kv[1]
 		if want[kv[0]] {
 			if n, err := strconv.ParseInt(kv[1], 10, 64); err == nil {
 				fields = append(fields, zap.Int64(kv[0], n))
 			}
 		}
 	}
+	v := func(k string) int64 { n, _ := strconv.ParseInt(stat[k], 10, 64); return n }
+	hitRate := 0.0
+	if gets := v("get_hits") + v("get_misses"); gets > 0 {
+		hitRate = 100 * float64(v("get_hits")) / float64(gets)
+	}
+	ce.Message = fmt.Sprintf(
+		"cache holds %d items in %.1f MiB; %d gets (%.1f%% hits), %d sets, %d evictions, %d connections open",
+		v("curr_items"), float64(v("bytes"))/(1<<20), v("cmd_get"), hitRate,
+		v("cmd_set"), v("evictions"), v("curr_connections"))
 	ce.Write(fields...)
 }
 
