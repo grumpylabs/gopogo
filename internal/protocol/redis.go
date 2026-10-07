@@ -57,7 +57,11 @@ func (h *RedisHandler) Handle(conn net.Conn) {
 		} else {
 			writeRESP(writer, r.resp)
 		}
-		writer.Flush()
+		// Reply to a pipelined batch with one write: flush once no further
+		// command is already buffered.
+		if reader.Buffered() == 0 || r.quit || r.monitor {
+			writer.Flush()
+		}
 		if r.quit {
 			return
 		}

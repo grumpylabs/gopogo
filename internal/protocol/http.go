@@ -66,7 +66,9 @@ func (h *HTTPHandler) Handle(conn net.Conn) {
 			return
 		}
 		h.serveTraced(writer, req, conn.RemoteAddr().String(), isTLS)
-		writer.Flush()
+		if reader.Buffered() == 0 || req.Close {
+			writer.Flush()
+		}
 		if req.Close {
 			return
 		}

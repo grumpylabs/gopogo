@@ -172,7 +172,9 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 			writer.WriteString("ERROR\r\n")
 		}
 		
-		writer.Flush()
+		if reader.Buffered() == 0 {
+			writer.Flush()
+		}
 		obs.end(peek.errorReply())
 	}
 }
