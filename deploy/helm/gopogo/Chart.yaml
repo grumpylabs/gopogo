@@ -2,8 +2,8 @@ apiVersion: v2
 name: gopogo
 description: Gopogo, a multi-protocol cache server (Redis, HTTP, Memcache and Postgres wire protocols)
 type: application
-version: 0.5.3
-appVersion: "1.3.0"
+version: 0.5.4
+appVersion: "1.4.0"
 home: https://github.com/grumpylabs/gopogo
 sources:
   - https://github.com/grumpylabs/gopogo
