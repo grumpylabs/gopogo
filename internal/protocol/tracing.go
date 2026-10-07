@@ -47,9 +47,12 @@ type commandObs struct {
 	name  string
 }
 
-// commandDuration is the gopogo.command.duration histogram, set by
-// EnableCommandMetrics.
-var commandDuration atomic.Pointer[metric.Float64Histogram]
+// commandDuration and httpDuration are the gopogo.command.duration and
+// http.server.request.duration histograms, set by EnableCommandMetrics.
+var (
+	commandDuration atomic.Pointer[metric.Float64Histogram]
+	httpDuration    atomic.Pointer[metric.Float64Histogram]
+)
 
 // commandDurationBuckets suit a cache, whose commands mostly take
 // microseconds: 10us to 1s.
@@ -59,16 +62,26 @@ var commandDurationBuckets = []float64{
 }
 
 // EnableCommandMetrics records every command's duration in the
-// gopogo.command.duration histogram, with the same attributes as its span.
+// gopogo.command.duration histogram, with the same attributes as its span,
+// and every HTTP request's in http.server.request.duration.
 func EnableCommandMetrics(mp metric.MeterProvider) error {
-	h, err := mp.Meter(instrumentationName).Float64Histogram("gopogo.command.duration",
+	meter := mp.Meter(instrumentationName)
+	h, err := meter.Float64Histogram("gopogo.command.duration",
 		metric.WithDescription("Duration of commands handled by the server"),
 		metric.WithUnit("s"),
 		metric.WithExplicitBucketBoundaries(commandDurationBuckets...))
 	if err != nil {
 		return err
 	}
+	hh, err := meter.Float64Histogram("http.server.request.duration",
+		metric.WithDescription("Duration of HTTP server requests"),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(commandDurationBuckets...))
+	if err != nil {
+		return err
+	}
 	commandDuration.Store(&h)
+	httpDuration.Store(&hh)
 	return nil
 }
 
@@ -178,8 +191,14 @@ func startCommandSpan(ctx context.Context, proto Type, addr, name string) (conte
 	} else {
 		attrs = append(attrs, semconv.NetworkTransportUnix)
 	}
+	// Over HTTP the request has its own server span; the command is a step
+	// inside it.
+	kind := trace.SpanKindServer
+	if proto == TypeHTTP {
+		kind = trace.SpanKindInternal
+	}
 	return otel.Tracer(instrumentationName).Start(ctx, name,
-		trace.WithSpanKind(trace.SpanKindServer),
+		trace.WithSpanKind(kind),
 		trace.WithAttributes(attrs...))
 }
 

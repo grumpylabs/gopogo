@@ -35,6 +35,7 @@ type Config struct {
 	ServiceVersion  string
 	Environment     string
 	SampleRatio     float64 // fraction of new traces to sample, 0-1
+	SampleRatioSet  bool    // SampleRatio was given explicitly; else OTEL_TRACES_SAMPLER may choose
 	Debug           bool    // log every export
 }
 
@@ -121,6 +122,19 @@ func instanceID() string {
 	rand.Read(b[:])
 	return hex.EncodeToString(b[:])
 }
+
+// Duration histograms are in seconds. opBuckets suit single cache
+// operations, which mostly take microseconds (10us to 1s); longBuckets
+// suit saving, loading and sweeping the whole cache (1ms to 60s).
+var (
+	opBuckets = []float64{
+		0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005,
+		0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1,
+	}
+	longBuckets = []float64{
+		0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,
+	}
+)
 
 // NewMetrics creates and initializes OpenTelemetry metrics
 func NewMetrics(ctx context.Context, cfg *Config) (*Metrics, error) {
@@ -214,7 +228,8 @@ func (m *Metrics) initializeInstruments() error {
 	m.CacheStoreDuration, err = m.meter.Float64Histogram(
 		"cache.store.duration",
 		metric.WithDescription("Duration of cache store operations"),
-		metric.WithUnit("ms"),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(opBuckets...),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create cache.store.duration: %w", err)
@@ -223,7 +238,8 @@ func (m *Metrics) initializeInstruments() error {
 	m.CacheLoadDuration, err = m.meter.Float64Histogram(
 		"cache.load.duration",
 		metric.WithDescription("Duration of cache load operations"),
-		metric.WithUnit("ms"),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(opBuckets...),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create cache.load.duration: %w", err)
@@ -232,7 +248,8 @@ func (m *Metrics) initializeInstruments() error {
 	m.CacheDeleteDuration, err = m.meter.Float64Histogram(
 		"cache.delete.duration",
 		metric.WithDescription("Duration of cache delete operations"),
-		metric.WithUnit("ms"),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(opBuckets...),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create cache.delete.duration: %w", err)
@@ -271,7 +288,8 @@ func (m *Metrics) initializeInstruments() error {
 	m.CacheSaveDuration, err = m.meter.Float64Histogram(
 		"cache.save.duration",
 		metric.WithDescription("Duration of cache save to disk"),
-		metric.WithUnit("ms"),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(longBuckets...),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create cache.save.duration: %w", err)
@@ -280,7 +298,8 @@ func (m *Metrics) initializeInstruments() error {
 	m.CacheLoadFileDuration, err = m.meter.Float64Histogram(
 		"cache.loadfile.duration",
 		metric.WithDescription("Duration of cache load from disk"),
-		metric.WithUnit("ms"),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(longBuckets...),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create cache.loadfile.duration: %w", err)
@@ -308,7 +327,8 @@ func (m *Metrics) initializeInstruments() error {
 	m.CacheSweepDuration, err = m.meter.Float64Histogram(
 		"cache.sweep.duration",
 		metric.WithDescription("Duration of cache sweep operations"),
-		metric.WithUnit("ms"),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(longBuckets...),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create cache.sweep.duration: %w", err)
@@ -386,22 +406,22 @@ func (m *Metrics) Shutdown(ctx context.Context) error {
 }
 
 // RecordStore records a cache store operation
-func (m *Metrics) RecordStore(ctx context.Context, result string, durationMs float64) {
+func (m *Metrics) RecordStore(ctx context.Context, result string, elapsed time.Duration) {
 	if m.CacheStoreCount == nil {
 		return
 	}
 	attrs := metric.WithAttributes(attribute.String("result", result))
 	m.CacheStoreCount.Add(ctx, 1, attrs)
-	m.CacheStoreDuration.Record(ctx, durationMs, attrs)
+	m.CacheStoreDuration.Record(ctx, elapsed.Seconds(), attrs)
 }
 
 // RecordLoad records a cache load operation
-func (m *Metrics) RecordLoad(ctx context.Context, hit bool, durationMs float64) {
+func (m *Metrics) RecordLoad(ctx context.Context, hit bool, elapsed time.Duration) {
 	if m.CacheLoadCount == nil {
 		return
 	}
 	m.CacheLoadCount.Add(ctx, 1)
-	m.CacheLoadDuration.Record(ctx, durationMs)
+	m.CacheLoadDuration.Record(ctx, elapsed.Seconds())
 	if hit {
 		m.CacheHitCount.Add(ctx, 1)
 	} else {
@@ -410,13 +430,13 @@ func (m *Metrics) RecordLoad(ctx context.Context, hit bool, durationMs float64) 
 }
 
 // RecordDelete records a cache delete operation
-func (m *Metrics) RecordDelete(ctx context.Context, found bool, durationMs float64) {
+func (m *Metrics) RecordDelete(ctx context.Context, found bool, elapsed time.Duration) {
 	if m.CacheDeleteCount == nil {
 		return
 	}
 	attrs := metric.WithAttributes(attribute.Bool("found", found))
 	m.CacheDeleteCount.Add(ctx, 1, attrs)
-	m.CacheDeleteDuration.Record(ctx, durationMs, attrs)
+	m.CacheDeleteDuration.Record(ctx, elapsed.Seconds(), attrs)
 }
 
 // RecordEviction records cache evictions
@@ -428,33 +448,33 @@ func (m *Metrics) RecordEviction(ctx context.Context, count int64) {
 }
 
 // RecordSave records a cache save-to-disk operation
-func (m *Metrics) RecordSave(ctx context.Context, success bool, durationMs float64) {
+func (m *Metrics) RecordSave(ctx context.Context, success bool, elapsed time.Duration) {
 	if m.CacheSaveDuration == nil {
 		return
 	}
-	m.CacheSaveDuration.Record(ctx, durationMs)
+	m.CacheSaveDuration.Record(ctx, elapsed.Seconds())
 	if !success {
 		m.CacheSaveErrors.Add(ctx, 1)
 	}
 }
 
 // RecordLoadFile records a cache load-from-disk operation
-func (m *Metrics) RecordLoadFile(ctx context.Context, success bool, durationMs float64) {
+func (m *Metrics) RecordLoadFile(ctx context.Context, success bool, elapsed time.Duration) {
 	if m.CacheLoadFileDuration == nil {
 		return
 	}
-	m.CacheLoadFileDuration.Record(ctx, durationMs)
+	m.CacheLoadFileDuration.Record(ctx, elapsed.Seconds())
 	if !success {
 		m.CacheLoadFileErrors.Add(ctx, 1)
 	}
 }
 
 // RecordSweep records a sweep operation
-func (m *Metrics) RecordSweep(ctx context.Context, expired int64, durationMs float64) {
+func (m *Metrics) RecordSweep(ctx context.Context, expired int64, elapsed time.Duration) {
 	if m.CacheSweepDuration == nil {
 		return
 	}
-	m.CacheSweepDuration.Record(ctx, durationMs)
+	m.CacheSweepDuration.Record(ctx, elapsed.Seconds())
 	if expired > 0 {
 		m.CacheSweepExpired.Add(ctx, expired)
 	}

@@ -355,11 +355,11 @@ func (c *Cache) recordPersist(start time.Time, isSave, success bool) {
 	if c.metrics == nil {
 		return
 	}
-	ms := float64(time.Since(start).Microseconds()) / 1000.0
+	elapsed := time.Since(start)
 	ctx := context.Background()
 	if isSave {
-		c.metrics.RecordSave(ctx, success, ms)
+		c.metrics.RecordSave(ctx, success, elapsed)
 	} else {
-		c.metrics.RecordLoadFile(ctx, success, ms)
+		c.metrics.RecordLoadFile(ctx, success, elapsed)
 	}
 }

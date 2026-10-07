@@ -3,6 +3,7 @@ package protocol
 import (
 	"bufio"
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -129,18 +130,37 @@ func TestHTTPSpanContinuesTrace(t *testing.T) {
 	resp.Body.Close()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for len(rec.Ended()) < 1 && time.Now().Before(deadline) {
+	for len(rec.Ended()) < 2 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	spans := rec.Ended()
-	if len(spans) != 1 || spans[0].Name() != "GET" {
+	if len(spans) != 2 {
 		t.Fatalf("spans: %v", spans)
 	}
-	if got := spans[0].SpanContext().TraceID().String(); got != traceID {
+	// The command ends first, inside the request's server span.
+	cmd, req0 := spans[0], spans[1]
+	if req0.Name() != "GET /{key}" || req0.SpanKind() != trace.SpanKindServer {
+		t.Fatalf("request span %q kind %v", req0.Name(), req0.SpanKind())
+	}
+	if got := req0.SpanContext().TraceID().String(); got != traceID {
 		t.Fatalf("trace id %s, want the caller's %s", got, traceID)
 	}
-	if got := spans[0].Parent().SpanID().String(); got != "00f067aa0ba902b7" {
+	if got := req0.Parent().SpanID().String(); got != "00f067aa0ba902b7" {
 		t.Fatalf("parent span %s, want the caller's", got)
+	}
+	for k, want := range map[string]string{
+		"http.request.method": "GET", "http.route": "/{key}", "url.scheme": "http",
+		"network.protocol.version": "1.1", "http.response.status_code": "404",
+	} {
+		if got := spanAttr(req0, k); got != want {
+			t.Errorf("request span %s = %q, want %q", k, got, want)
+		}
+	}
+	if spanAttr(req0, "url.path") != "" {
+		t.Error("request span records url.path, which holds the key")
+	}
+	if cmd.Name() != "GET" || cmd.SpanKind() != trace.SpanKindInternal || cmd.Parent().SpanID() != req0.SpanContext().SpanID() {
+		t.Fatalf("command span %q kind %v parent %v", cmd.Name(), cmd.SpanKind(), cmd.Parent().SpanID())
 	}
 }
 
@@ -176,7 +196,7 @@ func TestCommandDurationMetric(t *testing.T) {
 	if err := EnableCommandMetrics(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { commandDuration.Store(nil) })
+	t.Cleanup(func() { commandDuration.Store(nil); httpDuration.Store(nil) })
 
 	ctx := context.Background()
 	for i := 0; i < 3; i++ {
@@ -219,6 +239,81 @@ func TestCommandDurationMetric(t *testing.T) {
 	for k, n := range want {
 		if counts[k] != n {
 			t.Errorf("%s: count %d, want %d (all: %v)", k, counts[k], n, counts)
+		}
+	}
+}
+
+func TestHTTPServerMetricAndErrors(t *testing.T) {
+	rec := recordSpans(t)
+	reader := sdkmetric.NewManualReader()
+	if err := EnableCommandMetrics(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { commandDuration.Store(nil); httpDuration.Store(nil) })
+
+	server, client := net.Pipe()
+	go NewHTTPHandler(cache.New(nil), "").Handle(server)
+	defer client.Close()
+	client.SetDeadline(time.Now().Add(5 * time.Second))
+	br := bufio.NewReader(client)
+	do := func(method, target, body string) int {
+		req, _ := http.NewRequest(method, "http://gopogo"+target, strings.NewReader(body))
+		req.Write(client)
+		resp, err := http.ReadResponse(br, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := do("PUT", "/k", "v"); code != 200 {
+		t.Fatalf("PUT: %d", code)
+	}
+	if code := do("PUT", "/k?ex=soon", "v"); code != 500 {
+		t.Fatalf("PUT with a bad ex: %d", code)
+	}
+	if code := do("GET", "/@nope", ""); code != 400 {
+		t.Fatalf("GET /@nope: %d", code)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for len(rec.Ended()) < 5 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	var failed sdktrace.ReadOnlySpan
+	for _, s := range rec.Ended() {
+		if s.Name() == "PUT /{key}" && spanAttr(s, "http.response.status_code") == "500" {
+			failed = s
+		}
+	}
+	if failed == nil || failed.Status().Code != codes.Error || spanAttr(failed, "error.type") != "500" {
+		t.Fatalf("no failed PUT span with error status: %v", rec.Ended())
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	counts := map[string]uint64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, md := range sm.Metrics {
+			if md.Name != "http.server.request.duration" {
+				continue
+			}
+			for _, dp := range md.Data.(metricdata.Histogram[float64]).DataPoints {
+				counts[dp.Attributes.Encoded(attribute.DefaultEncoder())] += dp.Count
+			}
+		}
+	}
+	base := "network.protocol.name=http,network.protocol.version=1.1,url.scheme=http"
+	for k, n := range map[string]uint64{
+		"http.request.method=PUT,http.response.status_code=200,http.route=/{key}," + base:                1,
+		"error.type=500,http.request.method=PUT,http.response.status_code=500,http.route=/{key}," + base: 1,
+		"http.request.method=GET,http.response.status_code=400," + base:                                  1,
+	} {
+		if counts[k] != n {
+			t.Errorf("%s: %d, want %d (all: %v)", k, counts[k], n, counts)
 		}
 	}
 }

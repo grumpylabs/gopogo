@@ -763,19 +763,19 @@ func (c *Cache) evictIfNeeded(shard *Shard, requiredSpace int64, skipHash uint64
 
 func (c *Cache) recordStore(start time.Time, result string) {
 	if c.metrics != nil {
-		c.metrics.RecordStore(context.Background(), result, float64(time.Since(start).Microseconds())/1000.0)
+		c.metrics.RecordStore(context.Background(), result, time.Since(start))
 	}
 }
 
 func (c *Cache) recordLoad(start time.Time, hit bool) {
 	if c.metrics != nil {
-		c.metrics.RecordLoad(context.Background(), hit, float64(time.Since(start).Microseconds())/1000.0)
+		c.metrics.RecordLoad(context.Background(), hit, time.Since(start))
 	}
 }
 
 func (c *Cache) recordDelete(start time.Time, found bool) {
 	if c.metrics != nil {
-		c.metrics.RecordDelete(context.Background(), found, float64(time.Since(start).Microseconds())/1000.0)
+		c.metrics.RecordDelete(context.Background(), found, time.Since(start))
 	}
 }
 
@@ -787,7 +787,7 @@ func (c *Cache) recordEvictions(count int64) {
 
 func (c *Cache) recordSweep(start time.Time, expired int) {
 	if c.metrics != nil {
-		c.metrics.RecordSweep(context.Background(), int64(expired), float64(time.Since(start).Microseconds())/1000.0)
+		c.metrics.RecordSweep(context.Background(), int64(expired), time.Since(start))
 	}
 }
 

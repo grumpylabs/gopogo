@@ -94,7 +94,7 @@ func init() {
 	rootCmd.PersistentFlags().Bool("otlp-insecure", true, "Plaintext OTLP to a host:port endpoint; a URL endpoint's scheme decides")
 	rootCmd.PersistentFlags().String("otlp-headers", "", "OTLP request headers as key=value,... e.g. \"Authorization=Bearer <token>\" (default OTEL_EXPORTER_OTLP_HEADERS)")
 	rootCmd.PersistentFlags().String("telemetry-environment", "", "deployment.environment resource attribute")
-	rootCmd.PersistentFlags().Float64("trace-sample-ratio", 1.0, "Fraction of new traces to sample (0-1); a caller's sampling decision is respected")
+	rootCmd.PersistentFlags().Float64("trace-sample-ratio", 1.0, "Fraction of new traces to sample (0-1); a caller's sampling decision is respected. Unset, OTEL_TRACES_SAMPLER applies if set, else 1")
 	rootCmd.PersistentFlags().Bool("noevict", false, "Same as --evict=no")
 	rootCmd.PersistentFlags().Bool("nosixpack", false, "Disable sixpack key compression")
 	rootCmd.PersistentFlags().Int("loadfactor", 75, "Hashmap load factor percent (55-95)")
@@ -182,6 +182,8 @@ func runServer(cmd *cobra.Command, args []string) {
 		ServiceVersion: version,
 		Environment:    viper.GetString("telemetry-environment"),
 		SampleRatio:    viper.GetFloat64("trace-sample-ratio"),
+		SampleRatioSet: cmd.Flags().Changed("trace-sample-ratio") || viper.InConfig("trace-sample-ratio") ||
+			os.Getenv("GOPOGO_TRACE_SAMPLE_RATIO") != "",
 		Debug:          viper.GetBool("verbose"),
 	}
 	metrics, err := telemetry.NewMetrics(context.Background(), telemetryCfg)

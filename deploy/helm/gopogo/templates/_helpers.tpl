@@ -112,7 +112,11 @@ password
 {{- with $t.environment }}
 - --telemetry-environment={{ . }}
 {{- end }}
-- --trace-sample-ratio={{ if hasKey $t "traceSampleRatio" }}{{ $t.traceSampleRatio }}{{ else }}1{{ end }}
+{{- if and (hasKey $t "traceSampleRatio") (not (kindIs "invalid" $t.traceSampleRatio)) }}
+{{- if ne (toString $t.traceSampleRatio) "" }}
+- --trace-sample-ratio={{ $t.traceSampleRatio }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- if .Values.verbose }}
 - --verbose

@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
@@ -53,13 +54,16 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 
 	// Respect the caller's sampling decision; sample new traces at the
 	// configured ratio, since a cache can serve many commands per second.
-	ratio := cfg.SampleRatio
-	if ratio < 0 || ratio > 1 {
-		return nil, fmt.Errorf("trace sample ratio %v is not between 0 and 1", ratio)
-	}
-	opts := []sdktrace.TracerProviderOption{
-		sdktrace.WithResource(res),
-		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))),
+	opts := []sdktrace.TracerProviderOption{sdktrace.WithResource(res)}
+	// An explicit --trace-sample-ratio wins. Otherwise OTEL_TRACES_SAMPLER
+	// (and OTEL_TRACES_SAMPLER_ARG), read by the SDK, choose the sampler;
+	// without it every trace is sampled.
+	if cfg.SampleRatioSet || os.Getenv("OTEL_TRACES_SAMPLER") == "" {
+		ratio := cfg.SampleRatio
+		if ratio < 0 || ratio > 1 {
+			return nil, fmt.Errorf("trace sample ratio %v is not between 0 and 1", ratio)
+		}
+		opts = append(opts, sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))))
 	}
 	if exporter != nil {
 		if cfg.Debug {

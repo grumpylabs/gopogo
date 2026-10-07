@@ -92,7 +92,7 @@ Boolean flags take `=true` or `=false` (e.g. `--cas=false`); pogocache-style `--
 | `--otlp-insecure` | `GOPOGO_OTLP_INSECURE` | `true` | Plaintext to a `host:port` endpoint |
 | `--otlp-headers` | `GOPOGO_OTLP_HEADERS` | | OTLP request headers, `key=value,...` |
 | `--telemetry-environment` | `GOPOGO_TELEMETRY_ENVIRONMENT` | | `deployment.environment.name` resource attribute |
-| `--trace-sample-ratio` | `GOPOGO_TRACE_SAMPLE_RATIO` | `1.0` | Fraction of new traces sampled |
+| `--trace-sample-ratio` | `GOPOGO_TRACE_SAMPLE_RATIO` | `1.0` | Fraction of new traces sampled; when not given, `OTEL_TRACES_SAMPLER` applies if set |
 | `--tlsport` | `GOPOGO_TLSPORT` | `0` | TLS listening port |
 | `--tlscert` | `GOPOGO_TLSCERT` | | TLS certificate file |
 | `--tlskey` | `GOPOGO_TLSKEY` | | TLS key file |
@@ -255,9 +255,9 @@ With `--telemetry`, Gopogo exports OpenTelemetry metrics, traces and logs over O
 | `--otlp-insecure` | `true` | Plaintext to a `host:port` endpoint; a URL endpoint's scheme decides |
 | `--otlp-headers` | `OTEL_EXPORTER_OTLP_HEADERS` | Request headers, `key=value,...` |
 | `--telemetry-environment` | | `deployment.environment.name` resource attribute |
-| `--trace-sample-ratio` | `1.0` | Fraction of new traces sampled; a caller's sampling decision is respected |
+| `--trace-sample-ratio` | `1.0` | Fraction of new traces sampled; a caller's sampling decision is respected. When it is not given, the standard `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` choose the sampler if set |
 
-Telemetry follows the OpenTelemetry semantic conventions (v1.40.0). The resource carries `service.name`, `service.version`, `service.instance.id` (the host name, which is the pod name in Kubernetes), `deployment.environment.name` (and the older `deployment.environment`, which some backends still read), `host.name`, `os.*`, `process.*`, `telemetry.sdk.*` and, in a container, `container.id`. `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` add to or override these; the Helm chart uses `OTEL_RESOURCE_ATTRIBUTES` to add the pod's `k8s.*` attributes, `telemetry.clusterName`, `telemetry.serviceNamespace` and any `telemetry.resourceAttributes`.
+Telemetry follows the OpenTelemetry semantic conventions (v1.40.0). The resource carries `service.name`, `service.version`, `service.instance.id` (the host name, which is the pod name in Kubernetes), `deployment.environment.name` (and the older `deployment.environment`, which some backends still read), `host.name`, `os.*`, `process.*`, `telemetry.sdk.*` and, where the cgroup shows it, `container.id` (with cgroup v2 in Kubernetes it usually does not; `k8s.pod.uid` and `k8s.container.name` identify the container instead). `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` add to or override these; the Helm chart uses `OTEL_RESOURCE_ATTRIBUTES` to add the pod's `k8s.*` attributes, `telemetry.clusterName`, `telemetry.serviceNamespace` and any `telemetry.resourceAttributes`.
 
 For an OTLP/HTTP endpoint that takes a bearer token, pass the token in the environment rather than on the command line:
 
@@ -270,7 +270,7 @@ In the Helm chart, put the header in a Secret and set `telemetry.headersSecret.n
 
 ### Traces
 
-Every command runs in a server span named after the command (`GET`, `SET`, memcache `get`; unrecognized commands are `UNKNOWN`), with `db.system.name` (`gopogo`), `db.operation.name`, `network.protocol.name` (redis, http, memcache, postgres), `network.transport` (tcp or unix), `client.address` and `client.port`. Failed commands set the span status to error and `error.type` to the error reply's first word (`ERR`, `WRONGPASS`, `CLIENT_ERROR`, ...). Keys and values are never recorded. HTTP requests continue the caller's trace from a W3C `traceparent` header; the other protocols cannot carry trace context, so their spans start new traces. Loading and saving the persistence file run in `persist.load` and `persist.save` spans.
+Every command runs in a server span named after the command (`GET`, `SET`, memcache `get`; unrecognized commands are `UNKNOWN`), with `db.system.name` (`gopogo`), `db.operation.name`, `network.protocol.name` (redis, http, memcache, postgres), `network.transport` (tcp or unix), `client.address` and `client.port`. Failed commands set the span status to error and `error.type` to the error reply's first word (`ERR`, `WRONGPASS`, `CLIENT_ERROR`, ...). Keys and values are never recorded. Each HTTP request runs in its own server span, `GET /{key}` (or `/`, `/@stats`, `/@keys`), with `http.request.method`, `http.route`, `http.response.status_code`, `url.scheme`, `network.protocol.version`, `client.address`, `client.port` and `user_agent.original`; a 5xx response sets the span status to error and `error.type` to the status code. The key is never recorded, so there is no `url.path`. The cache command runs in a child span. HTTP requests continue the caller's trace from a W3C `traceparent` header; the other protocols cannot carry trace context, so their spans start new traces. Loading and saving the persistence file run in `persist.load` and `persist.save` spans.
 
 ### Logs
 
@@ -284,6 +284,7 @@ Gopogo logs with zap as one JSON object per line on stderr (`level`, `time`, `ca
 |--------|------|-------------|
 | `gopogo.commands` | Counter | `network.protocol.name`, `db.operation.name` (get, set, flush, touch); STATS `cmd_*` |
 | `gopogo.command.duration` | Histogram (s) | Every command's duration, with its span's `db.system.name`, `db.operation.name`, `network.protocol.name` and, when it failed, `error.type`; buckets from 10µs to 1s, and exemplars link samples to their traces |
+| `http.server.request.duration` | Histogram (s) | Every HTTP request's duration, with `http.request.method`, `http.response.status_code`, `http.route`, `url.scheme`, `network.protocol.name`, `network.protocol.version` and, for 5xx, `error.type`; buckets from 10µs to 1s |
 | `gopogo.keyspace.lookups` | Counter | `network.protocol.name`, `operation` (get, delete, incr, decr, touch), `result` (hit, miss) |
 | `gopogo.store.rejected` | Counter | `network.protocol.name`, `reason` (no_memory, too_large) |
 | `gopogo.auth.attempts` | Counter | `network.protocol.name`, `result` (success, failure) |
@@ -294,19 +295,19 @@ Gopogo logs with zap as one JSON object per line on stderr (`level`, `time`, `ca
 | `process.memory.usage` | Gauge | Resident memory (bytes; approximate off Linux) |
 | `go.*` | Various | Go runtime: memory, GC, goroutines |
 | `cache.store.count` | Counter | Engine store operations (with `result` attribute) |
-| `cache.store.duration` | Histogram | Store latency (ms) |
+| `cache.store.duration` | Histogram (s) | Store latency in the cache engine, without protocol or network time; buckets 10µs to 1s |
 | `cache.load.count` | Counter | Engine load operations |
-| `cache.load.duration` | Histogram | Load latency (ms) |
+| `cache.load.duration` | Histogram (s) | Load latency in the cache engine, without protocol or network time; buckets 10µs to 1s |
 | `cache.delete.count` | Counter | Engine delete operations |
-| `cache.delete.duration` | Histogram | Delete latency (ms) |
+| `cache.delete.duration` | Histogram (s) | Delete latency in the cache engine, without protocol or network time; buckets 10µs to 1s |
 | `cache.hit.count` / `cache.miss.count` | Counter | Engine lookups, including internal ones |
 | `cache.memory.used` | Gauge | Current memory usage (bytes) |
 | `cache.items.count` | Gauge | Current item count |
 | `cache.eviction.count` | Counter | Evictions |
 | `cache.expiration.count` | Counter | Entries removed because their TTL elapsed, whether found on access, deleted or swept (STATS `num_expired`) |
-| `cache.sweep.duration` | Histogram | Sweep latency (ms) |
-| `cache.save.duration` | Histogram | Persistence save latency (ms) |
-| `cache.loadfile.duration` | Histogram | Persistence load latency (ms) |
+| `cache.sweep.duration` | Histogram (s) | Sweep latency; buckets 1ms to 60s |
+| `cache.save.duration` | Histogram (s) | Persistence save latency; buckets 1ms to 60s |
+| `cache.loadfile.duration` | Histogram (s) | Persistence load latency; buckets 1ms to 60s |
 
 The `gopogo.*` counters count client commands like STATS does; the `cache.*` engine counters count every engine operation, including internal lookups.
 

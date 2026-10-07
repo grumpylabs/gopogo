@@ -108,9 +108,11 @@ telemetry:
   serviceNamespace: ""
   # Any other resource attributes, e.g. {"team": "cache", "cloud.region": "us-east-1"}.
   resourceAttributes: {}
-  # Fraction of new traces to sample (0-1). A caller's sampling decision
-  # (HTTP traceparent) is always respected.
-  traceSampleRatio: 1.0
+  # Fraction of new traces to sample (0-1), e.g. 0.1. A caller's sampling
+  # decision (HTTP traceparent) is always respected. Empty samples every
+  # trace, unless extraEnv sets OTEL_TRACES_SAMPLER (and
+  # OTEL_TRACES_SAMPLER_ARG), which then chooses the sampler.
+  traceSampleRatio: ""
 
 # Verbose logging, including every telemetry export and its result.
 verbose: false

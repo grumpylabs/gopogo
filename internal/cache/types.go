@@ -199,13 +199,13 @@ type Options struct {
 // MetricsRecorder is the interface the cache uses to record telemetry.
 // This avoids a direct dependency on the telemetry package.
 type MetricsRecorder interface {
-	RecordStore(ctx context.Context, result string, durationMs float64)
-	RecordLoad(ctx context.Context, hit bool, durationMs float64)
-	RecordDelete(ctx context.Context, found bool, durationMs float64)
+	RecordStore(ctx context.Context, result string, elapsed time.Duration)
+	RecordLoad(ctx context.Context, hit bool, elapsed time.Duration)
+	RecordDelete(ctx context.Context, found bool, elapsed time.Duration)
 	RecordEviction(ctx context.Context, count int64)
-	RecordSave(ctx context.Context, success bool, durationMs float64)
-	RecordLoadFile(ctx context.Context, success bool, durationMs float64)
-	RecordSweep(ctx context.Context, expired int64, durationMs float64)
+	RecordSave(ctx context.Context, success bool, elapsed time.Duration)
+	RecordLoadFile(ctx context.Context, success bool, elapsed time.Duration)
+	RecordSweep(ctx context.Context, expired int64, elapsed time.Duration)
 }
 
 type Cache struct {

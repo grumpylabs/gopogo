@@ -3,6 +3,7 @@ package protocol
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,7 +16,12 @@ import (
 
 	"github.com/grumpylabs/gopogo/internal/cache"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // HTTPHandler maps HTTP requests onto the shared command layer, as pogocache
@@ -47,7 +53,8 @@ func (h *HTTPHandler) Handle(conn net.Conn) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
+	writer := &httpWriter{Writer: bufio.NewWriter(conn)}
+	_, isTLS := conn.(*tls.Conn)
 
 	for {
 		req, err := http.ReadRequest(reader)
@@ -58,7 +65,7 @@ func (h *HTTPHandler) Handle(conn net.Conn) {
 			}
 			return
 		}
-		h.serve(writer, req, conn.RemoteAddr().String())
+		h.serveTraced(writer, req, conn.RemoteAddr().String(), isTLS)
 		writer.Flush()
 		if req.Close {
 			return
@@ -66,7 +73,105 @@ func (h *HTTPHandler) Handle(conn net.Conn) {
 	}
 }
 
-func (h *HTTPHandler) serve(w *bufio.Writer, req *http.Request, addr string) {
+// httpWriter is a connection's response writer; it remembers the status of
+// the last response written.
+type httpWriter struct {
+	*bufio.Writer
+	status int
+}
+
+// serveTraced serves one request in an HTTP server span, continuing the
+// caller's trace from traceparent, and records http.server.request.duration.
+// The cache command runs in a child span. Following gopogo's rule that keys
+// are never recorded, the span has http.route (/{key}) but no url.path.
+func (h *HTTPHandler) serveTraced(w *httpWriter, req *http.Request, addr string, isTLS bool) {
+	start := time.Now()
+	ctx := otel.GetTextMapPropagator().Extract(context.Background(), propagation.HeaderCarrier(req.Header))
+	method := httpMethod(req.Method)
+	route := httpRoute(req.URL.EscapedPath())
+	scheme := "http"
+	if isTLS {
+		scheme = "https"
+	}
+	attrs := []attribute.KeyValue{
+		semconv.HTTPRequestMethodKey.String(method),
+		semconv.URLScheme(scheme),
+		semconv.NetworkProtocolName("http"),
+		semconv.NetworkProtocolVersion(fmt.Sprintf("%d.%d", req.ProtoMajor, req.ProtoMinor)),
+	}
+	if route != "" {
+		attrs = append(attrs, semconv.HTTPRoute(route))
+	}
+
+	var span trace.Span
+	if tracingEnabled.Load() {
+		spanAttrs := append([]attribute.KeyValue{}, attrs...)
+		if method == "_OTHER" {
+			spanAttrs = append(spanAttrs, semconv.HTTPRequestMethodOriginal(req.Method))
+		}
+		if host, port := splitClient(addr); host != "" {
+			spanAttrs = append(spanAttrs, semconv.ClientAddress(host), semconv.ClientPort(port))
+		}
+		if ua := req.UserAgent(); ua != "" {
+			spanAttrs = append(spanAttrs, semconv.UserAgentOriginal(ua))
+		}
+		name := method
+		if method == "_OTHER" {
+			name = "HTTP"
+		}
+		if route != "" {
+			name += " " + route
+		}
+		ctx, span = otel.Tracer(instrumentationName).Start(ctx, name,
+			trace.WithSpanKind(trace.SpanKindServer), trace.WithAttributes(spanAttrs...))
+	}
+
+	w.status = 0
+	h.serve(ctx, w, req, addr)
+
+	result := []attribute.KeyValue{semconv.HTTPResponseStatusCode(w.status)}
+	if w.status >= 500 {
+		result = append(result, semconv.ErrorTypeKey.String(strconv.Itoa(w.status)))
+	}
+	if span != nil {
+		span.SetAttributes(result...)
+		if w.status >= 500 {
+			span.SetStatus(codes.Error, http.StatusText(w.status))
+		}
+		span.End()
+	}
+	if hist := httpDuration.Load(); hist != nil {
+		(*hist).Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(append(attrs, result...)...))
+	}
+}
+
+// httpMethod returns a known method as is and any other as _OTHER, so
+// clients cannot create unbounded attribute values.
+func httpMethod(m string) string {
+	switch m {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete,
+		http.MethodConnect, http.MethodOptions, http.MethodTrace, http.MethodPatch:
+		return m
+	}
+	return "_OTHER"
+}
+
+// httpRoute is the route a path matched, without the key, or "" for a
+// reserved path gopogo does not serve.
+func httpRoute(path string) string {
+	key := strings.TrimPrefix(path, "/")
+	switch {
+	case key == "":
+		return "/"
+	case key == "@stats" || key == "@keys":
+		return "/" + key
+	case strings.HasPrefix(key, "@"):
+		return ""
+	}
+	return "/{key}"
+}
+
+func (h *HTTPHandler) serve(ctx context.Context, w *httpWriter, req *http.Request, addr string) {
 	query, err := url.ParseQuery(req.URL.RawQuery)
 	if err != nil {
 		h.writeText(w, http.StatusBadRequest, "Bad Request\r\n")
@@ -143,8 +248,6 @@ func (h *HTTPHandler) serve(w *bufio.Writer, req *http.Request, addr string) {
 		return
 	}
 
-	// Continue the caller's trace when the request carries traceparent.
-	ctx := otel.GetTextMapPropagator().Extract(context.Background(), propagation.HeaderCarrier(req.Header))
 	s := &session{proto: TypeHTTP, addr: addr, authed: true, ctx: ctx}
 	r := h.exec.exec(s, args)
 	switch {
@@ -194,7 +297,7 @@ func validHTTPKey(key string) bool {
 	return true
 }
 
-func (h *HTTPHandler) serveHead(w *bufio.Writer, key string) {
+func (h *HTTPHandler) serveHead(w *httpWriter, key string) {
 	entry, found := h.exec.cache.Load([]byte(key))
 	if !found {
 		h.writeResponse(w, http.StatusNotFound, map[string]string{"Content-Length": "0"}, nil)
@@ -208,7 +311,7 @@ func (h *HTTPHandler) serveHead(w *bufio.Writer, key string) {
 	}, nil)
 }
 
-func (h *HTTPHandler) writeKeys(w *bufio.Writer, pattern string) {
+func (h *HTTPHandler) writeKeys(w *httpWriter, pattern string) {
 	if pattern == "" {
 		pattern = "*"
 	}
@@ -223,18 +326,19 @@ func (h *HTTPHandler) writeKeys(w *bufio.Writer, pattern string) {
 	h.writeJSON(w, keys)
 }
 
-func (h *HTTPHandler) writeJSON(w *bufio.Writer, v interface{}) {
+func (h *HTTPHandler) writeJSON(w *httpWriter, v interface{}) {
 	body, _ := json.MarshalIndent(v, "", "  ")
 	h.writeResponse(w, http.StatusOK, map[string]string{"Content-Type": "application/json"}, body)
 }
 
-func (h *HTTPHandler) writeText(w *bufio.Writer, status int, body string) {
+func (h *HTTPHandler) writeText(w *httpWriter, status int, body string) {
 	h.writeResponse(w, status, map[string]string{"Content-Type": "text/plain"}, []byte(body))
 }
 
 // writeResponse writes a response with a Content-Length for body. HEAD
 // responses pass a nil body and set Content-Length in headers instead.
-func (h *HTTPHandler) writeResponse(w *bufio.Writer, status int, headers map[string]string, body []byte) {
+func (h *HTTPHandler) writeResponse(w *httpWriter, status int, headers map[string]string, body []byte) {
+	w.status = status
 	w.WriteString(fmt.Sprintf("HTTP/1.1 %d %s\r\n", status, http.StatusText(status)))
 	w.WriteString("Server: gopogo/" + Version + "\r\n")
 	w.WriteString("Date: " + time.Now().UTC().Format(http.TimeFormat) + "\r\n")
