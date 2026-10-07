@@ -303,7 +303,7 @@ Gopogo logs with zap as one JSON object per line on stderr (`level`, `time`, `ca
 | `cache.memory.used` | Gauge | Current memory usage (bytes) |
 | `cache.items.count` | Gauge | Current item count |
 | `cache.eviction.count` | Counter | Evictions |
-| `cache.expiration.count` | Counter | Expirations |
+| `cache.expiration.count` | Counter | Entries removed because their TTL elapsed, whether found on access, deleted or swept (STATS `num_expired`) |
 | `cache.sweep.duration` | Histogram | Sweep latency (ms) |
 | `cache.save.duration` | Histogram | Persistence save latency (ms) |
 | `cache.loadfile.duration` | Histogram | Persistence load latency (ms) |

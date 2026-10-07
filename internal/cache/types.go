@@ -203,7 +203,6 @@ type MetricsRecorder interface {
 	RecordLoad(ctx context.Context, hit bool, durationMs float64)
 	RecordDelete(ctx context.Context, found bool, durationMs float64)
 	RecordEviction(ctx context.Context, count int64)
-	RecordExpiration(ctx context.Context, count int64)
 	RecordSave(ctx context.Context, success bool, durationMs float64)
 	RecordLoadFile(ctx context.Context, success bool, durationMs float64)
 	RecordSweep(ctx context.Context, expired int64, durationMs float64)
@@ -328,6 +327,16 @@ func (c *Cache) ShardNumItems(shardIdx int) int {
 // replacements) since the cache was created.
 func (c *Cache) TotalItems() uint64 {
 	return c.totalStored.Load()
+}
+
+// NumExpired returns how many entries have been removed because their TTL
+// elapsed, whether found on access, deleted or swept.
+func (c *Cache) NumExpired() uint64 {
+	var n uint64
+	for _, shard := range c.shards {
+		n += shard.NumExpired()
+	}
+	return n
 }
 
 func (c *Cache) Stats() map[string]interface{} {

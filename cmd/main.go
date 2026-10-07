@@ -234,6 +234,7 @@ func runServer(cmd *cobra.Command, args []string) {
 	metrics.RegisterGauges(
 		func() int64 { return c.MemUsed() },
 		func() int64 { return int64(c.NumItems()) },
+		func() int64 { return int64(c.NumExpired()) },
 	)
 	if err := metrics.RegisterServerMetrics(c); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize telemetry: %v\n", err)

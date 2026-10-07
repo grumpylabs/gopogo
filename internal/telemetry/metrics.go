@@ -63,7 +63,7 @@ type Metrics struct {
 
 	// Eviction and expiration
 	CacheEvictionCount   metric.Int64Counter
-	CacheExpirationCount metric.Int64Counter
+	CacheExpirationCount metric.Int64ObservableCounter
 
 	// Persistence
 	CacheSaveDuration     metric.Float64Histogram
@@ -267,15 +267,6 @@ func (m *Metrics) initializeInstruments() error {
 		return fmt.Errorf("failed to create cache.eviction.count: %w", err)
 	}
 
-	m.CacheExpirationCount, err = m.meter.Int64Counter(
-		"cache.expiration.count",
-		metric.WithDescription("Number of expired entries removed"),
-		metric.WithUnit("{expiration}"),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create cache.expiration.count: %w", err)
-	}
-
 	// Persistence
 	m.CacheSaveDuration, err = m.meter.Float64Histogram(
 		"cache.save.duration",
@@ -335,9 +326,9 @@ func (m *Metrics) initializeInstruments() error {
 	return nil
 }
 
-// RegisterGauges registers observable gauges that poll cache state.
-// memUsedFn and itemCountFn are callbacks that return current values.
-func (m *Metrics) RegisterGauges(memUsedFn func() int64, itemCountFn func() int64) error {
+// RegisterGauges registers instruments that poll cache state: memory used
+// and item count (gauges), and expired entries removed (a counter).
+func (m *Metrics) RegisterGauges(memUsedFn, itemCountFn, expiredFn func() int64) error {
 	if m.meter == nil {
 		return nil
 	}
@@ -366,6 +357,21 @@ func (m *Metrics) RegisterGauges(memUsedFn func() int64, itemCountFn func() int6
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create cache.items.count: %w", err)
+	}
+
+	// Read from the cache's own counter, which every expiry path updates
+	// (access, delete and both sweeps), as STATS num_expired does.
+	m.CacheExpirationCount, err = m.meter.Int64ObservableCounter(
+		"cache.expiration.count",
+		metric.WithDescription("Number of expired entries removed"),
+		metric.WithUnit("{expiration}"),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			o.Observe(expiredFn())
+			return nil
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create cache.expiration.count: %w", err)
 	}
 
 	return nil
@@ -419,14 +425,6 @@ func (m *Metrics) RecordEviction(ctx context.Context, count int64) {
 		return
 	}
 	m.CacheEvictionCount.Add(ctx, count)
-}
-
-// RecordExpiration records expired entry removals
-func (m *Metrics) RecordExpiration(ctx context.Context, count int64) {
-	if m.CacheExpirationCount == nil {
-		return
-	}
-	m.CacheExpirationCount.Add(ctx, count)
 }
 
 // RecordSave records a cache save-to-disk operation
