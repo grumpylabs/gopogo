@@ -373,7 +373,7 @@ See `deploy/helm/gopogo/values.yaml` for all options. The chart uses `ghcr.io/gr
 
 ## License
 
-MIT License - see LICENSE file for details
+MIT License - see [LICENSE](LICENSE). Gopogo is derived from pogocache, Copyright (c) 2025 Polypoint Labs, LLC, also MIT.
 
 ## Acknowledgments
 
