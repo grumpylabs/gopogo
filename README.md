@@ -329,6 +329,7 @@ make bench          # Run benchmarks
 make build-race     # Build with race detector
 make test-coverage  # Generate test coverage
 make integration    # Run pogocache's protocol tests against a live server
+make fuzz           # Fuzz each protocol parser (FUZZTIME=60s each)
 ```
 
 `make integration` runs the test suite from pogocache's `tools/tests`, copied unchanged into `test/integration` (a separate Go module, so its client libraries stay out of gopogo's `go.mod`). `run.sh` starts `bin/gopogo` on port 9401 with every protocol enabled and stops it afterwards. `INTEGRATION_RUN` and `INTEGRATION_SKIP` select tests, e.g. `make integration INTEGRATION_RUN=^TestRESP`.

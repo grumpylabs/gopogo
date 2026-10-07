@@ -260,7 +260,16 @@ func (s *Server) admit(conn net.Conn) bool {
 func (s *Server) handleConnection(conn net.Conn) {
 	defer protocol.ConnStats.Curr.Add(-1)
 	defer conn.Close()
-	
+	// A bug reached by one client's input closes that connection, not the
+	// whole server.
+	defer func() {
+		if r := recover(); r != nil {
+			zap.L().Error(fmt.Sprintf("connection from %s closed after a panic: %v", conn.RemoteAddr(), r),
+				zap.String("client.address", conn.RemoteAddr().String()),
+				zap.String("panic", fmt.Sprint(r)), zap.Stack("stack"))
+		}
+	}()
+
 	detector := protocol.NewDetector(conn)
 	protoType, err := detector.Detect()
 	if err != nil {

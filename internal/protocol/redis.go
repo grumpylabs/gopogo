@@ -172,6 +172,23 @@ const (
 	maxBulkLen = 512 << 20 // bytes in one argument or value
 )
 
+// readFull reads exactly n bytes. Memory grows with the bytes that arrive,
+// so a client that claims a large length but sends little costs little.
+func readFull(r io.Reader, n int) ([]byte, error) {
+	const chunk = 64 << 10
+	if n <= chunk {
+		buf := make([]byte, n)
+		_, err := io.ReadFull(r, buf)
+		return buf, err
+	}
+	var b bytes.Buffer
+	b.Grow(chunk)
+	if _, err := io.CopyN(&b, r, int64(n)); err != nil {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return b.Bytes(), nil
+}
+
 // parseLen parses the decimal number after a RESP type byte.
 func parseLen(b []byte) (int, error) {
 	n, err := strconv.Atoi(string(b))
@@ -239,8 +256,8 @@ func (h *RedisHandler) readArray(reader *bufio.Reader, count int) ([]string, err
 			reader.Discard(size + 2)
 			continue
 		}
-		buf := make([]byte, size+2)
-		if _, err := io.ReadFull(reader, buf); err != nil {
+		buf, err := readFull(reader, size+2)
+		if err != nil {
 			return nil, err
 		}
 		args = append(args, string(buf[:size]))

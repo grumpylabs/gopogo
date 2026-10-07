@@ -333,8 +333,7 @@ func (h *MemcacheHandler) handleStore(reader *bufio.Reader, writer *bufio.Writer
 	
 	noreply := len(parts) > 5 && parts[5] == "noreply"
 	
-	data := make([]byte, bytes)
-	_, err = io.ReadFull(reader, data)
+	data, err := readFull(reader, bytes)
 	if err != nil {
 		writer.WriteString("CLIENT_ERROR bad data chunk\r\n")
 		return
@@ -411,8 +410,7 @@ func (h *MemcacheHandler) handleCAS(reader *bufio.Reader, writer *bufio.Writer, 
 	
 	noreply := len(parts) > 6 && parts[6] == "noreply"
 	
-	data := make([]byte, bytes)
-	_, err = io.ReadFull(reader, data)
+	data, err := readFull(reader, bytes)
 	if err != nil {
 		writer.WriteString("CLIENT_ERROR bad data chunk\r\n")
 		return
@@ -469,8 +467,7 @@ func (h *MemcacheHandler) handleAppend(reader *bufio.Reader, writer *bufio.Write
 	
 	noreply := len(parts) > 5 && parts[5] == "noreply"
 	
-	data := make([]byte, bytes)
-	_, err = io.ReadFull(reader, data)
+	data, err := readFull(reader, bytes)
 	if err != nil {
 		writer.WriteString("CLIENT_ERROR bad data chunk\r\n")
 		return

@@ -232,8 +232,8 @@ func (c *pgConn) readMessage() (byte, []byte, error) {
 	if n < 4 || n > maxPGMessage {
 		return 0, nil, errPGProtocol
 	}
-	body := make([]byte, n-4)
-	if _, err := io.ReadFull(c.r, body); err != nil {
+	body, err := readFull(c.r, int(n-4))
+	if err != nil {
 		return 0, nil, err
 	}
 	return hdr[0], body, nil
@@ -295,7 +295,7 @@ func (c *pgConn) simpleQuery(query string) {
 
 func (c *pgConn) parse(m *pgMsg) {
 	name, query := m.cstr(), m.cstr()
-	n := int(m.int16())
+	n := m.count()
 	for i := 0; i < n; i++ {
 		m.int32() // parameter type OIDs are ignored; everything is text
 	}
@@ -313,12 +313,12 @@ func (c *pgConn) parse(m *pgMsg) {
 
 func (c *pgConn) bind(m *pgMsg) {
 	portal, stmtName := m.cstr(), m.cstr()
-	nformats := int(m.int16())
+	nformats := m.count()
 	formats := make([]int16, nformats)
 	for i := range formats {
 		formats[i] = m.int16()
 	}
-	nparams := int(m.int16())
+	nparams := m.count()
 	params := make([]string, nparams)
 	for i := range params {
 		n := m.int32()
@@ -327,7 +327,7 @@ func (c *pgConn) bind(m *pgMsg) {
 		}
 		// Text and binary parameters are both taken as raw bytes; NULL is "".
 	}
-	nresult := int(m.int16())
+	nresult := m.count()
 	for i := 0; i < nresult; i++ {
 		m.int16() // results are always text
 	}
@@ -559,6 +559,17 @@ func (m *pgMsg) int16() int16 {
 		return int16(binary.BigEndian.Uint16(b))
 	}
 	return 0
+}
+
+// count reads an Int16 element count. A negative count is malformed.
+func (m *pgMsg) count() int {
+	n := int(m.int16())
+	if n < 0 {
+		m.err = true
+		m.b = nil
+		return 0
+	}
+	return n
 }
 
 func (m *pgMsg) int32() int32 {

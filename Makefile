@@ -1,4 +1,4 @@
-.PHONY: all build loadgen amd64 arm64 clean test integration integration-run helm-lint bench install run run-ports help container login dock-amd64 dock-arm64 dev-manifest dev images ci-pkg-amd64 ci-pkg-arm64 ci-pkg push
+.PHONY: all build loadgen fuzz amd64 arm64 clean test integration integration-run helm-lint bench install run run-ports help container login dock-amd64 dock-arm64 dev-manifest dev images ci-pkg-amd64 ci-pkg-arm64 ci-pkg push
 
 # Version stamped into the binary: the nearest v* git tag (v1.2.3 -> 1.2.3),
 # with -<n>-g<commit> after it and -dirty for uncommitted changes.
@@ -75,6 +75,15 @@ test-coverage: ## Run tests and generate coverage report
 
 bench: ## Run performance benchmarks
 	@go test -bench=. -benchmem ./...
+
+FUZZTIME ?= 60s
+FUZZ_TARGETS := FuzzRESP FuzzMemcache FuzzHTTP FuzzPostgres FuzzDetect
+
+fuzz: ## Fuzz each protocol parser for FUZZTIME (default 60s)
+	@for t in $(FUZZ_TARGETS); do \
+		echo "== $$t"; \
+		go test ./internal/protocol -run '^$$' -fuzz "^$$t\$$" -fuzztime $(FUZZTIME) || exit 1; \
+	done
 
 fmt: ## Format Go source code
 	@go fmt ./...
