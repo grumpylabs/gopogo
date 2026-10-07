@@ -55,7 +55,7 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 	// peek sees the start of each flushed reply, so a command's span can be
 	// marked failed when the reply is an error.
 	peek := &replyPeek{w: conn}
-	writer := bufio.NewWriter(peek)
+	writer := bufio.NewWriterSize(peek, replyBufferSize)
 	addr := conn.RemoteAddr().String()
 	
 	for {
@@ -93,7 +93,7 @@ func (h *MemcacheHandler) Handle(conn net.Conn) {
 			// Consume a storage command's data block so the next command
 			// line is read correctly.
 			if memcacheStorageCmds[cmd] && len(parts) >= 5 {
-				if n, err := strconv.Atoi(parts[4]); err == nil && n >= 0 {
+				if n, err := strconv.Atoi(parts[4]); err == nil && n >= 0 && n <= maxBulkLen {
 					if _, err := io.CopyN(io.Discard, reader, int64(n)+2); err != nil {
 						return
 					}
@@ -326,7 +326,7 @@ func (h *MemcacheHandler) handleStore(reader *bufio.Reader, writer *bufio.Writer
 	}
 	
 	bytes, err := strconv.Atoi(parts[4])
-	if err != nil {
+	if err != nil || bytes < 0 || bytes > maxBulkLen {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
 	}
@@ -398,7 +398,7 @@ func (h *MemcacheHandler) handleCAS(reader *bufio.Reader, writer *bufio.Writer, 
 	}
 	
 	bytes, err := strconv.Atoi(parts[4])
-	if err != nil {
+	if err != nil || bytes < 0 || bytes > maxBulkLen {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
 	}
@@ -462,7 +462,7 @@ func (h *MemcacheHandler) handleAppend(reader *bufio.Reader, writer *bufio.Write
 	
 	key := parts[1]
 	bytes, err := strconv.Atoi(parts[4])
-	if err != nil {
+	if err != nil || bytes < 0 || bytes > maxBulkLen {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
 	}

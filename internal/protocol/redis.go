@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -26,7 +27,7 @@ func (h *RedisHandler) Handle(conn net.Conn) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
+	writer := bufio.NewWriterSize(conn, replyBufferSize)
 	s := &session{
 		proto:  TypeRedis,
 		addr:   conn.RemoteAddr().String(),
@@ -122,17 +123,18 @@ func writeRESP(w *bufio.Writer, v rv) {
 		w.WriteString(v.s)
 		w.WriteString("\r\n")
 	case ':':
-		w.WriteString(":" + strconv.FormatInt(v.n, 10) + "\r\n")
+		writeRESPHeader(w, ':', v.n)
 	case 'u':
-		w.WriteString("+" + strconv.FormatUint(v.u, 10) + "\r\n")
+		var b [24]byte
+		w.Write(append(strconv.AppendUint(append(b[:0], '+'), v.u, 10), '\r', '\n'))
 	case '$':
-		w.WriteString("$" + strconv.Itoa(len(v.s)) + "\r\n")
+		writeRESPHeader(w, '$', int64(len(v.s)))
 		w.WriteString(v.s)
 		w.WriteString("\r\n")
 	case '_':
 		w.WriteString("$-1\r\n")
 	case '*':
-		w.WriteString("*" + strconv.Itoa(len(v.arr)) + "\r\n")
+		writeRESPHeader(w, '*', int64(len(v.arr)))
 		for _, e := range v.arr {
 			writeRESP(w, e)
 		}
@@ -141,54 +143,106 @@ func writeRESP(w *bufio.Writer, v rv) {
 	}
 }
 
+// writeRESPHeader writes a type byte, a number and CRLF without allocating.
+func writeRESPHeader(w *bufio.Writer, kind byte, n int64) {
+	var b [24]byte
+	w.Write(append(strconv.AppendInt(append(b[:0], kind), n, 10), '\r', '\n'))
+}
+
+// readLine returns the next line, CRLF included. The slice is only valid
+// until the next read, unless the line overflowed the buffer.
+func readLine(reader *bufio.Reader) ([]byte, error) {
+	line, err := reader.ReadSlice('\n')
+	if err != bufio.ErrBufferFull {
+		return line, err
+	}
+	long := append([]byte(nil), line...)
+	rest, err := reader.ReadBytes('\n')
+	return append(long, rest...), err
+}
+
+// replyBufferSize is each connection's reply buffer, Redis's 16 KiB, so a
+// pipelined batch of typical replies goes out in one write.
+const replyBufferSize = 16 << 10
+
+// Limits on client-supplied lengths, as in Redis: a bad or hostile length
+// gets an error instead of a huge or negative allocation.
+const (
+	maxArgs    = 1 << 20   // arguments in one command
+	maxBulkLen = 512 << 20 // bytes in one argument or value
+)
+
+// parseLen parses the decimal number after a RESP type byte.
+func parseLen(b []byte) (int, error) {
+	n, err := strconv.Atoi(string(b))
+	return n, err
+}
+
 func (h *RedisHandler) readCommand(reader *bufio.Reader) ([]string, error) {
-	line, err := reader.ReadString('\n')
+	line, err := readLine(reader)
 	if err != nil {
 		return nil, err
 	}
 
-	line = strings.TrimSpace(line)
+	line = bytes.TrimSpace(line)
 	if len(line) == 0 {
 		return nil, nil
 	}
 
 	if line[0] == '*' {
-		return h.readArray(reader, line)
+		count, err := parseLen(line[1:])
+		if err != nil {
+			return nil, err
+		}
+		if count > maxArgs {
+			return nil, fmt.Errorf("invalid multibulk length")
+		}
+		return h.readArray(reader, count)
 	}
 
-	return strings.Fields(line), nil
+	return strings.Fields(string(line)), nil
 }
 
-func (h *RedisHandler) readArray(reader *bufio.Reader, line string) ([]string, error) {
-	count, err := strconv.Atoi(line[1:])
-	if err != nil {
-		return nil, err
+func (h *RedisHandler) readArray(reader *bufio.Reader, count int) ([]string, error) {
+	if count < 0 {
+		count = 0
 	}
-
 	args := make([]string, 0, count)
 
 	for i := 0; i < count; i++ {
-		line, err := reader.ReadString('\n')
+		line, err := readLine(reader)
 		if err != nil {
 			return nil, err
 		}
 
-		line = strings.TrimSpace(line)
+		line = bytes.TrimSpace(line)
 		if len(line) == 0 || line[0] != '$' {
 			return nil, fmt.Errorf("expected bulk string")
 		}
 
-		size, err := strconv.Atoi(line[1:])
+		size, err := parseLen(line[1:])
 		if err != nil {
 			return nil, err
 		}
+		if size < 0 || size > maxBulkLen {
+			return nil, fmt.Errorf("invalid bulk length")
+		}
 
+		// A bulk string that fits the read buffer is copied straight out of
+		// it; a larger one is read into its own buffer.
+		if size+2 <= reader.Size() {
+			b, err := reader.Peek(size + 2)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, string(b[:size]))
+			reader.Discard(size + 2)
+			continue
+		}
 		buf := make([]byte, size+2)
-		_, err = io.ReadFull(reader, buf)
-		if err != nil {
+		if _, err := io.ReadFull(reader, buf); err != nil {
 			return nil, err
 		}
-
 		args = append(args, string(buf[:size]))
 	}
 

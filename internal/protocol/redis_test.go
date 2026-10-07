@@ -685,3 +685,44 @@ func TestStatsCounters(t *testing.T) {
 		}
 	}
 }
+
+// TestBadLengthsDoNotPanic sends negative and oversized lengths, which once
+// crashed the server, and expects error replies.
+func TestBadLengthsDoNotPanic(t *testing.T) {
+	for _, input := range []string{
+		"*1\r\n$-1\r\nX\r\n",
+		"*1\r\n$99999999999\r\n",
+		"*99999999999\r\n",
+		"*-5\r\n",
+	} {
+		server, client := net.Pipe()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			NewRedisHandler(cache.New(nil), "", "").Handle(server)
+		}()
+		client.SetDeadline(time.Now().Add(5 * time.Second))
+		go client.Write([]byte(input))
+		r := bufio.NewReader(client)
+		if input != "*-5\r\n" {
+			line, err := r.ReadString('\n')
+			if err != nil || !strings.HasPrefix(line, "-") {
+				t.Errorf("%q: reply %q, %v; want an error", input, line, err)
+			}
+		}
+		client.Close()
+		<-done
+	}
+
+	for _, input := range []string{"set k 0 0 -1\r\n", "set k 0 0 99999999999\r\n"} {
+		server, client := net.Pipe()
+		go NewMemcacheHandler(cache.New(nil), "").Handle(server)
+		client.SetDeadline(time.Now().Add(5 * time.Second))
+		go client.Write([]byte(input))
+		line, err := bufio.NewReader(client).ReadString('\n')
+		if err != nil || !strings.HasPrefix(line, "CLIENT_ERROR") {
+			t.Errorf("%q: reply %q, %v; want CLIENT_ERROR", input, line, err)
+		}
+		client.Close()
+	}
+}

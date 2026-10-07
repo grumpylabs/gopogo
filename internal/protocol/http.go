@@ -53,7 +53,7 @@ func (h *HTTPHandler) Handle(conn net.Conn) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
-	writer := &httpWriter{Writer: bufio.NewWriter(conn)}
+	writer := &httpWriter{Writer: bufio.NewWriterSize(conn, replyBufferSize)}
 	_, isTLS := conn.(*tls.Conn)
 
 	for {

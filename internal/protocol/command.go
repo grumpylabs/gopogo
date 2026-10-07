@@ -269,19 +269,26 @@ func cmdGet(x *Executor, s *session, name string, args []string) result {
 	entry, found := x.cache.Load([]byte(args[1]))
 	ctr(s.proto).cmdGet.Add(1)
 	countHit(found, &ctr(s.proto).getHits, &ctr(s.proto).getMisses)
+	// GET is the hottest command: render only the reply this protocol sends.
 	if !found {
-		return result{
-			resp: rvNull(),
-			pg:   pgResult{cols: []string{"value"}, tag: "GET 0"},
-			http: &httpResult{404, "Not Found\r\n"},
+		r := result{resp: rvNull()}
+		switch s.proto {
+		case TypePostgres:
+			r.pg = pgResult{cols: []string{"value"}, tag: "GET 0"}
+		case TypeHTTP:
+			r.http = &httpResult{404, "Not Found\r\n"}
 		}
+		return r
 	}
 	val := string(entry.Value())
-	return result{
-		resp: rvBulk(val),
-		pg:   pgRow("value", val, "GET 1"),
-		http: &httpResult{200, val},
+	r := result{resp: rvBulk(val)}
+	switch s.proto {
+	case TypePostgres:
+		r.pg = pgRow("value", val, "GET 1")
+	case TypeHTTP:
+		r.http = &httpResult{200, val}
 	}
+	return r
 }
 
 // parseExpire converts an EX/PX/EXAT/PXAT argument to a TTL.
