@@ -283,6 +283,7 @@ Gopogo logs with zap as one JSON object per line on stderr (`level`, `time`, `ca
 | Metric | Type | Attributes / description |
 |--------|------|-------------|
 | `gopogo.commands` | Counter | `network.protocol.name`, `db.operation.name` (get, set, flush, touch); STATS `cmd_*` |
+| `gopogo.command.duration` | Histogram (s) | Every command's duration, with its span's `db.system.name`, `db.operation.name`, `network.protocol.name` and, when it failed, `error.type`; buckets from 10µs to 1s, and exemplars link samples to their traces |
 | `gopogo.keyspace.lookups` | Counter | `network.protocol.name`, `operation` (get, delete, incr, decr, touch), `result` (hit, miss) |
 | `gopogo.store.rejected` | Counter | `network.protocol.name`, `reason` (no_memory, too_large) |
 | `gopogo.auth.attempts` | Counter | `network.protocol.name`, `result` (success, failure) |

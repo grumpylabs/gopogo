@@ -11,8 +11,11 @@ import (
 
 	"github.com/grumpylabs/gopogo/internal/cache"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -165,5 +168,57 @@ func TestCommandLogs(t *testing.T) {
 	}
 	if got := failed.ContextMap()["error.type"]; got != "ERR" {
 		t.Errorf("error.type = %v", got)
+	}
+}
+
+func TestCommandDurationMetric(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	if err := EnableCommandMetrics(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { commandDuration.Store(nil) })
+
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		beginCommand(ctx, TypeRedis, "10.0.0.1:5000", "GET").end("")
+	}
+	beginCommand(ctx, TypeMemcache, "10.0.0.1:5000", "set").end("")
+	beginCommand(ctx, TypeRedis, "10.0.0.1:5000", "INCR").end("ERR value is not an integer or out of range")
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatal(err)
+	}
+	var hist metricdata.Histogram[float64]
+	found := false
+	for _, sm := range rm.ScopeMetrics {
+		for _, md := range sm.Metrics {
+			if md.Name == "gopogo.command.duration" {
+				if md.Unit != "s" {
+					t.Errorf("unit %q", md.Unit)
+				}
+				hist, found = md.Data.(metricdata.Histogram[float64])
+			}
+		}
+	}
+	if !found {
+		t.Fatal("gopogo.command.duration not reported")
+	}
+	counts := map[string]uint64{}
+	for _, dp := range hist.DataPoints {
+		counts[dp.Attributes.Encoded(attribute.DefaultEncoder())] = dp.Count
+		if len(dp.Bounds) != len(commandDurationBuckets) || dp.Bounds[0] != 0.00001 {
+			t.Errorf("bounds %v", dp.Bounds)
+		}
+	}
+	want := map[string]uint64{
+		"db.operation.name=GET,db.system.name=gopogo,network.protocol.name=redis":                 3,
+		"db.operation.name=set,db.system.name=gopogo,network.protocol.name=memcache":              1,
+		"db.operation.name=INCR,db.system.name=gopogo,error.type=ERR,network.protocol.name=redis": 1,
+	}
+	for k, n := range want {
+		if counts[k] != n {
+			t.Errorf("%s: count %d, want %d (all: %v)", k, counts[k], n, counts)
+		}
 	}
 }

@@ -227,6 +227,10 @@ func runServer(cmd *cobra.Command, args []string) {
 	}
 	if telemetryCfg.Enabled {
 		protocol.EnableTracing()
+		if err := protocol.EnableCommandMetrics(otel.GetMeterProvider()); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to initialize telemetry: %v\n", err)
+			os.Exit(1)
+		}
 	}
 	c.SetMetrics(metrics)
 	metrics.RegisterGauges(

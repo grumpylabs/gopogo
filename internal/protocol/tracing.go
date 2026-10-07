@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
@@ -46,6 +47,31 @@ type commandObs struct {
 	name  string
 }
 
+// commandDuration is the gopogo.command.duration histogram, set by
+// EnableCommandMetrics.
+var commandDuration atomic.Pointer[metric.Float64Histogram]
+
+// commandDurationBuckets suit a cache, whose commands mostly take
+// microseconds: 10us to 1s.
+var commandDurationBuckets = []float64{
+	0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005,
+	0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1,
+}
+
+// EnableCommandMetrics records every command's duration in the
+// gopogo.command.duration histogram, with the same attributes as its span.
+func EnableCommandMetrics(mp metric.MeterProvider) error {
+	h, err := mp.Meter(instrumentationName).Float64Histogram("gopogo.command.duration",
+		metric.WithDescription("Duration of commands handled by the server"),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(commandDurationBuckets...))
+	if err != nil {
+		return err
+	}
+	commandDuration.Store(&h)
+	return nil
+}
+
 // beginCommand starts observing a command. name must already be normalized.
 func beginCommand(ctx context.Context, proto Type, addr, name string) commandObs {
 	ctx, span := startCommandSpan(ctx, proto, addr, name)
@@ -54,12 +80,26 @@ func beginCommand(ctx context.Context, proto Type, addr, name string) commandObs
 
 // end records the command's outcome. errMsg is the error reply, or "".
 func (o commandObs) end(errMsg string) {
+	elapsed := time.Since(o.start)
 	endCommandSpan(o.span, errMsg)
+	if h := commandDuration.Load(); h != nil {
+		attrs := []attribute.KeyValue{
+			semconv.DBSystemNameKey.String(dbSystem),
+			semconv.DBOperationName(o.name),
+			semconv.NetworkProtocolName(o.proto.String()),
+		}
+		if errMsg != "" {
+			attrs = append(attrs, semconv.ErrorTypeKey.String(errorType(errMsg)))
+		}
+		// o.ctx carries the command's span, so the SDK can attach it as an
+		// exemplar.
+		(*h).Record(o.ctx, elapsed.Seconds(), metric.WithAttributes(attrs...))
+	}
 	ce := zap.L().Check(zapcore.DebugLevel, "command")
 	if ce == nil {
 		return
 	}
-	took := time.Since(o.start).Microseconds()
+	took := elapsed.Microseconds()
 	host, port := splitClient(o.addr)
 	// Field names follow the OpenTelemetry semantic conventions, matching
 	// the command's span.
