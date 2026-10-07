@@ -117,9 +117,6 @@ verbose: false
 # debug, info, warn or error. debug logs a record per command (linked to its
 # trace) and cache stats every 30s; with telemetry these become OTLP logs.
 logLevel: info
-# Fraction of successful commands logged at debug level (0-1), to bound log
-# volume. Failed commands are always logged.
-debugLogSample: 1.0
 
 # Extra command-line flags, e.g. ["--tcpnodelay=false"].
 extraArgs: []

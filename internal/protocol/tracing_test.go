@@ -141,11 +141,9 @@ func TestHTTPSpanContinuesTrace(t *testing.T) {
 	}
 }
 
-func TestDebugLogSampleKeepsFailures(t *testing.T) {
+func TestCommandLogs(t *testing.T) {
 	core, logs := observer.New(zapcore.DebugLevel)
 	t.Cleanup(zap.ReplaceGlobals(zap.New(core)))
-	SetDebugLogSample(0)
-	t.Cleanup(func() { SetDebugLogSample(1) })
 
 	ctx := context.Background()
 	for i := 0; i < 50; i++ {
@@ -153,15 +151,19 @@ func TestDebugLogSampleKeepsFailures(t *testing.T) {
 	}
 	beginCommand(ctx, TypeRedis, "10.0.0.1:5000", "INCR").end("ERR value is not an integer or out of range")
 
-	if logs.Len() != 1 {
-		t.Fatalf("got %d records, want only the failure", logs.Len())
+	if logs.Len() != 51 {
+		t.Fatalf("got %d records, want one per command", logs.Len())
 	}
-	e := logs.All()[0]
-	if !strings.HasPrefix(e.Message, "redis INCR failed in ") ||
-		!strings.HasSuffix(e.Message, "from 10.0.0.1: ERR value is not an integer or out of range") {
-		t.Errorf("message %q", e.Message)
+	ok := logs.All()[0]
+	if !strings.HasPrefix(ok.Message, "redis GET ok in ") || !strings.HasSuffix(ok.Message, "us from 10.0.0.1") {
+		t.Errorf("message %q", ok.Message)
 	}
-	if got := e.ContextMap()["error.type"]; got != "ERR" {
+	failed := logs.All()[50]
+	if !strings.HasPrefix(failed.Message, "redis INCR failed in ") ||
+		!strings.HasSuffix(failed.Message, "from 10.0.0.1: ERR value is not an integer or out of range") {
+		t.Errorf("message %q", failed.Message)
+	}
+	if got := failed.ContextMap()["error.type"]; got != "ERR" {
 		t.Errorf("error.type = %v", got)
 	}
 }

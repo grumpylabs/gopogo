@@ -3,8 +3,6 @@ package protocol
 import (
 	"context"
 	"fmt"
-	"math"
-	"math/rand/v2"
 	"net"
 	"strconv"
 	"strings"
@@ -37,18 +35,6 @@ func EnableTracing() {
 	tracingEnabled.Store(true)
 }
 
-// debugLogSample is the fraction of commands logged at debug level, stored
-// as float64 bits.
-var debugLogSample atomic.Uint64
-
-func init() { SetDebugLogSample(1) }
-
-// SetDebugLogSample sets the fraction (0-1) of commands logged at debug
-// level when the log level is debug.
-func SetDebugLogSample(ratio float64) {
-	debugLogSample.Store(math.Float64bits(min(max(ratio, 0), 1)))
-}
-
 // commandObs follows one command: its span, when tracing is on, and a debug
 // log record when debug logging is on and the command is sampled.
 type commandObs struct {
@@ -71,11 +57,6 @@ func (o commandObs) end(errMsg string) {
 	endCommandSpan(o.span, errMsg)
 	ce := zap.L().Check(zapcore.DebugLevel, "command")
 	if ce == nil {
-		return
-	}
-	// Sampling bounds the volume of successful commands; failures are
-	// always logged.
-	if r := math.Float64frombits(debugLogSample.Load()); errMsg == "" && r < 1 && rand.Float64() >= r {
 		return
 	}
 	took := time.Since(o.start).Microseconds()
