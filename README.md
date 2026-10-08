@@ -72,7 +72,7 @@ Boolean flags take `=true` or `=false` (e.g. `--cas=false`); pogocache-style `--
 | `--auth` | `GOPOGO_AUTH` | | Authentication password. The memcache protocol cannot authenticate, so with a password set every memcache command is refused |
 | `--persist` | `GOPOGO_PERSIST` | | Persistence file loaded at startup and saved at shutdown |
 | `--threads` | `GOPOGO_THREADS` | `0` | OS threads running Go code (GOMAXPROCS); 0 uses Go's default, which honors container CPU limits |
-| `--shards` | `GOPOGO_SHARDS` | `16` | Number of cache shards |
+| `--shards` | `GOPOGO_SHARDS` | `256` | Number of cache shards |
 | `--maxmemory` | `GOPOGO_MAXMEMORY` | `80%` | Maximum memory: bytes with a k/m/g/t suffix (e.g. 1GB), a percentage of available memory (e.g. 80%; the container memory limit when set), or 0 for unlimited |
 | `--evict` | `GOPOGO_EVICT` | `yes` | Evict keys when maxmemory is reached; `no` rejects writes instead (`ERR out of memory`) |
 | `--noevict` | `GOPOGO_NOEVICT` | `false` | Same as `--evict=no` |

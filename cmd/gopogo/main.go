@@ -58,7 +58,7 @@ func init() {
 	rootCmd.PersistentFlags().String("persist", "", "Persistence file to load at startup and save at shutdown")
 
 	rootCmd.PersistentFlags().Int("threads", 0, "Number of OS threads running Go code (GOMAXPROCS); 0 uses Go's default, which honors container CPU limits")
-	rootCmd.PersistentFlags().Int("shards", 16, "Number of cache shards")
+	rootCmd.PersistentFlags().Int("shards", 256, "Number of cache shards")
 	rootCmd.PersistentFlags().String("maxmemory", "80%", "Maximum memory: bytes with k/m/g/t suffix (e.g. 1GB), a percentage of available memory (e.g. 80%), or 0 for unlimited")
 	rootCmd.PersistentFlags().String("evict", "yes", "Evict keys when maxmemory is reached (yes/no); no rejects writes instead")
 	rootCmd.PersistentFlags().Bool("autosweep", true, "Enable automatic background sweeping of evicted entries")

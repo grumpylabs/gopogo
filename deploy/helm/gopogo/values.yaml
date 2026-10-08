@@ -32,7 +32,7 @@ cache:
   maxMemory: "80%"
   # Evict entries when full; false rejects writes instead.
   evict: true
-  shards: 16
+  shards: 256
   # Hashmap load factor percent, 55-95.
   loadFactor: 75
   # Assign compare-and-swap tokens on every write (memcache cas, HTTP cas).
