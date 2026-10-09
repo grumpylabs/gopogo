@@ -686,6 +686,19 @@ func TestStatsCounters(t *testing.T) {
 	}
 }
 
+func TestParseLen(t *testing.T) {
+	for in, want := range map[string]int{"0": 0, "7": 7, "-1": -1, "512": 512, "999999999999999999": 999999999999999999} {
+		if n, err := parseLen([]byte(in)); err != nil || n != want {
+			t.Errorf("parseLen(%q) = %d, %v; want %d", in, n, err, want)
+		}
+	}
+	for _, in := range []string{"", "-", "+5", "1x", " 1", "--1", "9999999999999999999"} {
+		if n, err := parseLen([]byte(in)); err == nil {
+			t.Errorf("parseLen(%q) = %d; want an error", in, n)
+		}
+	}
+}
+
 // TestBadLengthsDoNotPanic sends negative and oversized lengths, which once
 // crashed the server, and expects error replies.
 func TestBadLengthsDoNotPanic(t *testing.T) {
@@ -694,6 +707,8 @@ func TestBadLengthsDoNotPanic(t *testing.T) {
 		"*1\r\n$99999999999\r\n",
 		"*99999999999\r\n",
 		"*-5\r\n",
+		"*1x\r\n",
+		"*1\r\n$abc\r\n",
 	} {
 		server, client := net.Pipe()
 		done := make(chan struct{})

@@ -167,6 +167,8 @@ func TestHTTPSpanContinuesTrace(t *testing.T) {
 func TestCommandLogs(t *testing.T) {
 	core, logs := observer.New(zapcore.DebugLevel)
 	t.Cleanup(zap.ReplaceGlobals(zap.New(core)))
+	EnableCommandLogs()
+	t.Cleanup(func() { commandLogs.Store(false) })
 
 	ctx := context.Background()
 	for i := 0; i < 50; i++ {

@@ -32,13 +32,13 @@ func (*captureExporter) ForceFlush(context.Context) error { return nil }
 func TestOTelCoreRecord(t *testing.T) {
 	exp := &captureExporter{}
 	provider := sdklog.NewLoggerProvider(sdklog.WithProcessor(sdklog.NewSimpleProcessor(exp)))
-	core := otelCore{
+	core := &otelCore{
 		LevelEnabler: zapcore.DebugLevel,
 		enc:          zapcore.NewJSONEncoder(encoderConfig()),
 		logger:       provider.Logger("test"),
 	}
 	zap.New(core, zap.AddCaller()).With(zap.String("db.system.name", "gopogo")).
-		Warn("redis GET failed", zap.Int("client.port", 6379), zap.Strings("protocols", []string{"redis", "http"}))
+		Warn("redis GET failed", zap.Int("client.port", 6379), zap.Bool("cached", true), zap.Strings("protocols", []string{"redis", "http"}))
 
 	if len(exp.records) != 1 {
 		t.Fatalf("got %d records", len(exp.records))
@@ -63,6 +63,9 @@ func TestOTelCoreRecord(t *testing.T) {
 	}
 	if v := attrs["client.port"]; v.AsInt64() != 6379 {
 		t.Errorf("client.port = %v", v)
+	}
+	if v := attrs["cached"]; v.Kind() != otellog.KindBool || !v.AsBool() {
+		t.Errorf("cached = %v", v)
 	}
 	if v := attrs["protocols"]; v.Kind() != otellog.KindSlice || len(v.AsSlice()) != 2 {
 		t.Errorf("protocols = %v", v)

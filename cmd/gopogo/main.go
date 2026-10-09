@@ -84,6 +84,7 @@ func init() {
 	rootCmd.PersistentFlags().Bool("verbose", false, "Verbose output, including every telemetry export")
 	rootCmd.PersistentFlags().String("log-level", "info", "Log level: debug, info, warn or error. debug logs every command and cache stats every 30s")
 	rootCmd.PersistentFlags().Bool("version", false, "Show version")
+	rootCmd.PersistentFlags().String("pprof", "", "Serve Go runtime profiles on this loopback address, e.g. localhost:6060 (off when empty)")
 
 	rootCmd.PersistentFlags().Bool("telemetry", false, "Enable OpenTelemetry metrics, traces and logs")
 	rootCmd.PersistentFlags().String("telemetry-exporter", "otlp", "Telemetry exporter (otlp, stdout)")
@@ -245,6 +246,14 @@ func runServer(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	if addr := viper.GetString("pprof"); addr != "" {
+		if _, err := startPprof(addr); err != nil {
+			fmt.Fprintf(os.Stderr, "Option --pprof is invalid: %v\n", err)
+			shutdownTelemetry()
+			os.Exit(1)
+		}
+	}
+
 	persist := viper.GetString("persist")
 	if persist != "" {
 		loadPersist(c, persist)
@@ -281,6 +290,7 @@ func runServer(cmd *cobra.Command, args []string) {
 	}
 
 	if level <= zapcore.DebugLevel {
+		protocol.EnableCommandLogs()
 		go func() {
 			for range time.Tick(30 * time.Second) {
 				protocol.LogStats(c)

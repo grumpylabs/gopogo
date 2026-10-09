@@ -3,6 +3,7 @@ package protocol
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -190,10 +191,30 @@ func readFull(r io.Reader, n int) ([]byte, error) {
 }
 
 // parseLen parses the decimal number after a RESP type byte.
+// parseLen parses a RESP length: an optional minus sign and decimal digits.
+// It does not allocate, unlike strconv.Atoi on a converted string.
 func parseLen(b []byte) (int, error) {
-	n, err := strconv.Atoi(string(b))
-	return n, err
+	digits := b
+	if len(digits) > 0 && digits[0] == '-' {
+		digits = digits[1:]
+	}
+	if len(digits) == 0 || len(digits) > 18 {
+		return 0, errInvalidLen
+	}
+	n := 0
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return 0, errInvalidLen
+		}
+		n = n*10 + int(c-'0')
+	}
+	if len(digits) < len(b) {
+		n = -n
+	}
+	return n, nil
 }
+
+var errInvalidLen = errors.New("invalid length")
 
 func (h *RedisHandler) readCommand(reader *bufio.Reader) ([]string, error) {
 	line, err := readLine(reader)
@@ -208,10 +229,7 @@ func (h *RedisHandler) readCommand(reader *bufio.Reader) ([]string, error) {
 
 	if line[0] == '*' {
 		count, err := parseLen(line[1:])
-		if err != nil {
-			return nil, err
-		}
-		if count > maxArgs {
+		if err != nil || count > maxArgs {
 			return nil, fmt.Errorf("invalid multibulk length")
 		}
 		return h.readArray(reader, count)
@@ -238,10 +256,7 @@ func (h *RedisHandler) readArray(reader *bufio.Reader, count int) ([]string, err
 		}
 
 		size, err := parseLen(line[1:])
-		if err != nil {
-			return nil, err
-		}
-		if size < 0 || size > maxBulkLen {
+		if err != nil || size < 0 || size > maxBulkLen {
 			return nil, fmt.Errorf("invalid bulk length")
 		}
 

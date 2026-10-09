@@ -28,12 +28,18 @@ import (
 
 const instrumentationName = "github.com/grumpylabs/gopogo/internal/protocol"
 
-var tracingEnabled atomic.Bool
+var tracingEnabled, commandLogs atomic.Bool
 
 // EnableTracing turns on command spans. Spans go to the global tracer
 // provider; until this is called no spans are created.
 func EnableTracing() {
 	tracingEnabled.Store(true)
+}
+
+// EnableCommandLogs writes a debug log record for every command, when the
+// global logger has debug enabled.
+func EnableCommandLogs() {
+	commandLogs.Store(true)
 }
 
 // commandObs follows one command: its span, when tracing is on, and a debug
@@ -85,28 +91,85 @@ func EnableCommandMetrics(mp metric.MeterProvider) error {
 	return nil
 }
 
+// metricAttrKey identifies one combination of command metric attributes.
+type metricAttrKey struct {
+	proto   Type
+	name    string
+	errType string
+}
+
+// metricAttrs caches each combination's record options, so recording a
+// command builds and sorts no attribute set. Lookups take no lock; a new
+// combination copies the map. Names are normalized and error types come
+// from the server's own replies, so there are a few hundred at most;
+// maxMetricAttrs bounds the cache regardless.
+var metricAttrs atomic.Pointer[map[metricAttrKey][]metric.RecordOption]
+
+const maxMetricAttrs = 4096
+
+func commandMetricAttrs(proto Type, name, errType string) []metric.RecordOption {
+	key := metricAttrKey{proto, name, errType}
+	cached := metricAttrs.Load()
+	if cached != nil {
+		if opts, ok := (*cached)[key]; ok {
+			return opts
+		}
+	}
+	attrs := []attribute.KeyValue{
+		semconv.DBSystemNameKey.String(dbSystem),
+		semconv.DBOperationName(name),
+		semconv.NetworkProtocolName(proto.String()),
+	}
+	if errType != "" {
+		attrs = append(attrs, semconv.ErrorTypeKey.String(errType))
+	}
+	opts := []metric.RecordOption{metric.WithAttributeSet(attribute.NewSet(attrs...))}
+	if cached != nil && len(*cached) >= maxMetricAttrs {
+		return opts
+	}
+	// A racing writer may drop this entry or another's; either is rebuilt
+	// on its next use.
+	next := make(map[metricAttrKey][]metric.RecordOption, 1)
+	if cached != nil {
+		next = make(map[metricAttrKey][]metric.RecordOption, len(*cached)+1)
+		for k, v := range *cached {
+			next[k] = v
+		}
+	}
+	next[key] = opts
+	metricAttrs.Store(&next)
+	return opts
+}
+
 // beginCommand starts observing a command. name must already be normalized.
+// With no spans, metrics or command logs it records nothing, not even the
+// time.
 func beginCommand(ctx context.Context, proto Type, addr, name string) commandObs {
+	if !tracingEnabled.Load() && commandDuration.Load() == nil && !commandLogs.Load() {
+		return commandObs{}
+	}
 	ctx, span := startCommandSpan(ctx, proto, addr, name)
 	return commandObs{ctx: ctx, span: span, start: time.Now(), proto: proto, addr: addr, name: name}
 }
 
 // end records the command's outcome. errMsg is the error reply, or "".
 func (o commandObs) end(errMsg string) {
+	if o.start.IsZero() {
+		return
+	}
 	elapsed := time.Since(o.start)
 	endCommandSpan(o.span, errMsg)
 	if h := commandDuration.Load(); h != nil {
-		attrs := []attribute.KeyValue{
-			semconv.DBSystemNameKey.String(dbSystem),
-			semconv.DBOperationName(o.name),
-			semconv.NetworkProtocolName(o.proto.String()),
-		}
+		errType := ""
 		if errMsg != "" {
-			attrs = append(attrs, semconv.ErrorTypeKey.String(errorType(errMsg)))
+			errType = errorType(errMsg)
 		}
 		// o.ctx carries the command's span, so the SDK can attach it as an
 		// exemplar.
-		(*h).Record(o.ctx, elapsed.Seconds(), metric.WithAttributes(attrs...))
+		(*h).Record(o.ctx, elapsed.Seconds(), commandMetricAttrs(o.proto, o.name, errType)...)
+	}
+	if !commandLogs.Load() {
+		return
 	}
 	ce := zap.L().Check(zapcore.DebugLevel, "command")
 	if ce == nil {

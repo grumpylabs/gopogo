@@ -81,18 +81,18 @@ func NewLogger(ctx context.Context, cfg *Config) (*Logger, error) {
 func (l *Logger) Install(level zapcore.Level) *zap.Logger {
 	enabled := zap.NewAtomicLevelAt(level)
 	enc := zapcore.NewJSONEncoder(encoderConfig())
-	stderr := zapcore.NewCore(enc, zapcore.Lock(os.Stderr), enabled)
-	stderrLogger.Store(zap.New(traceCore{stderr}, zap.AddCaller()))
+	stderr := zapcore.NewCore(enc, stderrSyncer(), enabled)
+	stderrLogger.Store(zap.New(&traceCore{stderr}, zap.AddCaller()))
 
 	core := stderr
 	if l.provider != nil {
-		core = zapcore.NewTee(stderr, otelCore{
+		core = zapcore.NewTee(stderr, &otelCore{
 			LevelEnabler: enabled,
 			enc:          enc.Clone(),
 			logger:       l.provider.Logger("github.com/grumpylabs/gopogo"),
 		})
 	}
-	logger := zap.New(traceCore{core}, zap.AddCaller())
+	logger := zap.New(&traceCore{core}, zap.AddCaller())
 	zap.ReplaceGlobals(logger)
 	zap.RedirectStdLog(logger)
 
@@ -100,6 +100,18 @@ func (l *Logger) Install(level zapcore.Level) *zap.Logger {
 		stderrLogger.Load().Error("telemetry error", zap.Error(err))
 	}))
 	return logger
+}
+
+// stderrSyncer buffers stderr: with debug logging every command is an
+// entry, and a write per entry serializes all connections on one lock and
+// one syscall. Entries reach stderr within a second, at once for panics and
+// fatal errors, and on Sync at shutdown.
+func stderrSyncer() zapcore.WriteSyncer {
+	return &zapcore.BufferedWriteSyncer{
+		WS:            zapcore.AddSync(os.Stderr),
+		Size:          256 << 10,
+		FlushInterval: time.Second,
+	}
 }
 
 func encoderConfig() zapcore.EncoderConfig {
@@ -129,12 +141,12 @@ type otelCore struct {
 	logger otellog.Logger
 }
 
-func (c otelCore) With(fields []zapcore.Field) zapcore.Core {
+func (c *otelCore) With(fields []zapcore.Field) zapcore.Core {
 	enc := c.enc.Clone()
 	for _, f := range fields {
 		f.AddTo(enc)
 	}
-	return otelCore{
+	return &otelCore{
 		LevelEnabler: c.LevelEnabler,
 		enc:          enc,
 		with:         append(c.with[:len(c.with):len(c.with)], fields...),
@@ -142,14 +154,14 @@ func (c otelCore) With(fields []zapcore.Field) zapcore.Core {
 	}
 }
 
-func (c otelCore) Check(e zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+func (c *otelCore) Check(e zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
 	if c.Enabled(e.Level) {
 		return ce.AddCore(e, c)
 	}
 	return ce
 }
 
-func (c otelCore) Write(e zapcore.Entry, fields []zapcore.Field) error {
+func (c *otelCore) Write(e zapcore.Entry, fields []zapcore.Field) error {
 	buf, err := c.enc.EncodeEntry(e, fields)
 	if err != nil {
 		return err
@@ -157,31 +169,61 @@ func (c otelCore) Write(e zapcore.Entry, fields []zapcore.Field) error {
 	body := strings.TrimSuffix(buf.String(), "\n")
 	buf.Free()
 
+	// Strings and integers, nearly every field, convert directly; others
+	// go through zap's map encoder. Debug logging writes an entry per
+	// command, so this avoids a map and its entries per entry.
 	ctx := context.Background()
-	attrs := zapcore.NewMapObjectEncoder()
-	for _, f := range append(c.with[:len(c.with):len(c.with)], fields...) {
-		if fc, ok := f.Interface.(context.Context); ok {
-			ctx = fc
-			continue
+	kvs := make([]otellog.KeyValue, 0, len(c.with)+len(fields)+3)
+	var other *zapcore.MapObjectEncoder
+	for _, list := range [2][]zapcore.Field{c.with, fields} {
+		for _, f := range list {
+			if fc, ok := f.Interface.(context.Context); ok {
+				ctx = fc
+				continue
+			}
+			if kv, ok := simpleAttr(f); ok {
+				kvs = append(kvs, kv)
+				continue
+			}
+			if other == nil {
+				other = zapcore.NewMapObjectEncoder()
+			}
+			f.AddTo(other)
 		}
-		f.AddTo(attrs)
+	}
+	if other != nil {
+		for k, v := range other.Fields {
+			kvs = append(kvs, otellog.KeyValue{Key: k, Value: logValue(v)})
+		}
+	}
+	if e.Caller.Defined {
+		kvs = append(kvs,
+			otellog.String(string(semconv.CodeFilePathKey), e.Caller.File),
+			otellog.Int(string(semconv.CodeLineNumberKey), e.Caller.Line),
+			otellog.String(string(semconv.CodeFunctionNameKey), e.Caller.Function))
 	}
 	var r otellog.Record
 	r.SetTimestamp(e.Time)
 	r.SetSeverity(severity(e.Level))
 	r.SetSeverityText(e.Level.CapitalString())
 	r.SetBody(otellog.StringValue(body))
-	for k, v := range attrs.Fields {
-		r.AddAttributes(otellog.KeyValue{Key: k, Value: logValue(v)})
-	}
-	if e.Caller.Defined {
-		r.AddAttributes(
-			otellog.String(string(semconv.CodeFilePathKey), e.Caller.File),
-			otellog.Int(string(semconv.CodeLineNumberKey), e.Caller.Line),
-			otellog.String(string(semconv.CodeFunctionNameKey), e.Caller.Function))
-	}
+	r.AddAttributes(kvs...)
 	c.logger.Emit(ctx, r)
 	return nil
+}
+
+// simpleAttr converts a string, integer or bool field, the types that
+// encode the same in zap's map encoder.
+func simpleAttr(f zapcore.Field) (otellog.KeyValue, bool) {
+	switch f.Type {
+	case zapcore.StringType:
+		return otellog.String(f.Key, f.String), true
+	case zapcore.Int64Type, zapcore.Int32Type, zapcore.Int16Type, zapcore.Int8Type:
+		return otellog.Int64(f.Key, f.Integer), true
+	case zapcore.BoolType:
+		return otellog.Bool(f.Key, f.Integer == 1), true
+	}
+	return otellog.KeyValue{}, false
 }
 
 // logValue converts a value from zap's map encoder.
@@ -226,7 +268,7 @@ func logValue(v any) otellog.Value {
 	}
 }
 
-func (otelCore) Sync() error { return nil }
+func (*otelCore) Sync() error { return nil }
 
 func severity(l zapcore.Level) otellog.Severity {
 	switch {
@@ -249,18 +291,18 @@ type traceCore struct {
 	zapcore.Core
 }
 
-func (c traceCore) With(fields []zapcore.Field) zapcore.Core {
-	return traceCore{c.Core.With(fields)}
+func (c *traceCore) With(fields []zapcore.Field) zapcore.Core {
+	return &traceCore{c.Core.With(fields)}
 }
 
-func (c traceCore) Check(e zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+func (c *traceCore) Check(e zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
 	if c.Enabled(e.Level) {
 		return ce.AddCore(e, c)
 	}
 	return ce
 }
 
-func (c traceCore) Write(e zapcore.Entry, fields []zapcore.Field) error {
+func (c *traceCore) Write(e zapcore.Entry, fields []zapcore.Field) error {
 	for _, f := range fields {
 		ctx, ok := f.Interface.(context.Context)
 		if !ok {

@@ -83,6 +83,7 @@ Boolean flags take `=true` or `=false` (e.g. `--cas=false`); pogocache-style `--
 | `--sweepinterval` | `GOPOGO_SWEEPINTERVAL` | `10s` | Sweep interval |
 | `--log-level` | `GOPOGO_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`; `debug` logs every command and cache stats |
 | `--verbose` | `GOPOGO_VERBOSE` | `false` | Log telemetry exports and other detail |
+| `--pprof` | `GOPOGO_PPROF` | (off) | Serve Go runtime profiles at `/debug/pprof/` on a loopback address such as `localhost:6060`; reach it with `kubectl port-forward` |
 | `--telemetry` | `GOPOGO_TELEMETRY` | `false` | Enable OpenTelemetry metrics, traces and logs (see Telemetry) |
 | `--telemetry-exporter` | `GOPOGO_TELEMETRY_EXPORTER` | `otlp` | Exporter type (otlp, stdout) |
 | `--metrics-exporter` | `GOPOGO_METRICS_EXPORTER` | `--telemetry-exporter` | Metrics exporter (otlp, stdout, none) |
@@ -275,6 +276,8 @@ Every command runs in a server span named after the command (`GET`, `SET`, memca
 ### Logs
 
 `--log-level debug` adds a debug record per command, such as `redis SET ok in 91us from 10.42.6.21` or `redis INCR failed in 64us from 10.42.6.21: ERR value is not an integer or out of range`. Its fields use the span's attribute names (`db.system.name`, `db.operation.name`, `network.protocol.name`, `client.address`, `client.port`, and `error.type` and `exception.message` when it failed) plus `duration_us`, and it is written with the command's span context so each record links to its trace. Every 30 seconds a stats record summarizes the cache (`cache holds 1234 items in 5.2 MiB; 9000 gets (87.5% hits), ...`) with the counters as fields. Exported log records also carry each field as an attribute, and `code.file.path`, `code.line.number` and `code.function.name`.
+
+A debug record per command costs CPU: with telemetry on, it roughly triples the CPU per command under heavy load, so leave `--log-level debug` for low traffic or investigation. Stderr is buffered and flushed every second, and immediately for panics and fatal errors.
 
 Gopogo logs with zap as one JSON object per line on stderr (`level`, `time`, `caller`, `msg`, then the fields), including startup and shutdown events and `--verbose` output such as telemetry export results. Records logged in a traced command also carry `trace_id` and `span_id`. With `--telemetry`, each entry is also exported as an OpenTelemetry log record whose body is that same JSON line, with the matching severity and, for command records, the command's trace and span. OpenTelemetry's own error reports and the `--verbose` log-export results go to stderr only, so a failing log export cannot feed itself.
 
