@@ -213,11 +213,11 @@ func (c *pgConn) startup() error {
 	return nil
 }
 
-// isTLSConn reports whether conn (possibly wrapped by the protocol detector)
-// is already a TLS connection.
+// isTLSConn reports whether conn (possibly carrying input read before the
+// protocol was known) is already a TLS connection.
 func isTLSConn(conn net.Conn) bool {
-	if dc, ok := conn.(*detectorConn); ok {
-		conn = dc.Conn
+	if pc, ok := conn.(*prefixConn); ok {
+		conn = pc.Conn
 	}
 	_, ok := conn.(*tls.Conn)
 	return ok

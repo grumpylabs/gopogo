@@ -57,7 +57,7 @@ func init() {
 	rootCmd.PersistentFlags().String("auth", "", "Authentication password")
 	rootCmd.PersistentFlags().String("persist", "", "Persistence file to load at startup and save at shutdown")
 
-	rootCmd.PersistentFlags().Int("threads", 0, "Number of OS threads running Go code (GOMAXPROCS); 0 uses Go's default, which honors container CPU limits")
+	rootCmd.PersistentFlags().Int("threads", 0, "Threads serving connections: event loops on Linux, and GOMAXPROCS (one more with event loops); 0 uses Go's default, which honors container CPU limits")
 	rootCmd.PersistentFlags().Int("shards", 256, "Number of cache shards")
 	rootCmd.PersistentFlags().String("maxmemory", "80%", "Maximum memory: bytes with k/m/g/t suffix (e.g. 1GB), a percentage of available memory (e.g. 80%), or 0 for unlimited")
 	rootCmd.PersistentFlags().String("evict", "yes", "Evict keys when maxmemory is reached (yes/no); no rejects writes instead")
@@ -73,6 +73,7 @@ func init() {
 	rootCmd.PersistentFlags().Bool("reuseport", false, "Set SO_REUSEPORT on listening sockets")
 	rootCmd.PersistentFlags().Bool("tcpnodelay", true, "Disable Nagle's algorithm")
 	rootCmd.PersistentFlags().Bool("quickack", false, "Enable TCP quick acks (Linux)")
+	rootCmd.PersistentFlags().Bool("eventloops", true, "Serve plain connections from one epoll loop per thread (Linux); false gives each connection a goroutine")
 
 	rootCmd.PersistentFlags().Bool("http", false, "Enable HTTP protocol")
 	rootCmd.PersistentFlags().Bool("memcache", false, "Enable Memcache protocol")
@@ -234,8 +235,10 @@ func runServer(cmd *cobra.Command, args []string) {
 			fmt.Fprintf(os.Stderr, "Failed to initialize telemetry: %v\n", err)
 			os.Exit(1)
 		}
+		// Cache operation metrics time every load and store; without
+		// telemetry the cache skips the clock reads.
+		c.SetMetrics(metrics)
 	}
-	c.SetMetrics(metrics)
 	metrics.RegisterGauges(
 		func() int64 { return c.MemUsed() },
 		func() int64 { return int64(c.NumItems()) },
@@ -274,6 +277,7 @@ func runServer(cmd *cobra.Command, args []string) {
 		ReusePort:  viper.GetBool("reuseport"),
 		TCPNoDelay: viper.GetBool("tcpnodelay"),
 		QuickAck:   viper.GetBool("quickack"),
+		EventLoops: viper.GetBool("eventloops"),
 		HTTP:     viper.GetBool("http"),
 		Memcache: viper.GetBool("memcache"),
 		Postgres: viper.GetBool("postgres"),

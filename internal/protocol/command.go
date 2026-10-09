@@ -53,6 +53,7 @@ type session struct {
 type rv struct {
 	kind byte // '+' status, '-' error, ':' int, 'u' uint, '$' bulk, '_' null, '*' array
 	s    string
+	b    []byte // a bulk value, used instead of s when not nil
 	n    int64
 	u    uint64
 	arr  []rv
@@ -179,8 +180,9 @@ func (x *Executor) exec(s *session, args []string) result {
 		return errResult("ERR empty command")
 	}
 	name := strings.ToUpper(args[0])
+	fn := commands[name]
 	spanName := name
-	if commands[name] == nil {
+	if fn == nil {
 		spanName = "UNKNOWN"
 	}
 	parent := s.ctx
@@ -188,19 +190,19 @@ func (x *Executor) exec(s *session, args []string) result {
 		parent = context.Background()
 	}
 	obs := beginCommand(parent, s.proto, s.addr, spanName)
-	r := x.run(s, name, args)
+	r := x.run(s, name, fn, args)
 	obs.end(r.err)
 	return r
 }
 
-// run executes a command whose name is already upper-cased.
-func (x *Executor) run(s *session, name string, args []string) result {
+// run executes command fn, nil for an unknown command, whose name is
+// already upper-cased.
+func (x *Executor) run(s *session, name string, fn commandFunc, args []string) result {
 	if !s.authed && name != "AUTH" {
 		countAuth(s.proto, false)
 		return errResult("NOAUTH Authentication required.")
 	}
 	monitors.publish(s.addr, args)
-	fn := commands[name]
 	if fn == nil {
 		return errResult(fmt.Sprintf("ERR unknown command '%s'", args[0]))
 	}
@@ -280,13 +282,17 @@ func cmdGet(x *Executor, s *session, name string, args []string) result {
 		}
 		return r
 	}
-	val := string(entry.Value())
-	r := result{resp: rvBulk(val)}
+	// RESP writes the value straight from the entry; values are replaced,
+	// never changed in place, so the bytes stay valid.
+	r := result{resp: rv{kind: '$', b: entry.Value()}}
+	if r.resp.b == nil {
+		r.resp.b = []byte{}
+	}
 	switch s.proto {
 	case TypePostgres:
-		r.pg = pgRow("value", val, "GET 1")
+		r.pg = pgRow("value", string(r.resp.b), "GET 1")
 	case TypeHTTP:
-		r.http = &httpResult{200, val}
+		r.http = &httpResult{200, string(r.resp.b)}
 	}
 	return r
 }
@@ -402,22 +408,35 @@ func cmdSet(x *Executor, s *session, name string, args []string) result {
 		stored = res != cache.NotStored
 	}
 
-	r := result{pg: pgTag(name + " 0"), http: &httpResult{404, "Not Found\r\n"}}
-	if stored {
-		r.pg = pgTag(name + " 1")
-		r.http = &httpResult{200, "Stored\r\n"}
-	}
+	// Render only the reply this protocol sends; SET is a hot command.
+	var r result
 	switch {
 	case get && old != nil:
 		r.resp = rvBulk(*old)
-		r.pg = pgRow("value", *old, name+" 1")
 	case get:
 		r.resp = rvNull()
-		r.pg = pgResult{cols: []string{"value"}, tag: name + " 0"}
 	case stored:
 		r.resp = rvOK()
 	default:
 		r.resp = rvNull()
+	}
+	switch s.proto {
+	case TypePostgres:
+		r.pg = pgTag(name + " 0")
+		if stored {
+			r.pg = pgTag(name + " 1")
+		}
+		switch {
+		case get && old != nil:
+			r.pg = pgRow("value", *old, name+" 1")
+		case get:
+			r.pg = pgResult{cols: []string{"value"}, tag: name + " 0"}
+		}
+	case TypeHTTP:
+		r.http = &httpResult{404, "Not Found\r\n"}
+		if stored {
+			r.http = &httpResult{200, "Stored\r\n"}
+		}
 	}
 	return r
 }

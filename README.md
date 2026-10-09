@@ -5,6 +5,7 @@ Gopogo is a fast caching server built from scratch with a focus on low latency a
 ## Features
 
 - **Multiple Protocol Support**: Redis, HTTP, Memcache, and PostgreSQL wire protocols with auto-detection
+- **Event Loops**: On Linux, one epoll loop per thread serves plain connections, as in pogocache, for about pogocache's CPU per request
 - **Robin Hood Hashing**: Cache-friendly open addressing with configurable load factor (55-95%)
 - **Sharded Architecture**: 256 shards by default with upper-bit hash decorrelation for concurrent access
 - **2-Random LRU Eviction**: Access-time-based eviction matching pogocache's algorithm
@@ -71,7 +72,8 @@ Boolean flags take `=true` or `=false` (e.g. `--cas=false`); pogocache-style `--
 | `-s, --socket` | `GOPOGO_SOCKET` | | Unix socket path |
 | `--auth` | `GOPOGO_AUTH` | | Authentication password. The memcache protocol cannot authenticate, so with a password set every memcache command is refused |
 | `--persist` | `GOPOGO_PERSIST` | | Persistence file loaded at startup and saved at shutdown |
-| `--threads` | `GOPOGO_THREADS` | `0` | OS threads running Go code (GOMAXPROCS); 0 uses Go's default, which honors container CPU limits |
+| `--threads` | `GOPOGO_THREADS` | `0` | Threads serving connections: the number of event loops on Linux, and GOMAXPROCS (one more with event loops); 0 uses Go's default, which honors container CPU limits |
+| `--eventloops` | `GOPOGO_EVENTLOOPS` | `true` | Serve plain TCP and Unix socket connections from one epoll loop per thread (Linux); `false` gives each connection a goroutine, as on other platforms |
 | `--shards` | `GOPOGO_SHARDS` | `256` | Number of cache shards |
 | `--maxmemory` | `GOPOGO_MAXMEMORY` | `80%` | Maximum memory: bytes with a k/m/g/t suffix (e.g. 1GB), a percentage of available memory (e.g. 80%; the container memory limit when set), or 0 for unlimited |
 | `--evict` | `GOPOGO_EVICT` | `yes` | Evict keys when maxmemory is reached; `no` rejects writes instead (`ERR out of memory`) |
@@ -322,6 +324,7 @@ The `gopogo.*` counters count client commands like STATS does; the `cache.*` eng
 4. **2-Random LRU Eviction**: Samples 2 random entries (skipping the inserting entry's hash), prefers expired entries, falls back to oldest access time.
 5. **Persistence**: LZ4-compressed blocks with 16-byte headers (`POGO` magic + CRC32 + sizes). One block per shard. Atomic writes via temp file + rename.
 6. **Callbacks**: Eviction callback with reason codes (expired, lowmem, cleared). Notify callback for all mutations (insert, replace, delete). Load-with-update and delete-with-cancel callbacks.
+7. **Connections**: Each protocol is a state machine over bytes: it consumes complete requests from a connection's input and appends the replies, without blocking. On Linux, `--threads` event loops (one OS thread each) wait in epoll for any of their connections, then read, process and write each with one syscall per batch, as pogocache does. Go's own poller instead parks and wakes a goroutine per request, which costs a failed read and scheduler work every time. TLS connections, Postgres (which can upgrade to TLS) and MONITOR streams move to a goroutine of their own; other platforms, and `--eventloops=false`, give every connection a goroutine running the same state machine. Plain `GET key` and `SET key value` over RESP take a path that skips argument strings and the command table, as pogocache's do.
 
 ## Building
 

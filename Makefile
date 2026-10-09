@@ -77,7 +77,7 @@ bench: ## Run performance benchmarks
 	@go test -bench=. -benchmem ./...
 
 FUZZTIME ?= 60s
-FUZZ_TARGETS := FuzzRESP FuzzMemcache FuzzHTTP FuzzPostgres FuzzDetect
+FUZZ_TARGETS := FuzzRESP FuzzMemcache FuzzHTTP FuzzPostgres FuzzDetect FuzzSplit
 
 fuzz: ## Fuzz each protocol parser for FUZZTIME (default 60s)
 	@for t in $(FUZZ_TARGETS); do \

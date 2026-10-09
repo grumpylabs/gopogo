@@ -1,7 +1,6 @@
 package protocol
 
 import (
-	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -24,147 +23,152 @@ func NewRedisHandler(cache *cache.Cache, auth, persist string) *RedisHandler {
 	return &RedisHandler{exec: NewExecutor(cache, auth, persist)}
 }
 
+// Handle serves a connection known to speak RESP and closes it.
 func (h *RedisHandler) Handle(conn net.Conn) {
-	defer conn.Close()
+	c := NewConn(&Handlers{Redis: h}, conn.RemoteAddr().String(), false)
+	c.proto = TypeRedis
+	serve(conn, c)
+}
 
-	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriterSize(conn, replyBufferSize)
-	s := &session{
-		proto:  TypeRedis,
-		addr:   conn.RemoteAddr().String(),
-		authed: h.exec.auth == "",
+// process runs the complete commands at the start of in. A command that
+// turns the connection into a MONITOR stream ends with a Takeover.
+func (h *RedisHandler) process(c *Conn, in, out []byte) (int, []byte, Action) {
+	if c.redis == nil {
+		c.redis = &session{proto: TypeRedis, addr: c.addr, authed: h.exec.auth == ""}
 	}
-
-	for {
-		cmd, err := h.readCommand(reader)
+	pos := 0
+	for pos < len(in) && len(out) < outputLimit {
+		argv, n, err := c.scanRESP(in[pos:])
 		if err != nil {
-			if err != io.EOF {
-				writeRESP(writer, rv{kind: '-', s: err.Error()})
-				writer.Flush()
-			}
-			return
+			return pos, appendRESP(out, rv{kind: '-', s: err.Error()}), Close
 		}
-		if len(cmd) == 0 {
+		if n == 0 {
+			break
+		}
+		pos += n
+		if len(argv) == 0 {
 			continue
 		}
-
-		r := h.exec.exec(s, cmd)
-		var lines chan string
+		if o, ok := h.fast(c, argv, out); ok {
+			out = o
+			continue
+		}
+		r := h.exec.exec(c.redis, argStrings(argv))
 		if r.monitor {
 			// Subscribe before replying so no command after the OK is missed.
-			lines = monitors.subscribe()
+			c.monitor = monitors.subscribe()
 		}
 		if r.err != "" {
-			writeRESP(writer, rv{kind: '-', s: r.err})
+			out = appendRESP(out, rv{kind: '-', s: r.err})
 		} else {
-			writeRESP(writer, r.resp)
-		}
-		// Reply to a pipelined batch with one write: flush once no further
-		// command is already buffered.
-		if reader.Buffered() == 0 || r.quit || r.monitor {
-			writer.Flush()
+			out = appendRESP(out, r.resp)
 		}
 		if r.quit {
-			return
+			return pos, out, Close
 		}
 		if r.monitor {
-			h.monitor(reader, writer, lines)
-			return
+			return pos, out, Takeover
 		}
 	}
+	return pos, out, Continue
 }
 
 // monitor streams the subscribed command lines until the client sends QUIT
-// or disconnects. Other input is ignored.
-func (h *RedisHandler) monitor(reader *bufio.Reader, writer *bufio.Writer, lines chan string) {
+// or disconnects. Other input is ignored. in is input already read.
+func (h *RedisHandler) monitor(nc net.Conn, in []byte, lines chan string) {
 	defer monitors.unsubscribe(lines)
 
 	quit := make(chan bool, 1) // true: client sent QUIT
 	go func() {
+		parser := &Conn{}
+		buf := append([]byte(nil), in...)
+		chunk := make([]byte, 4096)
 		for {
-			cmd, err := h.readCommand(reader)
-			if err != nil {
+			for {
+				args, n, err := parser.parseRESP(buf)
+				if err != nil {
+					quit <- false
+					return
+				}
+				if n == 0 {
+					break
+				}
+				buf = buf[n:]
+				if len(args) > 0 && strings.EqualFold(args[0], "QUIT") {
+					quit <- true
+					return
+				}
+			}
+			n, err := nc.Read(chunk)
+			if n == 0 && err != nil {
 				quit <- false
 				return
 			}
-			if len(cmd) > 0 && strings.EqualFold(cmd[0], "QUIT") {
-				quit <- true
-				return
-			}
+			buf = append(buf, chunk[:n]...)
 		}
 	}()
 
+	var out []byte
 	for {
 		select {
 		case line := <-lines:
-			writer.WriteString(line)
+			out = append(out[:0], line...)
 			// Batch whatever else is queued into one write.
 			for n := len(lines); n > 0; n-- {
-				writer.WriteString(<-lines)
+				out = append(out, <-lines...)
 			}
-			if writer.Flush() != nil {
+			if _, err := nc.Write(out); err != nil {
 				return
 			}
 		case sentQuit := <-quit:
 			if sentQuit {
-				writeRESP(writer, rvOK())
-				writer.Flush()
+				nc.Write(appendRESP(nil, rvOK()))
 			}
 			return
 		}
 	}
 }
 
-// writeRESP writes v in RESP2. Unsigned values are written as simple
+// appendRESP appends v in RESP2. Unsigned values are written as simple
 // strings, as pogocache does, since they may not fit a RESP integer.
-func writeRESP(w *bufio.Writer, v rv) {
+func appendRESP(b []byte, v rv) []byte {
 	switch v.kind {
 	case '+', '-':
-		w.WriteByte(v.kind)
-		w.WriteString(v.s)
-		w.WriteString("\r\n")
+		b = append(b, v.kind)
+		b = append(b, v.s...)
+		return append(b, '\r', '\n')
 	case ':':
-		writeRESPHeader(w, ':', v.n)
+		return appendRESPHeader(b, ':', v.n)
 	case 'u':
-		var b [24]byte
-		w.Write(append(strconv.AppendUint(append(b[:0], '+'), v.u, 10), '\r', '\n'))
+		b = strconv.AppendUint(append(b, '+'), v.u, 10)
+		return append(b, '\r', '\n')
 	case '$':
-		writeRESPHeader(w, '$', int64(len(v.s)))
-		w.WriteString(v.s)
-		w.WriteString("\r\n")
-	case '_':
-		w.WriteString("$-1\r\n")
-	case '*':
-		writeRESPHeader(w, '*', int64(len(v.arr)))
-		for _, e := range v.arr {
-			writeRESP(w, e)
+		if v.b != nil {
+			b = appendRESPHeader(b, '$', int64(len(v.b)))
+			b = append(b, v.b...)
+		} else {
+			b = appendRESPHeader(b, '$', int64(len(v.s)))
+			b = append(b, v.s...)
 		}
+		return append(b, '\r', '\n')
+	case '_':
+		return append(b, "$-1\r\n"...)
+	case '*':
+		b = appendRESPHeader(b, '*', int64(len(v.arr)))
+		for _, e := range v.arr {
+			b = appendRESP(b, e)
+		}
+		return b
 	default:
-		panic(fmt.Sprintf("writeRESP: unknown kind %q", v.kind))
+		panic(fmt.Sprintf("appendRESP: unknown kind %q", v.kind))
 	}
 }
 
-// writeRESPHeader writes a type byte, a number and CRLF without allocating.
-func writeRESPHeader(w *bufio.Writer, kind byte, n int64) {
-	var b [24]byte
-	w.Write(append(strconv.AppendInt(append(b[:0], kind), n, 10), '\r', '\n'))
+// appendRESPHeader appends a type byte, a number and CRLF.
+func appendRESPHeader(b []byte, kind byte, n int64) []byte {
+	b = strconv.AppendInt(append(b, kind), n, 10)
+	return append(b, '\r', '\n')
 }
-
-// readLine returns the next line, CRLF included. The slice is only valid
-// until the next read, unless the line overflowed the buffer.
-func readLine(reader *bufio.Reader) ([]byte, error) {
-	line, err := reader.ReadSlice('\n')
-	if err != bufio.ErrBufferFull {
-		return line, err
-	}
-	long := append([]byte(nil), line...)
-	rest, err := reader.ReadBytes('\n')
-	return append(long, rest...), err
-}
-
-// replyBufferSize is each connection's reply buffer, Redis's 16 KiB, so a
-// pipelined batch of typical replies goes out in one write.
-const replyBufferSize = 16 << 10
 
 // Limits on client-supplied lengths, as in Redis: a bad or hostile length
 // gets an error instead of a huge or negative allocation.
@@ -190,7 +194,6 @@ func readFull(r io.Reader, n int) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-// parseLen parses the decimal number after a RESP type byte.
 // parseLen parses a RESP length: an optional minus sign and decimal digits.
 // It does not allocate, unlike strconv.Atoi on a converted string.
 func parseLen(b []byte) (int, error) {
@@ -214,72 +217,102 @@ func parseLen(b []byte) (int, error) {
 	return n, nil
 }
 
-var errInvalidLen = errors.New("invalid length")
+var (
+	errInvalidLen      = errors.New("invalid length")
+	errMultibulkLen    = errors.New("invalid multibulk length")
+	errBulkLen         = errors.New("invalid bulk length")
+	errExpectedBulk    = errors.New("expected bulk string")
+	errTooBigInline    = errors.New("too big inline request")
+	errTooBigMultibulk = errors.New("too big multibulk request")
+)
 
-func (h *RedisHandler) readCommand(reader *bufio.Reader) ([]string, error) {
-	line, err := readLine(reader)
-	if err != nil {
-		return nil, err
+// parseRESP parses one command at the start of b: a RESP array of bulk
+// strings, or an inline command line. It returns the arguments and the
+// bytes consumed, or 0 consumed when b holds only part of a command. A
+// blank line is consumed with no arguments.
+func (c *Conn) parseRESP(b []byte) ([]string, int, error) {
+	argv, n, err := c.scanRESP(b)
+	if err != nil || n == 0 {
+		return nil, n, err
 	}
-
-	line = bytes.TrimSpace(line)
-	if len(line) == 0 {
-		return nil, nil
-	}
-
-	if line[0] == '*' {
-		count, err := parseLen(line[1:])
-		if err != nil || count > maxArgs {
-			return nil, fmt.Errorf("invalid multibulk length")
-		}
-		return h.readArray(reader, count)
-	}
-
-	return strings.Fields(string(line)), nil
+	return argStrings(argv), n, nil
 }
 
-func (h *RedisHandler) readArray(reader *bufio.Reader, count int) ([]string, error) {
-	if count < 0 {
-		count = 0
+// scanRESP is parseRESP without copying: the arguments are slices of b,
+// valid until the next call.
+func (c *Conn) scanRESP(b []byte) ([][]byte, int, error) {
+	clear(c.argv)
+	argv := c.argv[:0]
+	i := bytes.IndexByte(b, '\n')
+	if i < 0 {
+		if len(b) > maxLine {
+			return nil, 0, errTooBigInline
+		}
+		return nil, 0, nil
 	}
-	args := make([]string, 0, count)
-
-	for i := 0; i < count; i++ {
-		line, err := readLine(reader)
-		if err != nil {
-			return nil, err
+	line := bytes.TrimSpace(b[:i+1])
+	if len(line) == 0 {
+		return argv, i + 1, nil
+	}
+	if line[0] != '*' {
+		c.argv = append(argv, bytes.Fields(line)...)
+		return c.argv, i + 1, nil
+	}
+	count, err := parseLen(line[1:])
+	if err != nil || count > maxArgs {
+		return nil, 0, errMultibulkLen
+	}
+	pos := i + 1
+	for k := 0; k < count; k++ {
+		j := bytes.IndexByte(b[pos:], '\n')
+		if j < 0 {
+			if len(b)-pos > maxLine {
+				return nil, 0, errTooBigMultibulk
+			}
+			c.argv = argv
+			return nil, 0, nil
 		}
-
-		line = bytes.TrimSpace(line)
+		line := bytes.TrimSpace(b[pos : pos+j+1])
 		if len(line) == 0 || line[0] != '$' {
-			return nil, fmt.Errorf("expected bulk string")
+			return nil, 0, errExpectedBulk
 		}
-
 		size, err := parseLen(line[1:])
 		if err != nil || size < 0 || size > maxBulkLen {
-			return nil, fmt.Errorf("invalid bulk length")
+			return nil, 0, errBulkLen
 		}
-
-		// A bulk string that fits the read buffer is copied straight out of
-		// it; a larger one is read into its own buffer.
-		if size+2 <= reader.Size() {
-			b, err := reader.Peek(size + 2)
-			if err != nil {
-				return nil, err
-			}
-			args = append(args, string(b[:size]))
-			reader.Discard(size + 2)
-			continue
+		start := pos + j + 1
+		if len(b) < start+size+2 {
+			c.argv = argv
+			return nil, 0, nil
 		}
-		buf, err := readFull(reader, size+2)
-		if err != nil {
-			return nil, err
-		}
-		args = append(args, string(buf[:size]))
+		argv = append(argv, b[start:start+size])
+		pos = start + size + 2
 	}
-
-	return args, nil
+	c.argv = argv
+	return argv, pos, nil
 }
 
-// handleSaveLoad implements SAVE [TO <path>] [FAST] and
-// LOAD [FROM <path>] [FAST]. FAST is accepted for pogocache compatibility.
+// argStrings copies arguments to strings. The name gets its own string,
+// since telemetry may keep it; the others share one allocation.
+func argStrings(argv [][]byte) []string {
+	args := make([]string, len(argv))
+	if len(argv) == 0 {
+		return args
+	}
+	args[0] = string(argv[0])
+	n := 0
+	for _, a := range argv[1:] {
+		n += len(a)
+	}
+	var sb strings.Builder
+	sb.Grow(n)
+	for _, a := range argv[1:] {
+		sb.Write(a)
+	}
+	all, off := sb.String(), 0
+	for k, a := range argv[1:] {
+		args[k+1] = all[off : off+len(a)]
+		off += len(a)
+	}
+	return args
+}

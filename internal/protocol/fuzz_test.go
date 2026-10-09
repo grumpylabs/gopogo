@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -113,13 +114,73 @@ func FuzzPostgres(f *testing.F) {
 	})
 }
 
-// FuzzDetect covers the first bytes of every connection, read before any
-// protocol handler runs.
+// FuzzDetect covers the first bytes of every connection: detection, then
+// whichever protocol they select.
 func FuzzDetect(f *testing.F) {
 	for _, s := range []string{"*1\r\n", "GET / HTTP/1.1\r\n", "get k\r\n", "\x00\x00\x00\x08\x04\xd2\x16\x2f", "\x16\x03\x01", ""} {
 		f.Add([]byte(s))
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
-		NewDetector(&fuzzConn{r: bytes.NewReader(data)}).Detect()
+		fuzzSkip(t, data)
+		c := cache.New(nil)
+		ServeConn(&fuzzConn{r: bytes.NewReader(data)}, &Handlers{
+			Redis:    NewRedisHandler(c, "", ""),
+			HTTP:     NewHTTPHandler(c, ""),
+			Memcache: NewMemcacheHandler(c, ""),
+			Postgres: NewPostgresHandler(c, "", ""),
+		})
 	})
+}
+
+// FuzzSplit checks that a connection's replies do not depend on how its
+// input is split into reads, the property the event loops rely on. Inputs
+// whose replies depend on time are skipped.
+func FuzzSplit(f *testing.F) {
+	for _, in := range splitInputs {
+		if in.proto != TypeHTTP {
+			f.Add(in.input)
+		}
+	}
+	f.Fuzz(func(t *testing.T, input string) {
+		fuzzSkip(t, []byte(input))
+		upper := strings.ToUpper(input)
+		for _, word := range []string{"EX", "PX", "TTL", "STAT", "INFO", "DEBUG", "MONITOR", "SWEEP", "PURGE", "TOUCH", "GAT", "SCAN", "KEYS", "FLUSH"} {
+			if strings.Contains(upper, word) {
+				t.Skip()
+			}
+		}
+		whole := feed(input, len(input)+1)
+		if bytewise := feed(input, 1); bytewise != whole {
+			t.Fatalf("input %q\nwhole:    %q\nbytewise: %q", input, whole, bytewise)
+		}
+	})
+}
+
+// feed runs input through a new connection, chunk bytes per read, and
+// returns its output and how it ended.
+func feed(input string, chunk int) string {
+	ch := cache.New(nil)
+	c := NewConn(&Handlers{
+		Redis:    NewRedisHandler(ch, "", ""),
+		Memcache: NewMemcacheHandler(ch, ""),
+	}, "127.0.0.1:4000", false)
+	var in, out []byte
+	for fed := 0; fed < len(input); {
+		end := min(fed+chunk, len(input))
+		in = append(in, input[fed:end]...)
+		fed = end
+		for {
+			n, o, act := c.Process(in, out)
+			out = o
+			in = in[n:]
+			if act != Continue {
+				c.Close()
+				return fmt.Sprintf("%s[action %d]", out, act)
+			}
+			if n == 0 || len(in) == 0 {
+				break
+			}
+		}
+	}
+	return fmt.Sprintf("%s[unconsumed %d]", out, len(in))
 }

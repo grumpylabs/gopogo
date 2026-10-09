@@ -2,16 +2,20 @@ package protocol
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/grumpylabs/gopogo/internal/cache"
@@ -49,28 +53,112 @@ const httpHelp = "gopogo HTTP interface\r\n\r\n" +
 	"PUT /<key>?ex=<seconds>&flags=<n>&cas=<n>&nx&xx  (value in body)\r\n" +
 	"DELETE /<key>\r\n"
 
+// Handle serves a connection known to speak HTTP and closes it.
 func (h *HTTPHandler) Handle(conn net.Conn) {
-	defer conn.Close()
-
-	reader := bufio.NewReader(conn)
-	writer := &httpWriter{Writer: bufio.NewWriterSize(conn, replyBufferSize)}
 	_, isTLS := conn.(*tls.Conn)
+	c := NewConn(&Handlers{HTTP: h}, conn.RemoteAddr().String(), isTLS)
+	c.proto = TypeHTTP
+	serve(conn, c)
+}
 
-	for {
-		req, err := http.ReadRequest(reader)
+// process serves the complete requests at the start of in.
+func (h *HTTPHandler) process(c *Conn, in, out []byte) (int, []byte, Action) {
+	w := &httpWriter{outBuf: &outBuf{b: out}}
+	pos := 0
+	for pos < len(in) && len(w.b) < outputLimit {
+		req, n, err := parseHTTPRequest(in[pos:])
 		if err != nil {
-			if err != io.EOF {
-				h.writeText(writer, http.StatusBadRequest, "Bad Request\r\n")
-				writer.Flush()
-			}
-			return
+			h.writeText(w, http.StatusBadRequest, "Bad Request\r\n")
+			return pos, w.b, Close
 		}
-		h.serveTraced(writer, req, conn.RemoteAddr().String(), isTLS)
-		if reader.Buffered() == 0 || req.Close {
-			writer.Flush()
+		if n == 0 {
+			break
 		}
+		pos += n
+		h.serveTraced(w, req, c.addr, c.tls)
 		if req.Close {
-			return
+			return pos, w.b, Close
+		}
+	}
+	return pos, w.b, Continue
+}
+
+// httpReaders recycles the readers that parse request headers.
+var httpReaders = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 4096) }}
+
+var errHTTPTooLarge = errors.New("request too large")
+
+// parseHTTPRequest parses one request, headers and body, at the start of
+// b. It returns the bytes consumed, or 0 when b holds only part of it.
+// Headers are parsed by net/http; the body is a Content-Length or chunked
+// body already in b.
+func parseHTTPRequest(b []byte) (*http.Request, int, error) {
+	end := httpHeaderEnd(b)
+	if end < 0 {
+		if len(b) > maxLine {
+			return nil, 0, errHTTPTooLarge
+		}
+		return nil, 0, nil
+	}
+	br := httpReaders.Get().(*bufio.Reader)
+	br.Reset(bytes.NewReader(b[:end]))
+	req, err := http.ReadRequest(br)
+	br.Reset(nil)
+	httpReaders.Put(br)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var body []byte
+	n := end
+	switch {
+	case len(req.TransferEncoding) > 0 && req.TransferEncoding[0] == "chunked":
+		src := bytes.NewReader(b[end:])
+		cr := bufio.NewReader(src)
+		body, err = io.ReadAll(io.LimitReader(httputil.NewChunkedReader(cr), maxBulkLen+1))
+		if err == io.ErrUnexpectedEOF {
+			return nil, 0, nil
+		}
+		if err != nil {
+			return nil, 0, err
+		}
+		if len(body) > maxBulkLen {
+			return nil, 0, errHTTPTooLarge
+		}
+		n = len(b) - src.Len() - cr.Buffered()
+		// The trailer, usually empty, ends with a blank line.
+		t := httpHeaderEnd(append([]byte("\n"), b[n:]...))
+		if t < 0 {
+			return nil, 0, nil
+		}
+		n += t - 1
+	case req.ContentLength > maxBulkLen:
+		return nil, 0, errHTTPTooLarge
+	case req.ContentLength > 0:
+		if int64(len(b)-end) < req.ContentLength {
+			return nil, 0, nil
+		}
+		n = end + int(req.ContentLength)
+		body = b[end:n]
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	return req, n, nil
+}
+
+// httpHeaderEnd returns the length of the header block at the start of b,
+// through the blank line that ends it, or -1 if it has not ended.
+func httpHeaderEnd(b []byte) int {
+	for i := 0; ; {
+		j := bytes.IndexByte(b[i:], '\n')
+		if j < 0 {
+			return -1
+		}
+		i += j + 1
+		switch {
+		case i < len(b) && b[i] == '\n':
+			return i + 1
+		case i+1 < len(b) && b[i] == '\r' && b[i+1] == '\n':
+			return i + 2
 		}
 	}
 }
@@ -78,7 +166,7 @@ func (h *HTTPHandler) Handle(conn net.Conn) {
 // httpWriter is a connection's response writer; it remembers the status of
 // the last response written.
 type httpWriter struct {
-	*bufio.Writer
+	*outBuf
 	status int
 }
 

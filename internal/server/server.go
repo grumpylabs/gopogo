@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -41,6 +43,9 @@ type Config struct {
 	Cache         *cache.Cache
 	AutoSweep     bool
 	SweepInterval time.Duration
+	// EventLoops serves plain connections from per-thread epoll loops on
+	// Linux, one per GOMAXPROCS, instead of a goroutine each.
+	EventLoops bool
 }
 
 type Server struct {
@@ -50,11 +55,11 @@ type Server struct {
 	wg        sync.WaitGroup
 	ctx       context.Context
 	cancel    context.CancelFunc
-	
-	redisHandler    *protocol.RedisHandler
-	httpHandler     *protocol.HTTPHandler
-	memcacheHandler *protocol.MemcacheHandler
-	postgresHandler *protocol.PostgresHandler
+	handlers  protocol.Handlers
+
+	mu      sync.Mutex  // guards listeners and loops between Start and Stop
+	loops   *eventLoops // nil: a goroutine per connection
+	stopped bool
 }
 
 func New(config *Config) *Server {
@@ -68,24 +73,55 @@ func New(config *Config) *Server {
 	}
 	
 	if config.Redis {
-		s.redisHandler = protocol.NewRedisHandler(config.Cache, config.Auth, config.Persist)
+		s.handlers.Redis = protocol.NewRedisHandler(config.Cache, config.Auth, config.Persist)
 	}
 	if config.HTTP {
-		s.httpHandler = protocol.NewHTTPHandler(config.Cache, config.Auth)
+		s.handlers.HTTP = protocol.NewHTTPHandler(config.Cache, config.Auth)
 	}
 	if config.Memcache {
-		s.memcacheHandler = protocol.NewMemcacheHandler(config.Cache, config.Auth)
+		s.handlers.Memcache = protocol.NewMemcacheHandler(config.Cache, config.Auth)
 	}
 	if config.Postgres {
-		s.postgresHandler = protocol.NewPostgresHandler(config.Cache, config.Auth, config.Persist)
+		s.handlers.Postgres = protocol.NewPostgresHandler(config.Cache, config.Auth, config.Persist)
 	}
 	
 	return s
 }
 
 func (s *Server) Start() error {
+	s.mu.Lock()
+	if err := s.start(); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	s.mu.Unlock()
+	s.wg.Wait()
+	return nil
+}
+
+// start sets up listeners, event loops and the sweeper, and starts
+// accepting. s.mu is held.
+func (s *Server) start() error {
+	if s.stopped {
+		return errors.New("server stopped")
+	}
 	if err := s.setupListeners(); err != nil {
 		return err
+	}
+	if s.config.EventLoops {
+		n := runtime.GOMAXPROCS(0)
+		loops, err := newEventLoops(n, &s.handlers)
+		if err != nil && err != errNoEventLoops {
+			return fmt.Errorf("failed to start event loops: %w", err)
+		}
+		if loops != nil {
+			// One loop per thread, and one more thread for everything
+			// else. With every thread waiting in a loop, Go would see no
+			// idle thread and keep reclaiming them from epoll_wait, waking
+			// other threads that find nothing to do.
+			runtime.GOMAXPROCS(n + 1)
+		}
+		s.loops = loops
 	}
 	
 	if s.config.AutoSweep {
@@ -105,21 +141,31 @@ func (s *Server) Start() error {
 	
 	for _, listener := range s.listeners {
 		s.wg.Add(1)
-		go s.serve(listener)
+		go s.serve(listener, s.loops)
 	}
-	
-	s.wg.Wait()
 	return nil
 }
 
+// Stop closes the listeners, waits for accepting to end, and stops the
+// event loops, closing their connections.
 func (s *Server) Stop() {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	s.stopped = true
 	s.cancel()
-	
 	for _, listener := range s.listeners {
 		listener.Close()
 	}
-	
+	loops := s.loops
+	s.mu.Unlock()
+
 	s.wg.Wait()
+	if loops != nil {
+		loops.close()
+	}
 }
 
 func (s *Server) setupListeners() error {
@@ -152,9 +198,9 @@ func (s *Server) setupListeners() error {
 	if err != nil {
 		return err
 	}
-	if tlsConfig != nil && s.postgresHandler != nil {
+	if tlsConfig != nil && s.handlers.Postgres != nil {
 		// Postgres clients upgrade the plain port to TLS with an SSLRequest.
-		s.postgresHandler.SetTLSConfig(tlsConfig)
+		s.handlers.Postgres.SetTLSConfig(tlsConfig)
 	}
 
 	if s.config.TLSPort > 0 && tlsConfig != nil {
@@ -208,7 +254,7 @@ func (s *Server) tlsConfig() (*tls.Config, error) {
 	return cfg, nil
 }
 
-func (s *Server) serve(listener net.Listener) {
+func (s *Server) serve(listener net.Listener, loops *eventLoops) {
 	defer s.wg.Done()
 	
 	for {
@@ -226,6 +272,12 @@ func (s *Server) serve(listener net.Listener) {
 		}
 		
 		if !s.admit(conn) {
+			continue
+		}
+		if loops != nil && loops.supported(conn) {
+			if err := loops.add(conn, release); err != nil {
+				zap.L().Warn("event loop refused a connection: "+err.Error(), zap.Error(err))
+			}
 			continue
 		}
 		go s.handleConnection(conn)
@@ -258,50 +310,29 @@ func (s *Server) admit(conn net.Conn) bool {
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
-	defer protocol.ConnStats.Curr.Add(-1)
+	defer release()
 	defer conn.Close()
 	// A bug reached by one client's input closes that connection, not the
 	// whole server.
 	defer func() {
 		if r := recover(); r != nil {
-			zap.L().Error(fmt.Sprintf("connection from %s closed after a panic: %v", conn.RemoteAddr(), r),
-				zap.String("client.address", conn.RemoteAddr().String()),
-				zap.String("panic", fmt.Sprint(r)), zap.Stack("stack"))
+			logPanic(conn.RemoteAddr().String(), r)
 		}
 	}()
+	protocol.ServeConn(conn, &s.handlers)
+}
 
-	detector := protocol.NewDetector(conn)
-	protoType, err := detector.Detect()
-	if err != nil {
-		if s.config.Verbose {
-			zap.L().Warn(fmt.Sprintf("protocol detection failed for %s: %v", conn.RemoteAddr(), err),
-				zap.String("client.address", conn.RemoteAddr().String()), zap.Error(err))
-		}
-		return
-	}
-	
-	switch protoType {
-	case protocol.TypeRedis:
-		if s.redisHandler != nil {
-			s.redisHandler.Handle(detector.Conn())
-		}
-	case protocol.TypeHTTP:
-		if s.httpHandler != nil {
-			s.httpHandler.Handle(detector.Conn())
-		}
-	case protocol.TypeMemcache:
-		if s.memcacheHandler != nil {
-			s.memcacheHandler.Handle(detector.Conn())
-		}
-	case protocol.TypePostgres:
-		if s.postgresHandler != nil {
-			s.postgresHandler.Handle(detector.Conn())
-		}
-	default:
-		if s.redisHandler != nil {
-			s.redisHandler.Handle(detector.Conn())
-		}
-	}
+// errNoEventLoops is newEventLoops's error where epoll is unavailable.
+var errNoEventLoops = errors.New("event loops need Linux")
+
+// release counts a connection admitted by admit as closed.
+func release() { protocol.ConnStats.Curr.Add(-1) }
+
+// logPanic reports a panic that closed a client's connection.
+func logPanic(addr string, r any) {
+	zap.L().Error(fmt.Sprintf("connection from %s closed after a panic: %v", addr, r),
+		zap.String("client.address", addr),
+		zap.String("panic", fmt.Sprint(r)), zap.Stack("stack"))
 }
 
 func (s *Server) startSweeper() {

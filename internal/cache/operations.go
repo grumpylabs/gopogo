@@ -157,7 +157,12 @@ func (c *Cache) Load(key []byte) (*Entry, bool) {
 }
 
 func (c *Cache) LoadWithOptions(key []byte, opts *LoadOptions) (*Entry, bool) {
-	start := time.Now()
+	// Loads are the hottest path: read the clock for metrics only when
+	// there are metrics to record.
+	var start time.Time
+	if c.metrics != nil {
+		start = time.Now()
+	}
 	shard := c.getShard(key)
 	lk, packed := c.lookupKey(key)
 	needsWrite := opts != nil && opts.Entry != nil

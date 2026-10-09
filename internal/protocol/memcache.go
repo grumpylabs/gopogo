@@ -1,11 +1,10 @@
 package protocol
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -48,135 +47,178 @@ var memcacheStorageCmds = map[string]bool{
 	"set": true, "add": true, "replace": true, "append": true, "prepend": true, "cas": true,
 }
 
+// Handle serves a connection known to speak the memcache text protocol and
+// closes it.
 func (h *MemcacheHandler) Handle(conn net.Conn) {
-	defer conn.Close()
-	
-	reader := bufio.NewReader(conn)
-	// peek sees the start of each flushed reply, so a command's span can be
-	// marked failed when the reply is an error.
-	peek := &replyPeek{w: conn}
-	writer := bufio.NewWriterSize(peek, replyBufferSize)
-	addr := conn.RemoteAddr().String()
-	
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err != io.EOF {
-				writer.WriteString("ERROR\r\n")
-				writer.Flush()
+	c := NewConn(&Handlers{Memcache: h}, conn.RemoteAddr().String(), false)
+	c.proto = TypeMemcache
+	serve(conn, c)
+}
+
+// process runs the complete commands at the start of in. A storage command
+// is complete once its data block and the line end after it have arrived.
+func (h *MemcacheHandler) process(c *Conn, in, out []byte) (int, []byte, Action) {
+	w := &outBuf{b: out}
+	pos := 0
+	for pos < len(in) && len(w.b) < outputLimit {
+		i := bytes.IndexByte(in[pos:], '\n')
+		if i < 0 {
+			if len(in)-pos > maxLine {
+				w.WriteString("CLIENT_ERROR line too long\r\n")
+				return pos, w.b, Close
 			}
-			return
+			break
 		}
-		
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		
+		next := pos + i + 1
+		line := strings.TrimSpace(string(in[pos:next]))
 		parts := strings.Fields(line)
 		if len(parts) == 0 {
+			pos = next
 			continue
 		}
-		
 		cmd := strings.ToLower(parts[0])
+
+		// A storage command's data block follows its line. Without auth it
+		// is read only when the handler gets far enough to read it; with
+		// auth it is skipped, n bytes and CRLF.
+		var data []byte
+		if n, ok := memcacheDataLen(cmd, parts, h.auth != ""); ok {
+			if len(in) < next+n {
+				break
+			}
+			// The cache keeps the value, so it cannot share the input buffer.
+			data = bytes.Clone(in[next : next+n])
+			if h.auth != "" {
+				if len(in) < next+n+2 {
+					break
+				}
+				next += n + 2
+			} else {
+				j := bytes.IndexByte(in[next+n:], '\n')
+				if j < 0 {
+					break
+				}
+				next += n + j + 1
+			}
+		}
+		pos = next
+
 		spanName := cmd
 		if !memcacheCmds[cmd] {
 			spanName = "UNKNOWN"
 		}
-		obs := beginCommand(context.Background(), TypeMemcache, addr, spanName)
-		peek.reset()
+		obs := beginCommand(context.Background(), TypeMemcache, c.addr, spanName)
+		replyStart := len(w.b)
 		if h.auth != "" {
 			if cmd == "quit" {
 				obs.end("")
-				return
-			}
-			// Consume a storage command's data block so the next command
-			// line is read correctly.
-			if memcacheStorageCmds[cmd] && len(parts) >= 5 {
-				if n, err := strconv.Atoi(parts[4]); err == nil && n >= 0 && n <= maxBulkLen {
-					if _, err := io.CopyN(io.Discard, reader, int64(n)+2); err != nil {
-						return
-					}
-				}
+				return pos, w.b, Close
 			}
 			countAuth(TypeMemcache, false)
-			writer.WriteString("CLIENT_ERROR Authentication required\r\n")
-			writer.Flush()
-			obs.end(peek.errorReply())
+			w.WriteString("CLIENT_ERROR Authentication required\r\n")
+			obs.end(memcacheErrorReply(w.b[replyStart:]))
 			continue
 		}
-		monitors.publish(addr, parts)
-		
+		monitors.publish(c.addr, parts)
+
 		switch cmd {
 		case "get", "gets":
-			h.handleGet(reader, writer, parts[1:], cmd == "gets")
-			
+			h.writeValues(w, parts[1:], cmd == "gets", nil)
+
 		case "set":
-			h.handleStore(reader, writer, parts, false, false)
-			
+			h.handleStore(w, parts, data, false, false)
+
 		case "add":
-			h.handleStore(reader, writer, parts, true, false)
-			
+			h.handleStore(w, parts, data, true, false)
+
 		case "replace":
-			h.handleStore(reader, writer, parts, false, true)
-			
+			h.handleStore(w, parts, data, false, true)
+
 		case "append":
-			h.handleAppend(reader, writer, parts, true)
-			
+			h.handleAppend(w, parts, data, true)
+
 		case "prepend":
-			h.handleAppend(reader, writer, parts, false)
-			
+			h.handleAppend(w, parts, data, false)
+
 		case "cas":
-			h.handleCAS(reader, writer, parts)
-			
+			h.handleCAS(w, parts, data)
+
 		case "delete":
-			h.handleDelete(writer, parts)
-			
+			h.handleDelete(w, parts)
+
 		case "incr":
-			h.handleIncr(writer, parts, true)
-			
+			h.handleIncr(w, parts, true)
+
 		case "decr":
-			h.handleIncr(writer, parts, false)
-			
+			h.handleIncr(w, parts, false)
+
 		case "touch":
-			h.handleTouch(writer, parts)
-			
+			h.handleTouch(w, parts)
+
 		case "gat", "gats":
-			h.handleGAT(writer, parts, cmd == "gats")
-			
+			h.handleGAT(w, parts, cmd == "gats")
+
 		case "verbosity":
 			// Logging levels are not configurable; accept and acknowledge.
 			if len(parts) < 2 || len(parts) > 3 {
-				writer.WriteString("ERROR\r\n")
+				w.WriteString("ERROR\r\n")
 			} else if !(len(parts) == 3 && parts[2] == "noreply") {
-				writer.WriteString("OK\r\n")
+				w.WriteString("OK\r\n")
 			}
-			
+
 		case "flush_all":
 			ctr(TypeMemcache).cmdFlush.Add(1)
 			h.cache.Clear()
-			writer.WriteString("OK\r\n")
-			
+			w.WriteString("OK\r\n")
+
 		case "stats":
-			h.handleStats(writer)
-			
+			h.handleStats(w)
+
 		case "version":
-			writer.WriteString("VERSION " + Version + "\r\n")
-			
+			w.WriteString("VERSION " + Version + "\r\n")
+
 		case "quit":
-			writer.Flush()
 			obs.end("")
-			return
-			
+			return pos, w.b, Close
+
 		default:
-			writer.WriteString("ERROR\r\n")
+			w.WriteString("ERROR\r\n")
 		}
-		
-		if reader.Buffered() == 0 {
-			writer.Flush()
-		}
-		obs.end(peek.errorReply())
+		obs.end(memcacheErrorReply(w.b[replyStart:]))
 	}
+	return pos, w.b, Continue
+}
+
+// memcacheDataLen returns the length of the data block that follows a
+// storage command, and whether the command reads one: the handlers read it
+// only after their earlier arguments parse, and with auth a block with a
+// valid length is skipped.
+func memcacheDataLen(cmd string, parts []string, auth bool) (int, bool) {
+	if !memcacheStorageCmds[cmd] || len(parts) < 5 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(parts[4])
+	if err != nil || n < 0 || n > maxBulkLen {
+		return 0, false
+	}
+	if auth || cmd == "append" || cmd == "prepend" {
+		return n, true
+	}
+	if _, err := strconv.ParseUint(parts[2], 10, 32); err != nil {
+		return 0, false
+	}
+	if _, err := strconv.ParseInt(parts[3], 10, 64); err != nil {
+		return 0, false
+	}
+	if cmd == "cas" {
+		if len(parts) < 6 {
+			return 0, false
+		}
+		if _, err := strconv.ParseUint(parts[5], 10, 64); err != nil {
+			return 0, false
+		}
+	}
+	return n, true
 }
 
 // memcacheCmds are the commands the handler implements; others are traced
@@ -188,42 +230,22 @@ var memcacheCmds = map[string]bool{
 	"version": true, "verbosity": true, "quit": true,
 }
 
-// replyPeek passes writes through and keeps the first bytes written since
-// the last reset.
-type replyPeek struct {
-	w    io.Writer
-	head []byte
-}
-
-func (p *replyPeek) Write(b []byte) (int, error) {
-	if n := 64 - len(p.head); n > 0 {
-		p.head = append(p.head, b[:min(n, len(b))]...)
+// memcacheErrorReply returns the first line of reply if it is a memcache
+// error (ERROR, CLIENT_ERROR or SERVER_ERROR), else "".
+func memcacheErrorReply(reply []byte) string {
+	if i := bytes.Index(reply, []byte("\r\n")); i >= 0 {
+		reply = reply[:i]
 	}
-	return p.w.Write(b)
-}
-
-func (p *replyPeek) reset() { p.head = p.head[:0] }
-
-// errorReply returns the first line of the reply if it is a memcache error
-// (ERROR, CLIENT_ERROR or SERVER_ERROR), else "".
-func (p *replyPeek) errorReply() string {
-	line := string(p.head)
-	if i := strings.Index(line, "\r\n"); i >= 0 {
-		line = line[:i]
-	}
-	if line == "ERROR" || strings.HasPrefix(line, "CLIENT_ERROR") || strings.HasPrefix(line, "SERVER_ERROR") {
-		return line
+	if bytes.Equal(reply, []byte("ERROR")) || bytes.HasPrefix(reply, []byte("CLIENT_ERROR")) ||
+		bytes.HasPrefix(reply, []byte("SERVER_ERROR")) {
+		return string(reply)
 	}
 	return ""
 }
 
-func (h *MemcacheHandler) handleGet(reader *bufio.Reader, writer *bufio.Writer, keys []string, withCAS bool) {
-	h.writeValues(writer, keys, withCAS, nil)
-}
-
 // handleGAT implements gat/gats <exptime> <key>*: return the found keys, like
 // get/gets, and set their expiration.
-func (h *MemcacheHandler) handleGAT(writer *bufio.Writer, parts []string, withCAS bool) {
+func (h *MemcacheHandler) handleGAT(writer *outBuf, parts []string, withCAS bool) {
 	if len(parts) < 3 {
 		writer.WriteString("ERROR\r\n")
 		return
@@ -239,7 +261,7 @@ func (h *MemcacheHandler) handleGAT(writer *bufio.Writer, parts []string, withCA
 
 // writeValues writes a VALUE block for each found key, then END. touch, if
 // set, is applied to each found entry after its value is read.
-func (h *MemcacheHandler) writeValues(writer *bufio.Writer, keys []string, withCAS bool, touch func(*cache.Entry)) {
+func (h *MemcacheHandler) writeValues(writer *outBuf, keys []string, withCAS bool, touch func(*cache.Entry)) {
 	for _, key := range keys {
 		entry, found := h.cache.Load([]byte(key))
 		ctr(TypeMemcache).cmdGet.Add(1)
@@ -306,7 +328,7 @@ func memcacheTTL(exptime int64) time.Duration {
 	}
 }
 
-func (h *MemcacheHandler) handleStore(reader *bufio.Reader, writer *bufio.Writer, parts []string, addOnly, replaceOnly bool) {
+func (h *MemcacheHandler) handleStore(writer *outBuf, parts []string, data []byte, addOnly, replaceOnly bool) {
 	if len(parts) < 5 {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
@@ -325,21 +347,14 @@ func (h *MemcacheHandler) handleStore(reader *bufio.Reader, writer *bufio.Writer
 		return
 	}
 	
-	bytes, err := strconv.Atoi(parts[4])
-	if err != nil || bytes < 0 || bytes > maxBulkLen {
+	size, err := strconv.Atoi(parts[4])
+	if err != nil || size < 0 || size > maxBulkLen {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
 	}
 	
 	noreply := len(parts) > 5 && parts[5] == "noreply"
 	
-	data, err := readFull(reader, bytes)
-	if err != nil {
-		writer.WriteString("CLIENT_ERROR bad data chunk\r\n")
-		return
-	}
-	
-	reader.ReadString('\n')
 	
 	existing, _ := h.cache.Load([]byte(key))
 	
@@ -377,7 +392,7 @@ func (h *MemcacheHandler) handleStore(reader *bufio.Reader, writer *bufio.Writer
 	}
 }
 
-func (h *MemcacheHandler) handleCAS(reader *bufio.Reader, writer *bufio.Writer, parts []string) {
+func (h *MemcacheHandler) handleCAS(writer *outBuf, parts []string, data []byte) {
 	if len(parts) < 6 {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
@@ -396,8 +411,8 @@ func (h *MemcacheHandler) handleCAS(reader *bufio.Reader, writer *bufio.Writer, 
 		return
 	}
 	
-	bytes, err := strconv.Atoi(parts[4])
-	if err != nil || bytes < 0 || bytes > maxBulkLen {
+	size, err := strconv.Atoi(parts[4])
+	if err != nil || size < 0 || size > maxBulkLen {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
 	}
@@ -410,13 +425,6 @@ func (h *MemcacheHandler) handleCAS(reader *bufio.Reader, writer *bufio.Writer, 
 	
 	noreply := len(parts) > 6 && parts[6] == "noreply"
 	
-	data, err := readFull(reader, bytes)
-	if err != nil {
-		writer.WriteString("CLIENT_ERROR bad data chunk\r\n")
-		return
-	}
-	
-	reader.ReadString('\n')
 	
 	opts := &cache.StoreOptions{
 		Flags: uint32(flags),
@@ -452,28 +460,21 @@ func (h *MemcacheHandler) handleCAS(reader *bufio.Reader, writer *bufio.Writer, 
 	}
 }
 
-func (h *MemcacheHandler) handleAppend(reader *bufio.Reader, writer *bufio.Writer, parts []string, isAppend bool) {
+func (h *MemcacheHandler) handleAppend(writer *outBuf, parts []string, data []byte, isAppend bool) {
 	if len(parts) < 5 {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
 	}
 	
 	key := parts[1]
-	bytes, err := strconv.Atoi(parts[4])
-	if err != nil || bytes < 0 || bytes > maxBulkLen {
+	size, err := strconv.Atoi(parts[4])
+	if err != nil || size < 0 || size > maxBulkLen {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
 	}
 	
 	noreply := len(parts) > 5 && parts[5] == "noreply"
 	
-	data, err := readFull(reader, bytes)
-	if err != nil {
-		writer.WriteString("CLIENT_ERROR bad data chunk\r\n")
-		return
-	}
-	
-	reader.ReadString('\n')
 	
 	// Update is atomic and keeps the entry's flags and TTL.
 	err = h.cache.Update([]byte(key), func(cur []byte, found bool) ([]byte, error) {
@@ -507,7 +508,7 @@ func (h *MemcacheHandler) handleAppend(reader *bufio.Reader, writer *bufio.Write
 	}
 }
 
-func (h *MemcacheHandler) handleDelete(writer *bufio.Writer, parts []string) {
+func (h *MemcacheHandler) handleDelete(writer *outBuf, parts []string) {
 	if len(parts) < 2 {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
@@ -537,7 +538,7 @@ var (
 // handleIncr implements incr/decr on unsigned 64-bit decimal values. Like
 // memcached, a missing key is NOT_FOUND, incr wraps around at 2^64 and decr
 // stops at 0.
-func (h *MemcacheHandler) handleIncr(writer *bufio.Writer, parts []string, incr bool) {
+func (h *MemcacheHandler) handleIncr(writer *outBuf, parts []string, incr bool) {
 	if len(parts) < 3 {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
@@ -595,7 +596,7 @@ func (h *MemcacheHandler) handleIncr(writer *bufio.Writer, parts []string, incr 
 	}
 }
 
-func (h *MemcacheHandler) handleTouch(writer *bufio.Writer, parts []string) {
+func (h *MemcacheHandler) handleTouch(writer *outBuf, parts []string) {
 	if len(parts) < 3 {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
@@ -627,7 +628,7 @@ func (h *MemcacheHandler) handleTouch(writer *bufio.Writer, parts []string) {
 	}
 }
 
-func (h *MemcacheHandler) handleStats(writer *bufio.Writer) {
+func (h *MemcacheHandler) handleStats(writer *outBuf) {
 	for _, kv := range statLines(h.cache) {
 		fmt.Fprintf(writer, "STAT %s %s\r\n", kv[0], kv[1])
 	}
