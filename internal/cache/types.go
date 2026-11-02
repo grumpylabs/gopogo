@@ -275,6 +275,11 @@ func (c *Cache) getShard(key []byte) *Shard {
 	return c.shards[(h>>32)%uint64(c.numShards)]
 }
 
+// ShardIndex is the index of the shard that holds key.
+func (c *Cache) ShardIndex(key []byte) int {
+	return int((hashKey(key) >> 32) % uint64(c.numShards))
+}
+
 // SetMetrics attaches a metrics recorder to the cache.
 func (c *Cache) SetMetrics(m MetricsRecorder) {
 	c.metrics = m

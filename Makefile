@@ -38,14 +38,14 @@ build: ## Build the binary
 
 amd64: ## Build static linux/amd64 binaries (bin/gopogo-amd64, bin/gopogo-loadgen-amd64)
 	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/gopogo-amd64 ./cmd/gopogo
-	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/gopogo-loadgen-amd64 ./cmd/loadgen
+	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/gopogo-loadgen-amd64 ./cmd/loadgen
 
 arm64: ## Build static linux/arm64 binaries (bin/gopogo-arm64, bin/gopogo-loadgen-arm64)
 	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/gopogo-arm64 ./cmd/gopogo
-	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o bin/gopogo-loadgen-arm64 ./cmd/loadgen
+	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/gopogo-loadgen-arm64 ./cmd/loadgen
 
 loadgen: ## Build the load generator (bin/gopogo-loadgen)
-	@go build -trimpath -o bin/gopogo-loadgen ./cmd/loadgen
+	@go build -trimpath -ldflags "$(LDFLAGS)" -o bin/gopogo-loadgen ./cmd/loadgen
 
 build-race: ## Build with race detector enabled
 	@go build -trimpath -race -ldflags "$(LDFLAGS)" -o bin/gopogo-race ./cmd/gopogo

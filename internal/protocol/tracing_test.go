@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -39,6 +41,17 @@ func recordSpans(t *testing.T) *tracetest.SpanRecorder {
 	return rec
 }
 
+// commandSpans returns the ended spans other than cache operations'.
+func commandSpans(rec *tracetest.SpanRecorder) []sdktrace.ReadOnlySpan {
+	var out []sdktrace.ReadOnlySpan
+	for _, s := range rec.Ended() {
+		if !strings.HasPrefix(s.Name(), "cache.") {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func spanAttr(s sdktrace.ReadOnlySpan, key string) string {
 	for _, kv := range s.Attributes() {
 		if string(kv.Key) == key {
@@ -70,10 +83,10 @@ func TestCommandSpans(t *testing.T) {
 
 	// The server ends a span after its reply is read; wait for the last one.
 	deadline := time.Now().Add(2 * time.Second)
-	for len(rec.Ended()) < 5 && time.Now().Before(deadline) {
+	for len(commandSpans(rec)) < 5 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	spans := rec.Ended()
+	spans := commandSpans(rec)
 	if len(spans) != 5 {
 		t.Fatalf("got %d spans, want 5", len(spans))
 	}
@@ -112,6 +125,101 @@ func TestCommandSpans(t *testing.T) {
 	}
 }
 
+func TestTraceparentParentsNextCommand(t *testing.T) {
+	rec := recordSpans(t)
+	c := newRESPClient(t, cache.New(nil))
+	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	const parentID = "00f067aa0ba902b7"
+	c.expect("OK", "TRACEPARENT", "00-"+traceID+"-"+parentID+"-01")
+	c.expect("OK", "SET", "k", "v") // the fast path's form: must still continue the trace
+	c.expect("v", "GET", "k")       // the context is used once
+	c.expect(errReply("ERR invalid traceparent"), "TRACEPARENT", "garbage")
+	c.expect(errReply("ERR wrong number of arguments for 'traceparent' command"), "TRACEPARENT")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for len(commandSpans(rec)) < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	spans := commandSpans(rec)
+	if len(spans) != 2 {
+		t.Fatalf("got %d spans, want 2 (TRACEPARENT gets none)", len(spans))
+	}
+	set, get := spans[0], spans[1]
+	if set.Name() != "SET" || set.SpanContext().TraceID().String() != traceID ||
+		set.Parent().SpanID().String() != parentID || !set.Parent().IsRemote() {
+		t.Errorf("SET span %s in trace %s, parent %s; want trace %s, remote parent %s",
+			set.Name(), set.SpanContext().TraceID(), set.Parent().SpanID(), traceID, parentID)
+	}
+	if get.Name() != "GET" || get.SpanContext().TraceID().String() == traceID || get.Parent().IsValid() {
+		t.Errorf("GET span should start a new trace, got trace %s parent %s",
+			get.SpanContext().TraceID(), get.Parent().SpanID())
+	}
+}
+
+func TestCacheSpans(t *testing.T) {
+	rec := recordSpans(t)
+	ch := cache.New(nil)
+	c := newRESPClient(t, ch)
+	c.expect("OK", "SET", "a", "v1")             // fast path: inserted
+	c.expect("OK", "SET", "a", "v2", "EX", "60") // general path: replaced
+	c.do("MGET", "a", "b")                       // a hit, b a miss
+	c.expect(errReply("ERR value is not an integer or out of range"), "INCR", "a")
+	// A caller's unsampled trace: the command span does not record, so
+	// it gets no cache spans.
+	c.expect("OK", "TRACEPARENT", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00")
+	c.expect("v2", "GET", "a")
+	c.expect("v2", "GET", "a") // fast path: hit
+
+	type want struct {
+		name, parent, key, attr, val string
+		failed                       bool
+	}
+	wants := []want{
+		{"cache.store", "SET", "a", "gopogo.cache.result", "inserted", false},
+		{"cache.store", "SET", "a", "gopogo.cache.result", "replaced", false},
+		{"cache.load", "MGET", "a", "gopogo.cache.hit", "true", false},
+		{"cache.load", "MGET", "b", "gopogo.cache.hit", "false", false},
+		{"cache.increment", "INCR", "a", "", "", true},
+		{"cache.load", "GET", "a", "gopogo.cache.hit", "true", false},
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for len(rec.Ended()) < 11 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	spans := rec.Ended()
+	byID := map[trace.SpanID]sdktrace.ReadOnlySpan{}
+	for _, sp := range spans {
+		byID[sp.SpanContext().SpanID()] = sp
+	}
+	shardKey := map[string]string{
+		strconv.Itoa(ch.ShardIndex([]byte("a"))): "a",
+		strconv.Itoa(ch.ShardIndex([]byte("b"))): "b",
+	}
+	var got []want
+	for _, sp := range spans {
+		if !strings.HasPrefix(sp.Name(), "cache.") {
+			continue
+		}
+		parent := byID[sp.Parent().SpanID()]
+		if parent == nil {
+			t.Fatalf("%s has no recorded parent", sp.Name())
+		}
+		if sp.SpanKind() != trace.SpanKindInternal || sp.SpanContext().TraceID() != parent.SpanContext().TraceID() {
+			t.Errorf("%s: kind %v, or not in its command's trace", sp.Name(), sp.SpanKind())
+		}
+		w := want{sp.Name(), parent.Name(), shardKey[spanAttr(sp, "gopogo.shard")], "", "", sp.Status().Code == codes.Error}
+		for _, k := range []string{"gopogo.cache.result", "gopogo.cache.hit"} {
+			if v := spanAttr(sp, k); v != "" {
+				w.attr, w.val = k, v
+			}
+		}
+		got = append(got, w)
+	}
+	if !reflect.DeepEqual(got, wants) {
+		t.Errorf("cache spans:\n got %v\nwant %v", got, wants)
+	}
+}
+
 func TestHTTPSpanContinuesTrace(t *testing.T) {
 	rec := recordSpans(t)
 	server, client := net.Pipe()
@@ -130,10 +238,10 @@ func TestHTTPSpanContinuesTrace(t *testing.T) {
 	resp.Body.Close()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for len(rec.Ended()) < 2 && time.Now().Before(deadline) {
+	for len(commandSpans(rec)) < 2 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	spans := rec.Ended()
+	spans := commandSpans(rec)
 	if len(spans) != 2 {
 		t.Fatalf("spans: %v", spans)
 	}

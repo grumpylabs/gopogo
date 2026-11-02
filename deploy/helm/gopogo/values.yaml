@@ -174,7 +174,11 @@ readinessProbe:
 # few deliberate errors. For exercising the cache and its telemetry.
 loadgen:
   enabled: false
-  rate: 100        # commands per second
+  rate: 100        # operations per second, each one to four commands
+  # With telemetry.enabled, trace each operation and export to the same OTLP
+  # endpoint (and headersSecret) as the server: a span per operation, a
+  # client span per command, and the server's command span beneath each.
+  telemetry: true
   workers: 4       # connections
   keys: 10000      # key space size
   duration: "0"    # 0 runs until the Deployment is removed

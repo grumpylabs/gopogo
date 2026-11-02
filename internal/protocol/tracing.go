@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/grumpylabs/gopogo/internal/cache"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -233,6 +234,65 @@ func errorType(errMsg string) string {
 // the trace and span from it.
 func logContext(ctx context.Context) zap.Field {
 	return zap.Field{Key: "context", Type: zapcore.SkipType, Interface: ctx}
+}
+
+// Each cache operation inside a traced command gets an internal child span,
+// cache.<op>, with the key's shard (gopogo.shard) and the outcome:
+// gopogo.cache.hit for lookups and deletes, gopogo.cache.result for stores.
+// A command touching several keys (MGET, DEL, MSET) has one per key. They
+// start only under a recording command span, so other commands pay one
+// check.
+
+// startCacheSpan starts the span for one cache operation under the command
+// span in ctx, or returns nil when there is none or it is not recording.
+func (x *Executor) startCacheSpan(ctx context.Context, op string, key []byte) trace.Span {
+	if ctx == nil || !trace.SpanFromContext(ctx).IsRecording() {
+		return nil
+	}
+	_, span := otel.Tracer(instrumentationName).Start(ctx, op,
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(attribute.Int("gopogo.shard", x.cache.ShardIndex(key))))
+	return span
+}
+
+// endCacheHit ends a cache span with whether the key was found.
+func endCacheHit(span trace.Span, hit bool) {
+	if span != nil {
+		span.SetAttributes(attribute.Bool("gopogo.cache.hit", hit))
+		span.End()
+	}
+}
+
+// endCacheStore ends a cache span with a store's outcome.
+func endCacheStore(span trace.Span, res cache.StoreResult) {
+	if span == nil {
+		return
+	}
+	outcome := "inserted"
+	switch res {
+	case cache.Replaced:
+		outcome = "replaced"
+	case cache.NotStored:
+		outcome = "not_stored"
+	case cache.NoMemory:
+		outcome = "no_memory"
+	}
+	span.SetAttributes(attribute.String("gopogo.cache.result", outcome))
+	if res == cache.NoMemory {
+		span.SetStatus(codes.Error, errNoMemory)
+	}
+	span.End()
+}
+
+// endCacheErr ends a cache span, marking it failed when err is not nil.
+func endCacheErr(span trace.Span, err error) {
+	if span == nil {
+		return
+	}
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+	}
+	span.End()
 }
 
 // startCommandSpan starts the span for one command, or returns ctx and nil

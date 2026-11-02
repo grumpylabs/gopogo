@@ -1,5 +1,8 @@
 {{- $lg := .Values.loadgen | default dict }}
 {{- if $lg.enabled }}
+{{- /* Traced by default when telemetry is on; the default covers upgrades
+     with --reuse-values that lack loadgen.telemetry. */}}
+{{- $traced := and .Values.telemetry.enabled (ternary $lg.telemetry true (hasKey $lg "telemetry")) }}
 # Continuous load against this release's Service, for exercising the cache
 # and its telemetry. Its pods carry their own name label, so the cache's
 # Service never selects them.
@@ -42,13 +45,47 @@ spec:
             - --workers={{ $lg.workers | default 4 }}
             - --keys={{ $lg.keys | default 10000 }}
             - --duration={{ $lg.duration | default "0" }}
-          {{- if .Values.auth.enabled }}
+            {{- if $traced }}
+            {{- $t := .Values.telemetry }}
+            {{- /* Traces go where the server's do, so each operation's trace
+                 holds the loadgen's spans and the server's beneath them. */}}
+            - --telemetry
+            - --traces-exporter={{ $t.tracesExporter | default $t.exporter | default "otlp" }}
+            {{- with $t.protocol }}
+            - --otlp-protocol={{ . }}
+            {{- end }}
+            {{- with $t.otlpEndpoint }}
+            - --otlp-endpoint={{ . }}
+            {{- end }}
+            - --otlp-insecure={{ if hasKey $t "insecure" }}{{ $t.insecure }}{{ else }}true{{ end }}
+            {{- with $t.environment }}
+            - --telemetry-environment={{ . }}
+            {{- end }}
+            {{- if and (hasKey $t "traceSampleRatio") (not (kindIs "invalid" $t.traceSampleRatio)) }}
+            {{- if ne (toString $t.traceSampleRatio) "" }}
+            - --trace-sample-ratio={{ $t.traceSampleRatio }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+          {{- if or .Values.auth.enabled $traced }}
           env:
+            {{- if .Values.auth.enabled }}
             - name: GOPOGO_LOADGEN_AUTH
               valueFrom:
                 secretKeyRef:
                   name: {{ include "gopogo.authSecretName" . }}
                   key: {{ include "gopogo.authSecretKey" . }}
+            {{- end }}
+            {{- if $traced }}
+            {{- with dig "headersSecret" "name" "" .Values.telemetry }}
+            - name: GOPOGO_LOADGEN_OTLP_HEADERS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ dig "headersSecret" "key" "headers" $.Values.telemetry | default "headers" }}
+            {{- end }}
+            {{- include "gopogo.resourceEnv" (dict "ctx" . "loadgen" true) | nindent 12 }}
+            {{- end }}
           {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}

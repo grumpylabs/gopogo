@@ -13,6 +13,9 @@ import (
 	"time"
 
 	"github.com/grumpylabs/gopogo/internal/cache"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // This file is the command layer shared by the RESP, HTTP and Postgres
@@ -47,6 +50,8 @@ type session struct {
 	addr   string
 	authed bool
 	ctx    context.Context // parent for command spans; nil means Background
+	next   context.Context // parent for the next command only, from TRACEPARENT
+	cmd    context.Context // the running command's span, parent for cache spans
 }
 
 // rv is a RESP value.
@@ -180,17 +185,25 @@ func (x *Executor) exec(s *session, args []string) result {
 		return errResult("ERR empty command")
 	}
 	name := strings.ToUpper(args[0])
+	if name == "TRACEPARENT" {
+		return cmdTraceparent(s, args)
+	}
 	fn := commands[name]
 	spanName := name
 	if fn == nil {
 		spanName = "UNKNOWN"
 	}
 	parent := s.ctx
+	if s.next != nil {
+		parent, s.next = s.next, nil
+	}
 	if parent == nil {
 		parent = context.Background()
 	}
 	obs := beginCommand(parent, s.proto, s.addr, spanName)
+	s.cmd = obs.ctx
 	r := x.run(s, name, fn, args)
+	s.cmd = nil
 	obs.end(r.err)
 	return r
 }
@@ -224,6 +237,28 @@ func cmdAuth(x *Executor, s *session, name string, args []string) result {
 		return result{resp: rvOK(), pg: pgTag("AUTH OK")}
 	}
 	return errResult("WRONGPASS invalid username-password pair or user is disabled.")
+}
+
+// cmdTraceparent handles TRACEPARENT <traceparent> [<tracestate>], which
+// makes the W3C trace context the parent of the connection's next command,
+// so a client can carry its trace over protocols with no headers. It is
+// observability plumbing, not a cache command: it gets no span, metrics or
+// MONITOR line, and needs no AUTH (the next command still does). Clients
+// pipeline it with the command it describes.
+func cmdTraceparent(s *session, args []string) result {
+	if len(args) < 2 || len(args) > 3 {
+		return wrongArgs("TRACEPARENT")
+	}
+	carrier := propagation.MapCarrier{"traceparent": args[1]}
+	if len(args) == 3 {
+		carrier["tracestate"] = args[2]
+	}
+	ctx := propagation.TraceContext{}.Extract(context.Background(), carrier)
+	if !trace.SpanContextFromContext(ctx).IsValid() {
+		return errResult("ERR invalid traceparent")
+	}
+	s.next = ctx
+	return result{resp: rvOK(), pg: pgTag("TRACEPARENT")}
 }
 
 func cmdPing(x *Executor, s *session, name string, args []string) result {
@@ -268,7 +303,9 @@ func cmdGet(x *Executor, s *session, name string, args []string) result {
 	if len(args) != 2 {
 		return wrongArgs(name)
 	}
+	span := x.startCacheSpan(s.cmd, "cache.load", []byte(args[1]))
 	entry, found := x.cache.Load([]byte(args[1]))
+	endCacheHit(span, found)
 	ctr(s.proto).cmdGet.Add(1)
 	countHit(found, &ctr(s.proto).getHits, &ctr(s.proto).getMisses)
 	// GET is the hottest command: render only the reply this protocol sends.
@@ -381,9 +418,18 @@ func cmdSet(x *Executor, s *session, name string, args []string) result {
 
 	var stored bool
 	var old *string
+	span := x.startCacheSpan(s.cmd, "cache.store", key)
 	switch {
 	case withCAS:
 		ok, err := x.cache.CompareAndSwap(key, val, cas, opts)
+		res := cache.Replaced
+		switch {
+		case err == cache.ErrOutOfMemory:
+			res = cache.NoMemory
+		case !ok:
+			res = cache.NotStored
+		}
+		endCacheStore(span, res)
 		if err == cache.ErrOutOfMemory {
 			return noMemory(s.proto)
 		}
@@ -396,12 +442,17 @@ func cmdSet(x *Executor, s *session, name string, args []string) result {
 		}
 		res := b.Store(key, val, opts)
 		b.End()
+		endCacheStore(span, res)
 		if res == cache.NoMemory {
 			return noMemory(s.proto)
 		}
 		stored = res != cache.NotStored
 	default:
 		res, err := x.cache.Store(key, val, opts)
+		if err == cache.ErrOutOfMemory {
+			res = cache.NoMemory
+		}
+		endCacheStore(span, res)
 		if err == cache.ErrOutOfMemory {
 			return noMemory(s.proto)
 		}
@@ -450,7 +501,13 @@ func cmdSetEx(x *Executor, s *session, name string, args []string) result {
 		return errResult(errExpire)
 	}
 	ctr(s.proto).cmdSet.Add(1)
-	if _, err := x.cache.Store([]byte(args[1]), []byte(args[3]), &cache.StoreOptions{TTL: ttl}); err != nil {
+	span := x.startCacheSpan(s.cmd, "cache.store", []byte(args[1]))
+	res, err := x.cache.Store([]byte(args[1]), []byte(args[3]), &cache.StoreOptions{TTL: ttl})
+	if err != nil {
+		res = cache.NoMemory
+	}
+	endCacheStore(span, res)
+	if err != nil {
 		return noMemory(s.proto)
 	}
 	return result{resp: rvOK(), pg: pgTag("SETEX 1")}
@@ -462,7 +519,9 @@ func cmdDel(x *Executor, s *session, name string, args []string) result {
 	}
 	var deleted int64
 	for _, k := range args[1:] {
+		span := x.startCacheSpan(s.cmd, "cache.delete", []byte(k))
 		found := x.cache.Delete([]byte(k))
+		endCacheHit(span, found)
 		countHit(found, &ctr(s.proto).deleteHits, &ctr(s.proto).deleteMisses)
 		if found {
 			deleted++
@@ -483,7 +542,10 @@ func cmdExists(x *Executor, s *session, name string, args []string) result {
 	}
 	var n int64
 	for _, k := range args[1:] {
-		if _, found := x.cache.Load([]byte(k)); found {
+		span := x.startCacheSpan(s.cmd, "cache.load", []byte(k))
+		_, found := x.cache.Load([]byte(k))
+		endCacheHit(span, found)
+		if found {
 			n++
 		}
 	}
@@ -502,7 +564,9 @@ func cmdMGet(x *Executor, s *session, name string, args []string) result {
 	}
 	vals := make([]rv, 0, len(args)-1)
 	for _, k := range args[1:] {
+		span := x.startCacheSpan(s.cmd, "cache.load", []byte(k))
 		e, found := x.cache.Load([]byte(k))
+		endCacheHit(span, found)
 		ctr(s.proto).cmdGet.Add(1)
 		countHit(found, &ctr(s.proto).getHits, &ctr(s.proto).getMisses)
 		if !found {
@@ -529,7 +593,13 @@ func cmdMSet(x *Executor, s *session, name string, args []string) result {
 	}
 	for i := 1; i < len(args); i += 2 {
 		ctr(s.proto).cmdSet.Add(1)
-		if _, err := x.cache.Store([]byte(args[i]), []byte(args[i+1]), nil); err != nil {
+		span := x.startCacheSpan(s.cmd, "cache.store", []byte(args[i]))
+		res, err := x.cache.Store([]byte(args[i]), []byte(args[i+1]), nil)
+		if err != nil {
+			res = cache.NoMemory
+		}
+		endCacheStore(span, res)
+		if err != nil {
 			return noMemory(s.proto)
 		}
 	}
@@ -557,7 +627,10 @@ func cmdIncr(x *Executor, s *session, name string, args []string) result {
 		if delta, err = strconv.ParseUint(deltaStr, 10, 64); err != nil {
 			return errResult(errNotInteger)
 		}
-		if n, err = x.cache.IncrementUnsigned(key, delta, decr); err == nil {
+		span := x.startCacheSpan(s.cmd, "cache.increment", key)
+		n, err = x.cache.IncrementUnsigned(key, delta, decr)
+		endCacheErr(span, err)
+		if err == nil {
 			countIncr(s.proto, decr)
 			v := strconv.FormatUint(n, 10)
 			return result{resp: rvUint(n), pg: pgRow("value", v, tag)}
@@ -573,7 +646,10 @@ func cmdIncr(x *Executor, s *session, name string, args []string) result {
 			}
 			delta = -delta
 		}
-		if n, err = x.cache.Increment(key, delta); err == nil {
+		span := x.startCacheSpan(s.cmd, "cache.increment", key)
+		n, err = x.cache.Increment(key, delta)
+		endCacheErr(span, err)
+		if err == nil {
 			countIncr(s.proto, decr)
 			v := strconv.FormatInt(n, 10)
 			return result{resp: rvInt(n), pg: pgRow("value", v, tag)}
@@ -604,7 +680,10 @@ func cmdAppend(x *Executor, s *session, name string, args []string) result {
 	prepend := name == "PREPEND"
 	value := args[2]
 	var n int
+	var existed bool
+	span := x.startCacheSpan(s.cmd, "cache.update", []byte(args[1]))
 	err := x.cache.Update([]byte(args[1]), func(cur []byte, found bool) ([]byte, error) {
+		existed = found
 		out := make([]byte, 0, len(cur)+len(value))
 		if prepend {
 			out = append(append(out, value...), cur...)
@@ -614,6 +693,10 @@ func cmdAppend(x *Executor, s *session, name string, args []string) result {
 		n = len(out)
 		return out, nil
 	})
+	if span != nil {
+		span.SetAttributes(attribute.Bool("gopogo.cache.hit", existed))
+	}
+	endCacheErr(span, err)
 	if err != nil {
 		return noMemory(s.proto)
 	}
@@ -629,7 +712,10 @@ func cmdExpire(x *Executor, s *session, name string, args []string) result {
 		return errResult(errNotInteger)
 	}
 	var n int64
-	if entry, found := x.cache.Load([]byte(args[1])); found {
+	span := x.startCacheSpan(s.cmd, "cache.expire", []byte(args[1]))
+	entry, found := x.cache.Load([]byte(args[1]))
+	endCacheHit(span, found)
+	if found {
 		entry.SetExpireAt(time.Now().Add(time.Duration(seconds) * time.Second).UnixNano())
 		n = 1
 	}
@@ -646,7 +732,9 @@ func cmdTTL(x *Executor, s *session, name string, args []string) result {
 		unit = time.Millisecond
 	}
 	var ttl int64
+	span := x.startCacheSpan(s.cmd, "cache.load", []byte(args[1]))
 	entry, found := x.cache.Load([]byte(args[1]))
+	endCacheHit(span, found)
 	switch {
 	case !found:
 		ttl = -2
@@ -665,7 +753,9 @@ func cmdTouch(x *Executor, s *session, name string, args []string) result {
 	}
 	var n int64
 	for _, k := range args[1:] {
+		span := x.startCacheSpan(s.cmd, "cache.touch", []byte(k))
 		_, found := x.cache.LoadWithOptions([]byte(k), nil)
+		endCacheHit(span, found)
 		ctr(s.proto).cmdTouch.Add(1)
 		countHit(found, &ctr(s.proto).touchHits, &ctr(s.proto).touchMisses)
 		if found {

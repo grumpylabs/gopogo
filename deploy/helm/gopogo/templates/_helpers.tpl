@@ -133,21 +133,27 @@ telemetry.clusterName, telemetry.serviceNamespace and
 telemetry.resourceAttributes. Kubernetes expands $(VAR) from the variables
 defined before it. An attribute also set by the image's
 OTEL_RESOURCE_ATTRIBUTES (e.g. via extraEnv) takes the later value.
+Called with (dict "ctx" $ "loadgen" true) for the loadgen's pod, else with $.
 */}}
 {{- define "gopogo.resourceEnv" -}}
-{{- $t := .Values.telemetry -}}
+{{- $ctx := . -}}
+{{- $loadgen := false -}}
+{{- if hasKey . "ctx" }}{{ $ctx = .ctx }}{{ $loadgen = .loadgen }}{{ end -}}
+{{- $t := $ctx.Values.telemetry -}}
 {{- $attrs := list
   "k8s.pod.name=$(K8S_POD_NAME)"
   "k8s.pod.uid=$(K8S_POD_UID)"
   "k8s.namespace.name=$(K8S_NAMESPACE_NAME)"
   "k8s.node.name=$(K8S_NODE_NAME)"
-  "k8s.container.name=gopogo"
+  (printf "k8s.container.name=%s" (ternary "loadgen" "gopogo" $loadgen))
   "service.instance.id=$(K8S_POD_NAME)"
 -}}
-{{- if .Values.persistence.enabled }}
-{{- $attrs = append $attrs (printf "k8s.statefulset.name=%s" (include "gopogo.fullname" .)) -}}
+{{- if $loadgen }}
+{{- $attrs = append $attrs (printf "k8s.deployment.name=%s-loadgen" (include "gopogo.fullname" $ctx)) -}}
+{{- else if $ctx.Values.persistence.enabled }}
+{{- $attrs = append $attrs (printf "k8s.statefulset.name=%s" (include "gopogo.fullname" $ctx)) -}}
 {{- else }}
-{{- $attrs = append $attrs (printf "k8s.deployment.name=%s" (include "gopogo.fullname" .)) -}}
+{{- $attrs = append $attrs (printf "k8s.deployment.name=%s" (include "gopogo.fullname" $ctx)) -}}
 {{- end }}
 {{- with $t.clusterName }}
 {{- $attrs = append $attrs (printf "k8s.cluster.name=%s" .) -}}

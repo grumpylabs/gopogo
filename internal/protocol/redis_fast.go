@@ -15,14 +15,16 @@ import (
 // anything else, which takes the general path.
 func (h *RedisHandler) fast(c *Conn, argv [][]byte, out []byte) ([]byte, bool) {
 	s := c.redis
-	if !s.authed || s.ctx != nil {
+	if !s.authed || s.ctx != nil || s.next != nil {
 		return out, false
 	}
 	switch {
 	case len(argv) == 2 && isCommand(argv[0], "GET"):
 		obs := beginCommand(context.Background(), TypeRedis, s.addr, "GET")
 		publishFast(s.addr, argv)
+		span := h.exec.startCacheSpan(obs.ctx, "cache.load", argv[1])
 		entry, found := h.exec.cache.Load(argv[1])
+		endCacheHit(span, found)
 		ctr(TypeRedis).cmdGet.Add(1)
 		countHit(found, &ctr(TypeRedis).getHits, &ctr(TypeRedis).getMisses)
 		if !found {
@@ -46,7 +48,13 @@ func (h *RedisHandler) fast(c *Conn, argv [][]byte, out []byte) ([]byte, bool) {
 		key := kv[:copy(kv, argv[1]):len(argv[1])]
 		val := kv[len(key):]
 		copy(val, argv[2])
-		if _, err := h.exec.cache.Store(key, val, nil); err == cache.ErrOutOfMemory {
+		span := h.exec.startCacheSpan(obs.ctx, "cache.store", key)
+		res, err := h.exec.cache.Store(key, val, nil)
+		if err == cache.ErrOutOfMemory {
+			res = cache.NoMemory
+		}
+		endCacheStore(span, res)
+		if err == cache.ErrOutOfMemory {
 			r := noMemory(TypeRedis)
 			out = appendRESP(out, rv{kind: '-', s: r.err})
 			obs.end(r.err)
