@@ -246,13 +246,33 @@ func logContext(ctx context.Context) zap.Field {
 // startCacheSpan starts the span for one cache operation under the command
 // span in ctx, or returns nil when there is none or it is not recording.
 func (x *Executor) startCacheSpan(ctx context.Context, op string, key []byte) trace.Span {
+	return startCacheSpanIn(ctx, x.cache, op, key)
+}
+
+// startCacheSpan is the memcache handler's startCacheSpan.
+func (h *MemcacheHandler) startCacheSpan(ctx context.Context, op string, key []byte) trace.Span {
+	return startCacheSpanIn(ctx, h.cache, op, key)
+}
+
+func startCacheSpanIn(ctx context.Context, c *cache.Cache, op string, key []byte) trace.Span {
 	if ctx == nil || !trace.SpanFromContext(ctx).IsRecording() {
 		return nil
 	}
 	_, span := otel.Tracer(instrumentationName).Start(ctx, op,
 		trace.WithSpanKind(trace.SpanKindInternal),
-		trace.WithAttributes(attribute.Int("gopogo.shard", x.cache.ShardIndex(key))))
+		trace.WithAttributes(attribute.Int("gopogo.shard", c.ShardIndex(key))))
 	return span
+}
+
+// endCacheMiss ends a cache span for an operation whose not-found error is
+// an ordinary miss (memcache append, incr): hit unless notFound, and failed
+// only on another error.
+func endCacheMiss(span trace.Span, err, notFound error) {
+	if err == nil || err == notFound {
+		endCacheHit(span, err == nil)
+		return
+	}
+	endCacheErr(span, err)
 }
 
 // endCacheHit ends a cache span with whether the key was found.
