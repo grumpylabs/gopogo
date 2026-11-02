@@ -45,6 +45,7 @@ spec:
             - --workers={{ $lg.workers | default 4 }}
             - --keys={{ $lg.keys | default 10000 }}
             - --duration={{ $lg.duration | default "0" }}
+            - --protocol={{ $lg.protocol | default "redis" }}
             {{- if $traced }}
             {{- $t := .Values.telemetry }}
             {{- /* Traces go where the server's do, so each operation's trace

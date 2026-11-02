@@ -103,11 +103,28 @@ func (h *MemcacheHandler) process(c *Conn, in, out []byte) (int, []byte, Action)
 		}
 		pos = next
 
+		// traceparent <traceparent> [<tracestate>] parents the next command,
+		// as TRACEPARENT does over RESP; a gopogo extension, not memcached's.
+		if cmd == "traceparent" {
+			if len(parts) < 2 || len(parts) > 3 {
+				w.WriteString("ERROR\r\n")
+			} else if ctx, ok := parseTraceparent(parts[1:]); ok {
+				c.mcNext = ctx
+				w.WriteString("OK\r\n")
+			} else {
+				w.WriteString("CLIENT_ERROR invalid traceparent\r\n")
+			}
+			continue
+		}
+		parent := context.Background()
+		if c.mcNext != nil {
+			parent, c.mcNext = c.mcNext, nil
+		}
 		spanName := cmd
 		if !memcacheCmds[cmd] {
 			spanName = "UNKNOWN"
 		}
-		obs := beginCommand(context.Background(), TypeMemcache, c.addr, spanName)
+		obs := beginCommand(parent, TypeMemcache, c.addr, spanName)
 		replyStart := len(w.b)
 		if h.auth != "" {
 			if cmd == "quit" {

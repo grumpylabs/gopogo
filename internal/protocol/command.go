@@ -249,16 +249,23 @@ func cmdTraceparent(s *session, args []string) result {
 	if len(args) < 2 || len(args) > 3 {
 		return wrongArgs("TRACEPARENT")
 	}
-	carrier := propagation.MapCarrier{"traceparent": args[1]}
-	if len(args) == 3 {
-		carrier["tracestate"] = args[2]
-	}
-	ctx := propagation.TraceContext{}.Extract(context.Background(), carrier)
-	if !trace.SpanContextFromContext(ctx).IsValid() {
+	ctx, ok := parseTraceparent(args[1:])
+	if !ok {
 		return errResult("ERR invalid traceparent")
 	}
 	s.next = ctx
 	return result{resp: rvOK(), pg: pgTag("TRACEPARENT")}
+}
+
+// parseTraceparent extracts the W3C trace context from [traceparent,
+// tracestate?], reporting whether it is valid.
+func parseTraceparent(args []string) (context.Context, bool) {
+	carrier := propagation.MapCarrier{"traceparent": args[0]}
+	if len(args) == 2 {
+		carrier["tracestate"] = args[1]
+	}
+	ctx := propagation.TraceContext{}.Extract(context.Background(), carrier)
+	return ctx, trace.SpanContextFromContext(ctx).IsValid()
 }
 
 func cmdPing(x *Executor, s *session, name string, args []string) result {

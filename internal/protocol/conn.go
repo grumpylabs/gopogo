@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"net"
 )
@@ -55,8 +56,9 @@ type Conn struct {
 	proto Type // TypeUnknown until the first bytes are seen
 
 	redis   *session
-	argv    [][]byte    // RESP parse scratch
-	monitor chan string // MONITOR subscription, set before a Takeover
+	mcNext  context.Context // memcache: parent for the next command only, from traceparent
+	argv    [][]byte        // RESP parse scratch
+	monitor chan string     // MONITOR subscription, set before a Takeover
 }
 
 // NewConn returns the state for a new connection from addr. Its protocol is
