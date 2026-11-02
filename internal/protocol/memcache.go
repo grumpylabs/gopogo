@@ -140,40 +140,40 @@ func (h *MemcacheHandler) process(c *Conn, in, out []byte) (int, []byte, Action)
 
 		switch cmd {
 		case "get", "gets":
-			h.writeValues(w, parts[1:], cmd == "gets", nil)
+			h.writeValues(obs.ctx, w, parts[1:], cmd == "gets", nil)
 
 		case "set":
-			h.handleStore(w, parts, data, false, false)
+			h.handleStore(obs.ctx, w, parts, data, false, false)
 
 		case "add":
-			h.handleStore(w, parts, data, true, false)
+			h.handleStore(obs.ctx, w, parts, data, true, false)
 
 		case "replace":
-			h.handleStore(w, parts, data, false, true)
+			h.handleStore(obs.ctx, w, parts, data, false, true)
 
 		case "append":
-			h.handleAppend(w, parts, data, true)
+			h.handleAppend(obs.ctx, w, parts, data, true)
 
 		case "prepend":
-			h.handleAppend(w, parts, data, false)
+			h.handleAppend(obs.ctx, w, parts, data, false)
 
 		case "cas":
-			h.handleCAS(w, parts, data)
+			h.handleCAS(obs.ctx, w, parts, data)
 
 		case "delete":
-			h.handleDelete(w, parts)
+			h.handleDelete(obs.ctx, w, parts)
 
 		case "incr":
-			h.handleIncr(w, parts, true)
+			h.handleIncr(obs.ctx, w, parts, true)
 
 		case "decr":
-			h.handleIncr(w, parts, false)
+			h.handleIncr(obs.ctx, w, parts, false)
 
 		case "touch":
-			h.handleTouch(w, parts)
+			h.handleTouch(obs.ctx, w, parts)
 
 		case "gat", "gats":
-			h.handleGAT(w, parts, cmd == "gats")
+			h.handleGAT(obs.ctx, w, parts, cmd == "gats")
 
 		case "verbosity":
 			// Logging levels are not configurable; accept and acknowledge.
@@ -262,7 +262,7 @@ func memcacheErrorReply(reply []byte) string {
 
 // handleGAT implements gat/gats <exptime> <key>*: return the found keys, like
 // get/gets, and set their expiration.
-func (h *MemcacheHandler) handleGAT(writer *outBuf, parts []string, withCAS bool) {
+func (h *MemcacheHandler) handleGAT(ctx context.Context, writer *outBuf, parts []string, withCAS bool) {
 	if len(parts) < 3 {
 		writer.WriteString("ERROR\r\n")
 		return
@@ -273,14 +273,20 @@ func (h *MemcacheHandler) handleGAT(writer *outBuf, parts []string, withCAS bool
 		return
 	}
 	expireAt := memcacheExpireAt(exptime)
-	h.writeValues(writer, parts[2:], withCAS, func(e *cache.Entry) { e.SetExpireAt(expireAt) })
+	h.writeValues(ctx, writer, parts[2:], withCAS, func(e *cache.Entry) { e.SetExpireAt(expireAt) })
 }
 
 // writeValues writes a VALUE block for each found key, then END. touch, if
 // set, is applied to each found entry after its value is read.
-func (h *MemcacheHandler) writeValues(writer *outBuf, keys []string, withCAS bool, touch func(*cache.Entry)) {
+func (h *MemcacheHandler) writeValues(ctx context.Context, writer *outBuf, keys []string, withCAS bool, touch func(*cache.Entry)) {
+	op := "cache.load"
+	if touch != nil {
+		op = "cache.touch"
+	}
 	for _, key := range keys {
+		span := h.startCacheSpan(ctx, op, []byte(key))
 		entry, found := h.cache.Load([]byte(key))
+		endCacheHit(span, found)
 		ctr(TypeMemcache).cmdGet.Add(1)
 		countHit(found, &ctr(TypeMemcache).getHits, &ctr(TypeMemcache).getMisses)
 		if touch != nil {
@@ -345,7 +351,7 @@ func memcacheTTL(exptime int64) time.Duration {
 	}
 }
 
-func (h *MemcacheHandler) handleStore(writer *outBuf, parts []string, data []byte, addOnly, replaceOnly bool) {
+func (h *MemcacheHandler) handleStore(ctx context.Context, writer *outBuf, parts []string, data []byte, addOnly, replaceOnly bool) {
 	if len(parts) < 5 {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
@@ -373,9 +379,11 @@ func (h *MemcacheHandler) handleStore(writer *outBuf, parts []string, data []byt
 	noreply := len(parts) > 5 && parts[5] == "noreply"
 	
 	
+	span := h.startCacheSpan(ctx, "cache.store", []byte(key))
 	existing, _ := h.cache.Load([]byte(key))
 	
 	if addOnly && existing != nil {
+		endCacheStore(span, cache.NotStored)
 		if !noreply {
 			writer.WriteString("NOT_STORED\r\n")
 		}
@@ -383,6 +391,7 @@ func (h *MemcacheHandler) handleStore(writer *outBuf, parts []string, data []byt
 	}
 	
 	if replaceOnly && existing == nil {
+		endCacheStore(span, cache.NotStored)
 		if !noreply {
 			writer.WriteString("NOT_STORED\r\n")
 		}
@@ -396,7 +405,12 @@ func (h *MemcacheHandler) handleStore(writer *outBuf, parts []string, data []byt
 	opts.TTL = memcacheTTL(exptime)
 	
 	ctr(TypeMemcache).cmdSet.Add(1)
-	if _, err := h.cache.Store([]byte(key), data, opts); err != nil {
+	res, err := h.cache.Store([]byte(key), data, opts)
+	if err != nil {
+		res = cache.NoMemory
+	}
+	endCacheStore(span, res)
+	if err != nil {
 		ctr(TypeMemcache).storeNoMemory.Add(1)
 		if !noreply {
 			writer.WriteString(memcacheNoMemory)
@@ -409,7 +423,7 @@ func (h *MemcacheHandler) handleStore(writer *outBuf, parts []string, data []byt
 	}
 }
 
-func (h *MemcacheHandler) handleCAS(writer *outBuf, parts []string, data []byte) {
+func (h *MemcacheHandler) handleCAS(ctx context.Context, writer *outBuf, parts []string, data []byte) {
 	if len(parts) < 6 {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
@@ -450,7 +464,16 @@ func (h *MemcacheHandler) handleCAS(writer *outBuf, parts []string, data []byte)
 	opts.TTL = memcacheTTL(exptime)
 	
 	ctr(TypeMemcache).cmdSet.Add(1)
+	span := h.startCacheSpan(ctx, "cache.store", []byte(key))
 	success, err := h.cache.CompareAndSwap([]byte(key), data, cas, opts)
+	res := cache.Replaced
+	switch {
+	case err == cache.ErrOutOfMemory:
+		res = cache.NoMemory
+	case err != nil || !success:
+		res = cache.NotStored
+	}
+	endCacheStore(span, res)
 	if err == cache.ErrOutOfMemory {
 		ctr(TypeMemcache).storeNoMemory.Add(1)
 	}
@@ -477,7 +500,7 @@ func (h *MemcacheHandler) handleCAS(writer *outBuf, parts []string, data []byte)
 	}
 }
 
-func (h *MemcacheHandler) handleAppend(writer *outBuf, parts []string, data []byte, isAppend bool) {
+func (h *MemcacheHandler) handleAppend(ctx context.Context, writer *outBuf, parts []string, data []byte, isAppend bool) {
 	if len(parts) < 5 {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
@@ -494,6 +517,7 @@ func (h *MemcacheHandler) handleAppend(writer *outBuf, parts []string, data []by
 	
 	
 	// Update is atomic and keeps the entry's flags and TTL.
+	span := h.startCacheSpan(ctx, "cache.update", []byte(key))
 	err = h.cache.Update([]byte(key), func(cur []byte, found bool) ([]byte, error) {
 		if !found {
 			return nil, errMemcacheNotFound
@@ -506,6 +530,7 @@ func (h *MemcacheHandler) handleAppend(writer *outBuf, parts []string, data []by
 		}
 		return out, nil
 	})
+	endCacheMiss(span, err, errMemcacheNotFound)
 	if err != nil {
 		if err == cache.ErrOutOfMemory {
 			ctr(TypeMemcache).storeNoMemory.Add(1)
@@ -525,7 +550,7 @@ func (h *MemcacheHandler) handleAppend(writer *outBuf, parts []string, data []by
 	}
 }
 
-func (h *MemcacheHandler) handleDelete(writer *outBuf, parts []string) {
+func (h *MemcacheHandler) handleDelete(ctx context.Context, writer *outBuf, parts []string) {
 	if len(parts) < 2 {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
@@ -534,7 +559,9 @@ func (h *MemcacheHandler) handleDelete(writer *outBuf, parts []string) {
 	key := parts[1]
 	noreply := len(parts) > 2 && parts[len(parts)-1] == "noreply"
 	
+	span := h.startCacheSpan(ctx, "cache.delete", []byte(key))
 	found := h.cache.Delete([]byte(key))
+	endCacheHit(span, found)
 	countHit(found, &ctr(TypeMemcache).deleteHits, &ctr(TypeMemcache).deleteMisses)
 	if found {
 		if !noreply {
@@ -555,7 +582,7 @@ var (
 // handleIncr implements incr/decr on unsigned 64-bit decimal values. Like
 // memcached, a missing key is NOT_FOUND, incr wraps around at 2^64 and decr
 // stops at 0.
-func (h *MemcacheHandler) handleIncr(writer *outBuf, parts []string, incr bool) {
+func (h *MemcacheHandler) handleIncr(ctx context.Context, writer *outBuf, parts []string, incr bool) {
 	if len(parts) < 3 {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
@@ -571,6 +598,7 @@ func (h *MemcacheHandler) handleIncr(writer *outBuf, parts []string, incr bool) 
 	noreply := len(parts) > 3 && parts[3] == "noreply"
 
 	var newVal uint64
+	span := h.startCacheSpan(ctx, "cache.increment", []byte(key))
 	err = h.cache.Update([]byte(key), func(cur []byte, found bool) ([]byte, error) {
 		if !found {
 			return nil, errMemcacheNotFound
@@ -589,6 +617,7 @@ func (h *MemcacheHandler) handleIncr(writer *outBuf, parts []string, incr bool) 
 		}
 		return strconv.AppendUint(nil, newVal, 10), nil
 	})
+	endCacheMiss(span, err, errMemcacheNotFound)
 	hits, misses := incrOrDecr(incr)
 	switch err {
 	case nil:
@@ -613,7 +642,7 @@ func (h *MemcacheHandler) handleIncr(writer *outBuf, parts []string, incr bool) 
 	}
 }
 
-func (h *MemcacheHandler) handleTouch(writer *outBuf, parts []string) {
+func (h *MemcacheHandler) handleTouch(ctx context.Context, writer *outBuf, parts []string) {
 	if len(parts) < 3 {
 		writer.WriteString("CLIENT_ERROR bad command line format\r\n")
 		return
@@ -628,7 +657,9 @@ func (h *MemcacheHandler) handleTouch(writer *outBuf, parts []string) {
 	
 	noreply := len(parts) > 3 && parts[3] == "noreply"
 	
+	span := h.startCacheSpan(ctx, "cache.touch", []byte(key))
 	entry, found := h.cache.Load([]byte(key))
+	endCacheHit(span, found)
 	ctr(TypeMemcache).cmdTouch.Add(1)
 	countHit(found, &ctr(TypeMemcache).touchHits, &ctr(TypeMemcache).touchMisses)
 	if !found {

@@ -170,11 +170,7 @@ func TestCacheSpans(t *testing.T) {
 	c.expect("v2", "GET", "a")
 	c.expect("v2", "GET", "a") // fast path: hit
 
-	type want struct {
-		name, parent, key, attr, val string
-		failed                       bool
-	}
-	wants := []want{
+	wants := []cacheSpanWant{
 		{"cache.store", "SET", "a", "gopogo.cache.result", "inserted", false},
 		{"cache.store", "SET", "a", "gopogo.cache.result", "replaced", false},
 		{"cache.load", "MGET", "a", "gopogo.cache.hit", "true", false},
@@ -182,8 +178,24 @@ func TestCacheSpans(t *testing.T) {
 		{"cache.increment", "INCR", "a", "", "", true},
 		{"cache.load", "GET", "a", "gopogo.cache.hit", "true", false},
 	}
+	checkCacheSpans(t, rec, ch, 11, wants)
+}
+
+// cacheSpanWant is a cache span as checkCacheSpans compares it: its name,
+// its command span's name, its key (a or b, from its shard), its outcome
+// attribute and value, and whether it failed.
+type cacheSpanWant struct {
+	name, parent, key, attr, val string
+	failed                       bool
+}
+
+// checkCacheSpans waits for n ended spans, then checks the cache spans among
+// them against wants: each internal, in its command span's trace. Keys a and
+// b must fall in different shards.
+func checkCacheSpans(t *testing.T, rec *tracetest.SpanRecorder, ch *cache.Cache, n int, wants []cacheSpanWant) {
+	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
-	for len(rec.Ended()) < 11 && time.Now().Before(deadline) {
+	for len(rec.Ended()) < n && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	spans := rec.Ended()
@@ -195,7 +207,7 @@ func TestCacheSpans(t *testing.T) {
 		strconv.Itoa(ch.ShardIndex([]byte("a"))): "a",
 		strconv.Itoa(ch.ShardIndex([]byte("b"))): "b",
 	}
-	var got []want
+	var got []cacheSpanWant
 	for _, sp := range spans {
 		if !strings.HasPrefix(sp.Name(), "cache.") {
 			continue
@@ -207,7 +219,7 @@ func TestCacheSpans(t *testing.T) {
 		if sp.SpanKind() != trace.SpanKindInternal || sp.SpanContext().TraceID() != parent.SpanContext().TraceID() {
 			t.Errorf("%s: kind %v, or not in its command's trace", sp.Name(), sp.SpanKind())
 		}
-		w := want{sp.Name(), parent.Name(), shardKey[spanAttr(sp, "gopogo.shard")], "", "", sp.Status().Code == codes.Error}
+		w := cacheSpanWant{sp.Name(), parent.Name(), shardKey[spanAttr(sp, "gopogo.shard")], "", "", sp.Status().Code == codes.Error}
 		for _, k := range []string{"gopogo.cache.result", "gopogo.cache.hit"} {
 			if v := spanAttr(sp, k); v != "" {
 				w.attr, w.val = k, v
@@ -218,6 +230,49 @@ func TestCacheSpans(t *testing.T) {
 	if !reflect.DeepEqual(got, wants) {
 		t.Errorf("cache spans:\n got %v\nwant %v", got, wants)
 	}
+}
+
+func TestMemcacheCacheSpans(t *testing.T) {
+	rec := recordSpans(t)
+	ch := cache.New(nil)
+	server, client := net.Pipe()
+	go NewMemcacheHandler(ch, "").Handle(server)
+	defer client.Close()
+	client.SetDeadline(time.Now().Add(5 * time.Second))
+	r := bufio.NewReader(client)
+	expect := func(send string, want ...string) {
+		t.Helper()
+		if _, err := client.Write([]byte(send)); err != nil {
+			t.Fatal(err)
+		}
+		for _, w := range want {
+			if got, err := r.ReadString('\n'); err != nil || got != w+"\r\n" {
+				t.Fatalf("%q: got %q, %v; want %q", send, got, err, w)
+			}
+		}
+	}
+	expect("set a 0 0 2\r\nv1\r\n", "STORED")
+	expect("add a 0 0 2\r\nv2\r\n", "NOT_STORED")
+	expect("get a b\r\n", "VALUE a 0 2", "v1", "END")
+	expect("incr a 1\r\n", "CLIENT_ERROR cannot increment or decrement non-numeric value")
+	expect("incr b 1\r\n", "NOT_FOUND") // a miss, not a failure
+	expect("append b 0 0 1\r\nx\r\n", "NOT_STORED")
+	expect("touch a 60\r\n", "TOUCHED")
+	expect("delete b\r\n", "NOT_FOUND")
+	expect("gat 60 a\r\n", "VALUE a 0 2", "v1", "END")
+
+	checkCacheSpans(t, rec, ch, 19, []cacheSpanWant{
+		{"cache.store", "set", "a", "gopogo.cache.result", "inserted", false},
+		{"cache.store", "add", "a", "gopogo.cache.result", "not_stored", false},
+		{"cache.load", "get", "a", "gopogo.cache.hit", "true", false},
+		{"cache.load", "get", "b", "gopogo.cache.hit", "false", false},
+		{"cache.increment", "incr", "a", "", "", true},
+		{"cache.increment", "incr", "b", "gopogo.cache.hit", "false", false},
+		{"cache.update", "append", "b", "gopogo.cache.hit", "false", false},
+		{"cache.touch", "touch", "a", "gopogo.cache.hit", "true", false},
+		{"cache.delete", "delete", "b", "gopogo.cache.hit", "false", false},
+		{"cache.touch", "gat", "a", "gopogo.cache.hit", "true", false},
+	})
 }
 
 func TestHTTPSpanContinuesTrace(t *testing.T) {
