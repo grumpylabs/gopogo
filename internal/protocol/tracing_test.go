@@ -427,3 +427,47 @@ func TestHTTPServerMetricAndErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestMemcacheTraceparentParentsNextCommand(t *testing.T) {
+	rec := recordSpans(t)
+	server, client := net.Pipe()
+	go NewMemcacheHandler(cache.New(nil), "").Handle(server)
+	defer client.Close()
+	client.SetDeadline(time.Now().Add(5 * time.Second))
+	r := bufio.NewReader(client)
+	expect := func(send, want string) {
+		t.Helper()
+		if _, err := client.Write([]byte(send)); err != nil {
+			t.Fatal(err)
+		}
+		got, err := r.ReadString('\n')
+		if err != nil || got != want {
+			t.Fatalf("%q: got %q, %v; want %q", send, got, err, want)
+		}
+	}
+	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	const parentID = "00f067aa0ba902b7"
+	expect("traceparent 00-"+traceID+"-"+parentID+"-01\r\n", "OK\r\n")
+	expect("set k 0 0 1\r\nv\r\n", "STORED\r\n")
+	expect("delete k\r\n", "DELETED\r\n") // the context is used once
+	expect("traceparent garbage\r\n", "CLIENT_ERROR invalid traceparent\r\n")
+	expect("traceparent\r\n", "ERROR\r\n")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for len(commandSpans(rec)) < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	spans := commandSpans(rec)
+	if len(spans) != 2 {
+		t.Fatalf("got %d spans, want 2 (traceparent gets none)", len(spans))
+	}
+	set, del := spans[0], spans[1]
+	if set.Name() != "set" || set.SpanContext().TraceID().String() != traceID ||
+		set.Parent().SpanID().String() != parentID || !set.Parent().IsRemote() {
+		t.Errorf("set span %s in trace %s, parent %s; want trace %s, remote parent %s",
+			set.Name(), set.SpanContext().TraceID(), set.Parent().SpanID(), traceID, parentID)
+	}
+	if del.Name() != "delete" || del.Parent().IsValid() {
+		t.Errorf("delete span should start a new trace, got parent %s", del.Parent().SpanID())
+	}
+}
