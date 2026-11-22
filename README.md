@@ -385,3 +385,5 @@ MIT License - see [LICENSE](LICENSE). Gopogo is derived from pogocache, Copyrigh
 ## Acknowledgments
 
 Go port of [pogocache](https://github.com/tidwall/pogocache) by Josh Baker / Polypoint Labs.
+
+<!-- ci trigger: Dstl8 edge events test, 2026-11-22 -->
