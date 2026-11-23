@@ -1114,37 +1114,44 @@ func cmdInfo(x *Executor, s *session, name string, args []string) result {
 	return result{resp: rvBulk(info), pg: pgRow("info", info, "INFO")}
 }
 
+// matchPattern reports whether key matches a glob pattern of '*' (any run),
+// '?' (any byte) and '\' (escapes the next byte), as pogocache's match().
+// Only the last '*' seen needs revisiting on a mismatch, so it runs in
+// O(len(pattern)*len(key)); the recursive form was exponential in the
+// number of stars, which let KEYS or SCAN MATCH stall the server.
 func matchPattern(pattern, key string) bool {
-	if pattern == "*" {
-		return true
-	}
-
-	i, j := 0, 0
-	for i < len(pattern) && j < len(key) {
-		if pattern[i] == '*' {
-			if i == len(pattern)-1 {
-				return true
-			}
-			for j < len(key) {
-				if matchPattern(pattern[i+1:], key[j:]) {
-					return true
+	p, k := 0, 0
+	star, starK := -1, 0 // the last '*' in pattern, and where in key it resumes
+	for k < len(key) {
+		if p < len(pattern) {
+			switch c := pattern[p]; {
+			case c == '*':
+				star, starK = p, k
+				p++
+				continue
+			case c == '\\':
+				if p+1 < len(pattern) && pattern[p+1] == key[k] {
+					p += 2
+					k++
+					continue
 				}
-				j++
+			case c == '?' || c == key[k]:
+				p++
+				k++
+				continue
 			}
-			return false
-		} else if pattern[i] == '?' || pattern[i] == key[j] {
-			i++
-			j++
-		} else {
+		}
+		if star < 0 {
 			return false
 		}
+		// Let the last '*' absorb one more byte and retry after it.
+		starK++
+		p, k = star+1, starK
 	}
-
-	for i < len(pattern) && pattern[i] == '*' {
-		i++
+	for p < len(pattern) && pattern[p] == '*' {
+		p++
 	}
-
-	return i == len(pattern) && j == len(key)
+	return p == len(pattern)
 }
 
 func formatMemory(bytes int64) string {

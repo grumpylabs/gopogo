@@ -59,6 +59,9 @@ type Conn struct {
 	mcNext  context.Context // memcache: parent for the next command only, from traceparent
 	argv    [][]byte        // RESP parse scratch
 	monitor chan string     // MONITOR subscription, set before a Takeover
+	// HTTP: how far the pending request's chunked body has been checked,
+	// so a body arriving over many reads is scanned once.
+	httpScan int
 }
 
 // NewConn returns the state for a new connection from addr. Its protocol is

@@ -53,6 +53,9 @@ const (
 	byteaOID = 17
 
 	maxPGMessage = 1 << 30
+	// maxPGAuthMessage bounds SASL messages, read before the client is
+	// authenticated, as pogocache bounds them (64KB).
+	maxPGAuthMessage = 64 << 10
 )
 
 // pgToken is one parsed query argument. param is the 1-based parameter number
@@ -109,7 +112,7 @@ func (h *PostgresHandler) Handle(conn net.Conn) {
 		return
 	}
 	for !c.quitting {
-		typ, body, err := c.readMessage()
+		typ, body, err := c.readMessage(maxPGMessage)
 		if err != nil {
 			return
 		}
@@ -223,13 +226,14 @@ func isTLSConn(conn net.Conn) bool {
 	return ok
 }
 
-func (c *pgConn) readMessage() (byte, []byte, error) {
+// readMessage reads one message of at most limit bytes.
+func (c *pgConn) readMessage(limit uint32) (byte, []byte, error) {
 	var hdr [5]byte
 	if _, err := io.ReadFull(c.r, hdr[:]); err != nil {
 		return 0, nil, err
 	}
 	n := binary.BigEndian.Uint32(hdr[1:])
-	if n < 4 || n > maxPGMessage {
+	if n < 4 || n > limit {
 		return 0, nil, errPGProtocol
 	}
 	body, err := readFull(c.r, int(n-4))

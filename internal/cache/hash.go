@@ -1,13 +1,17 @@
 package cache
 
 import (
+	"hash/maphash"
 	"math/rand"
-
-	"github.com/cespare/xxhash/v2"
 )
 
+// hashSeed is random per process, as pogocache seeds its hash at startup:
+// with a fixed hash, clients could pick keys that all land in one shard
+// and bucket, and slow every operation on it.
+var hashSeed = maphash.MakeSeed()
+
 func hashKey(key []byte) uint64 {
-	return xxhash.Sum64(key)
+	return maphash.Bytes(hashSeed, key)
 }
 
 func (m *Map) resize(newSize int) {

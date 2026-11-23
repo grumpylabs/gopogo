@@ -66,7 +66,7 @@ func (h *HTTPHandler) process(c *Conn, in, out []byte) (int, []byte, Action) {
 	w := &httpWriter{outBuf: &outBuf{b: out}}
 	pos := 0
 	for pos < len(in) && len(w.b) < outputLimit {
-		req, n, err := parseHTTPRequest(in[pos:])
+		req, n, err := parseHTTPRequest(in[pos:], &c.httpScan)
 		if err != nil {
 			h.writeText(w, http.StatusBadRequest, "Bad Request\r\n")
 			return pos, w.b, Close
@@ -91,8 +91,9 @@ var errHTTPTooLarge = errors.New("request too large")
 // parseHTTPRequest parses one request, headers and body, at the start of
 // b. It returns the bytes consumed, or 0 when b holds only part of it.
 // Headers are parsed by net/http; the body is a Content-Length or chunked
-// body already in b.
-func parseHTTPRequest(b []byte) (*http.Request, int, error) {
+// body already in b. *scan carries chunkedLen's progress between calls for
+// the same request and is reset once it completes.
+func parseHTTPRequest(b []byte, scan *int) (*http.Request, int, error) {
 	end := httpHeaderEnd(b)
 	if end < 0 {
 		if len(b) > maxLine {
@@ -113,25 +114,21 @@ func parseHTTPRequest(b []byte) (*http.Request, int, error) {
 	n := end
 	switch {
 	case len(req.TransferEncoding) > 0 && req.TransferEncoding[0] == "chunked":
-		src := bytes.NewReader(b[end:])
-		cr := bufio.NewReader(src)
-		body, err = io.ReadAll(io.LimitReader(httputil.NewChunkedReader(cr), maxBulkLen+1))
-		if err == io.ErrUnexpectedEOF {
-			return nil, 0, nil
+		// Decoding on every read until the body was whole made a large
+		// body arriving in small reads cost quadratic time.
+		l, err := chunkedLen(b[end:], scan)
+		if err != nil || l == 0 {
+			if err != nil {
+				*scan = 0
+			}
+			return nil, 0, err
 		}
+		*scan = 0
+		n = end + l
+		body, err = io.ReadAll(httputil.NewChunkedReader(bytes.NewReader(b[end:n])))
 		if err != nil {
 			return nil, 0, err
 		}
-		if len(body) > maxBulkLen {
-			return nil, 0, errHTTPTooLarge
-		}
-		n = len(b) - src.Len() - cr.Buffered()
-		// The trailer, usually empty, ends with a blank line.
-		t := httpHeaderEnd(append([]byte("\n"), b[n:]...))
-		if t < 0 {
-			return nil, 0, nil
-		}
-		n += t - 1
 	case req.ContentLength > maxBulkLen:
 		return nil, 0, errHTTPTooLarge
 	case req.ContentLength > 0:
@@ -143,6 +140,65 @@ func parseHTTPRequest(b []byte) (*http.Request, int, error) {
 	}
 	req.Body = io.NopCloser(bytes.NewReader(body))
 	return req, n, nil
+}
+
+var errBadChunk = errors.New("malformed chunked body")
+
+// chunkedLen returns the length of the chunked body at the start of b,
+// through the blank line that ends its trailer, or 0 if it has not all
+// arrived. *from is where scanning resumes, the start of the first chunk not
+// yet seen whole, so each call reads only what arrived since the last.
+func chunkedLen(b []byte, from *int) (int, error) {
+	i := *from
+	for {
+		j := bytes.IndexByte(b[i:], '\n')
+		if j < 0 {
+			if len(b)-i > maxLine {
+				return 0, errHTTPTooLarge
+			}
+			*from = i
+			return 0, nil
+		}
+		line := b[i : i+j]
+		if k := bytes.IndexByte(line, ';'); k >= 0 {
+			line = line[:k] // chunk extensions are ignored
+		}
+		size, err := strconv.ParseUint(string(bytes.TrimSpace(line)), 16, 62)
+		if err != nil {
+			return 0, errBadChunk
+		}
+		data := i + j + 1
+		if size == 0 {
+			// The trailer, usually empty, ends with a blank line.
+			rest := b[data:]
+			switch {
+			case bytes.HasPrefix(rest, []byte("\r\n")):
+				return data + 2, nil
+			case bytes.HasPrefix(rest, []byte("\n")):
+				return data + 1, nil
+			}
+			if t := httpHeaderEnd(rest); t >= 0 {
+				return data + t, nil
+			}
+			if len(rest) > maxLine {
+				return 0, errHTTPTooLarge
+			}
+			*from = i
+			return 0, nil
+		}
+		if size > maxBulkLen || data+int(size)+2 > maxBulkLen {
+			return 0, errHTTPTooLarge
+		}
+		next := data + int(size) + 2
+		if next > len(b) {
+			*from = i
+			return 0, nil
+		}
+		if b[next-2] != '\r' || b[next-1] != '\n' {
+			return 0, errBadChunk
+		}
+		i = next
+	}
 }
 
 // httpHeaderEnd returns the length of the header block at the start of b,
