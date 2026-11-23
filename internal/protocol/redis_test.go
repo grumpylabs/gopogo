@@ -820,3 +820,88 @@ func TestRedisExpireHuge(t *testing.T) {
 	c.expect(int64(1), "EXPIRE", "k", "-99999999999")
 	c.expect(nil, "GET", "k")
 }
+
+func TestMatchPattern(t *testing.T) {
+	for _, tt := range []struct {
+		pattern, key string
+		want         bool
+	}{
+		{"*", "", true}, {"*", "abc", true}, {"", "", true}, {"", "a", false},
+		{"a*", "abc", true}, {"*c", "abc", true}, {"*c", "abd", false},
+		{"a?c", "abc", true}, {"a?c", "ac", false},
+		{"a*b*c", "axxbyyc", true}, {"a*b*c", "axxbyy", false},
+		{"h*llo", "heeeello", true}, {"h*ll?", "hello", true}, {"**", "x", true},
+		{"*a*a*b", "aaaa", false}, {"*ab", "aab", true},
+		{`foo\*`, "foo*", true}, {`foo\*`, "foox", false},
+		{`\?`, "?", true}, {`\?`, "a", false}, {`a\`, `a\`, false},
+	} {
+		if got := matchPattern(tt.pattern, tt.key); got != tt.want {
+			t.Errorf("matchPattern(%q, %q) = %v, want %v", tt.pattern, tt.key, got, tt.want)
+		}
+	}
+	// Exponential under the old recursive matcher: it would not return.
+	if matchPattern(strings.Repeat("*a", 30)+"b", strings.Repeat("a", 200)) {
+		t.Fatal("pathological pattern matched")
+	}
+}
+
+// TestHTTPChunkedSmallReads checks that a large chunked body arriving in
+// small reads is accepted whole. The body used to be decoded again on every
+// read until it was complete, quadratic in its size.
+func TestHTTPChunkedSmallReads(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("PUT /big HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n")
+	chunk := strings.Repeat("x", 256)
+	for i := 0; i < 32768; i++ { // 8MB
+		fmt.Fprintf(&b, "%x;ext=1\r\n%s\r\n", len(chunk), chunk)
+	}
+	b.WriteString("0\r\nX-Trailer: y\r\n\r\nGET /big HTTP/1.1\r\nHost: x\r\n\r\n")
+	start := time.Now()
+	out := runSplit(t, TypeHTTP, b.String(), 512)
+	// Linear takes well under a second even with -race; the quadratic
+	// decode took about 15s.
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("8MB chunked body in 512-byte reads took %v", d)
+	}
+	if n := strings.Count(out, "x"); n < 32768*256 {
+		t.Fatalf("GET returned %d bytes of the body, want %d", n, 32768*256)
+	}
+}
+
+func TestHTTPChunkedMalformed(t *testing.T) {
+	for _, body := range []string{"zz\r\nab\r\n", "2\r\nabX\r\n0\r\n\r\n"} {
+		c := NewConn(&Handlers{HTTP: NewHTTPHandler(cache.New(nil), "")}, "127.0.0.1:4000", false)
+		c.proto = TypeHTTP
+		in := "PUT /k HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" + body
+		_, out, act := c.Process([]byte(in), nil)
+		if act != Close || !strings.Contains(string(out), "400") {
+			t.Errorf("%q: action %v, output %q; want 400 and Close", body, act, out)
+		}
+	}
+}
+
+// TestPostgresAuthMessageLimit checks that a SASL message, read before the
+// client has authenticated, may not claim more than 64KB.
+func TestPostgresAuthMessageLimit(t *testing.T) {
+	server, client := net.Pipe()
+	go NewPostgresHandler(cache.New(nil), "s3cret", "").Handle(server)
+	defer client.Close()
+	client.SetDeadline(time.Now().Add(5 * time.Second))
+	r := bufio.NewReader(client)
+	startup := append(be32(pgProtocolV3), "user\x00test\x00\x00"...)
+	client.Write(append(be32(int32(len(startup)+4)), startup...))
+	if typ, _ := pgReadMsg(t, r); typ != 'R' {
+		t.Fatalf("expected AuthenticationSASL, got %c", typ)
+	}
+	// A header claiming 1MB, with no body: the server must give up rather
+	// than wait for (and buffer) it.
+	client.Write(append([]byte{'p'}, be32(1<<20)...))
+	for {
+		if _, err := r.ReadByte(); err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				t.Fatal("server waited for an oversized auth message")
+			}
+			return // closed, as wanted
+		}
+	}
+}

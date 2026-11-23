@@ -27,7 +27,7 @@ func (c *pgConn) scramAuth(password string) error {
 	c.w.Flush()
 
 	// SASLInitialResponse: mechanism, then the client-first-message.
-	typ, body, err := c.readMessage()
+	typ, body, err := c.readMessage(maxPGAuthMessage)
 	if err != nil {
 		return err
 	}
@@ -62,7 +62,7 @@ func (c *pgConn) scramAuth(password string) error {
 	c.w.Flush()
 
 	// SASLResponse: client-final-message = c=<gs2>,r=<nonce>[,...],p=<proof>.
-	typ, body, err = c.readMessage()
+	typ, body, err = c.readMessage(maxPGAuthMessage)
 	if err != nil {
 		return err
 	}

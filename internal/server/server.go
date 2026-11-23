@@ -256,21 +256,33 @@ func (s *Server) tlsConfig() (*tls.Config, error) {
 
 func (s *Server) serve(listener net.Listener, loops *eventLoops) {
 	defer s.wg.Done()
-	
+
+	var delay time.Duration // backoff after accept errors, as net/http's Serve
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			select {
-			case <-s.ctx.Done():
+			if s.ctx.Err() != nil {
 				return
-			default:
+			}
+			// Errors such as EMFILE persist: retrying at once spun a core.
+			if delay == 0 {
+				delay = 5 * time.Millisecond
+				zap.L().Warn("accept failed, backing off: "+err.Error(), zap.Error(err))
+			} else {
+				delay = min(2*delay, time.Second)
 				if s.config.Verbose {
 					zap.L().Warn("accept failed: "+err.Error(), zap.Error(err))
 				}
-				continue
 			}
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+			continue
 		}
-		
+		delay = 0
+
 		if !s.admit(conn) {
 			continue
 		}

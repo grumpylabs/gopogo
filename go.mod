@@ -3,7 +3,6 @@ module github.com/grumpylabs/gopogo
 go 1.25.0
 
 require (
-	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/pierrec/lz4/v4 v4.1.26
 	github.com/spf13/cobra v1.8.1
 	github.com/spf13/viper v1.19.0
@@ -16,6 +15,8 @@ require (
 	go.uber.org/zap v1.27.1
 	golang.org/x/sys v0.42.0
 )
+
+require github.com/cespare/xxhash/v2 v2.3.0 // indirect
 
 require (
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
