@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"runtime"
+	"runtime/debug"
 	"time"
 
 	"github.com/grumpylabs/gopogo/internal/cache"
@@ -154,6 +155,12 @@ func runServer(cmd *cobra.Command, args []string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Option --maxmemory is invalid: %v\n", err)
 		os.Exit(1)
+	}
+	// maxmemory counts entry bytes, not the Go heap, which runs up to about
+	// twice the live data: let the GC work harder before the container's
+	// limit OOM-kills the process. GOMEMLIMIT, when set, wins.
+	if avail := sysmem.Available(); avail > 0 && os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetMemoryLimit(avail / 100 * 95)
 	}
 
 	c := cache.New(&cache.Options{

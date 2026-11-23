@@ -290,7 +290,7 @@ func (c *Cache) DeleteWithOptions(key []byte, opts *DeleteOptions) bool {
 			c.recordDelete(start, false)
 			return false
 		}
-		if !opts.Entry(entry.Key(), entry.value, entry.expireAt, entry.flags, entry.cas) {
+		if !entry.IsExpired() && !opts.Entry(entry.Key(), entry.value, entry.expireAt, entry.flags, entry.cas) {
 			// Caller canceled the delete
 			c.recordDelete(start, false)
 			return false
@@ -305,13 +305,15 @@ func (c *Cache) DeleteWithOptions(key []byte, opts *DeleteOptions) bool {
 
 	shard.addMemUsed(-entry.Size())
 
-	// C differentiates: expired entries fire NOTIFY_EXPIRED, live entries fire NOTIFY_DELETED
+	// An expired entry not yet swept is removed but, as in pogocache, the
+	// delete reports not found: DEL replies 0 and memcache NOT_FOUND.
 	if entry.IsExpired() {
 		atomic.AddUint64(&shard.numExpired, 1)
 		c.fireEvicted(ReasonExpired, entry)
-	} else {
-		c.fireNotifyDeleted(entry)
+		c.recordDelete(start, false)
+		return false
 	}
+	c.fireNotifyDeleted(entry)
 
 	c.recordDelete(start, true)
 	return true
@@ -687,7 +689,7 @@ func (c *Cache) clearShard(shard *Shard) {
 		})
 	}
 	shard.m = NewMap(16, shard.m.loadFactor, shard.m.allowShrink)
-	atomic.StoreInt64(&shard.memUsed, 0)
+	shard.addMemUsed(-shard.MemUsed())
 	shard.mu.Unlock()
 }
 
@@ -711,14 +713,16 @@ func (c *Cache) makeRoom(shard *Shard, requiredSpace int64, skipHash uint64) boo
 		return true
 	}
 	if c.noEvict {
-		return shard.MemUsed()+requiredSpace <= shard.maxMemory
+		return shard.total.Load()+requiredSpace <= shard.maxMemory
 	}
 	c.evictIfNeeded(shard, requiredSpace, skipHash)
 	return true
 }
 
 func (c *Cache) evictIfNeeded(shard *Shard, requiredSpace int64, skipHash uint64) {
-	for shard.MemUsed()+requiredSpace > shard.maxMemory && shard.m.numItems > 0 {
+	// Evict from the key's shard, the only one locked here, until the whole
+	// cache fits or the shard is empty.
+	for shard.total.Load()+requiredSpace > shard.maxMemory && shard.m.numItems > 0 {
 		entries := shard.m.randomEntries(2, skipHash)
 		if len(entries) == 0 {
 			break

@@ -113,7 +113,8 @@ type Shard struct {
 	mu         sync.RWMutex
 	m          *Map
 	memUsed    int64
-	maxMemory  int64
+	maxMemory  int64         // the cache-wide limit, compared with total
+	total      *atomic.Int64 // bytes used by all shards, shared
 	numOps     uint64
 	numHits    uint64
 	numMisses  uint64
@@ -123,10 +124,11 @@ type Shard struct {
 	cas        uint64 // last CAS token issued, guarded by mu
 }
 
-func newShard(maxMemory int64, loadFactor float64, allowShrink bool) *Shard {
+func newShard(maxMemory int64, total *atomic.Int64, loadFactor float64, allowShrink bool) *Shard {
 	return &Shard{
 		m:         NewMap(16, loadFactor, allowShrink),
 		maxMemory: maxMemory,
+		total:     total,
 	}
 }
 
@@ -136,6 +138,7 @@ func (s *Shard) MemUsed() int64 {
 
 func (s *Shard) addMemUsed(delta int64) {
 	atomic.AddInt64(&s.memUsed, delta)
+	s.total.Add(delta)
 }
 
 func (s *Shard) NumOps() uint64 {
@@ -245,11 +248,13 @@ func New(opts *Options) *Cache {
 		}
 	}
 
+	// One limit for the whole cache, as in pogocache: a per-shard split
+	// refuses values larger than maxMemory/numShards and evicts early when
+	// keys are skewed.
 	shards := make([]*Shard, numShards)
-	shardMaxMem := maxMemory / int64(numShards)
-
+	total := new(atomic.Int64)
 	for i := 0; i < numShards; i++ {
-		shards[i] = newShard(shardMaxMem, loadFactor, allowShrink)
+		shards[i] = newShard(maxMemory, total, loadFactor, allowShrink)
 	}
 
 	c := &Cache{

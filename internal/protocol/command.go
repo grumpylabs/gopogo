@@ -710,6 +710,20 @@ func cmdAppend(x *Executor, s *session, name string, args []string) result {
 	return result{resp: rvInt(int64(n)), pg: pgTag(fmt.Sprintf("%s %d", name, n))}
 }
 
+// expireAfter returns the expiry time seconds after now, in Unix nanoseconds,
+// saturating as pogocache's int64_mul_clamp/int64_add_clamp do: a huge
+// EXPIRE must not wrap into the past. It is at least 1, since 0 means none.
+func expireAfter(now, seconds int64) int64 {
+	const sec = int64(time.Second)
+	switch {
+	case seconds > (math.MaxInt64-now)/sec:
+		return math.MaxInt64
+	case seconds < -now/sec:
+		return 1
+	}
+	return max(now+seconds*sec, 1)
+}
+
 func cmdExpire(x *Executor, s *session, name string, args []string) result {
 	if len(args) != 3 {
 		return wrongArgs(name)
@@ -723,7 +737,7 @@ func cmdExpire(x *Executor, s *session, name string, args []string) result {
 	entry, found := x.cache.Load([]byte(args[1]))
 	endCacheHit(span, found)
 	if found {
-		entry.SetExpireAt(time.Now().Add(time.Duration(seconds) * time.Second).UnixNano())
+		entry.SetExpireAt(expireAfter(time.Now().UnixNano(), seconds))
 		n = 1
 	}
 	return result{resp: rvInt(n), pg: pgTag(fmt.Sprintf("EXPIRE %d", n))}
