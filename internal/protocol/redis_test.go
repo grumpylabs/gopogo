@@ -741,3 +741,82 @@ func TestBadLengthsDoNotPanic(t *testing.T) {
 		client.Close()
 	}
 }
+
+// TestMemcacheBadDataChunk checks that a data block must end in CRLF right
+// after its length: scanning on for a newline let a client grow the input
+// without bound and swallowed the next pipelined command.
+func TestMemcacheBadDataChunk(t *testing.T) {
+	server, client := net.Pipe()
+	go NewMemcacheHandler(cache.New(nil), "").Handle(server)
+	defer client.Close()
+	go client.Write([]byte("set k 0 0 1\r\nxyz\r\nget k\r\n"))
+	if l, _ := bufio.NewReader(client).ReadString('\n'); l != "CLIENT_ERROR bad data chunk\r\n" {
+		t.Fatalf("got %q, want CLIENT_ERROR bad data chunk", l)
+	}
+}
+
+// TestMemcacheAddAtomic checks that concurrent adds of one key store once.
+func TestMemcacheAddAtomic(t *testing.T) {
+	ch := cache.New(nil)
+	const workers, rounds = 8, 200
+	conns := make([]*bufio.ReadWriter, workers)
+	for w := range conns {
+		server, client := net.Pipe()
+		go NewMemcacheHandler(ch, "").Handle(server)
+		t.Cleanup(func() { client.Close() })
+		conns[w] = bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client))
+	}
+	for round := 0; round < rounds; round++ {
+		key := fmt.Sprintf("k%d", round)
+		start := make(chan struct{})
+		results := make(chan string, workers)
+		for _, rw := range conns {
+			go func() {
+				<-start
+				fmt.Fprintf(rw, "add %s 0 0 1\r\nx\r\n", key)
+				rw.Flush()
+				l, _ := rw.ReadString('\n')
+				results <- l
+			}()
+		}
+		close(start)
+		n := 0
+		for range conns {
+			switch l := <-results; l {
+			case "STORED\r\n":
+				n++
+			case "NOT_STORED\r\n":
+			default:
+				t.Fatalf("add got %q", l)
+			}
+		}
+		if n != 1 {
+			t.Fatalf("round %d: %d concurrent adds stored, want 1", round, n)
+		}
+	}
+	ch.Store([]byte("k"), []byte("x"), nil)
+
+	server, client := net.Pipe()
+	go NewMemcacheHandler(ch, "").Handle(server)
+	defer client.Close()
+	r := bufio.NewReader(client)
+	client.Write([]byte("replace missing 0 0 1\r\nx\r\n"))
+	if l, _ := r.ReadString('\n'); l != "NOT_STORED\r\n" {
+		t.Fatalf("replace of a missing key got %q", l)
+	}
+	client.Write([]byte("replace k 0 0 1\r\ny\r\n"))
+	if l, _ := r.ReadString('\n'); l != "STORED\r\n" {
+		t.Fatalf("replace of an existing key got %q", l)
+	}
+}
+
+// TestRedisExpireHuge checks that an EXPIRE too large for a Duration
+// saturates instead of wrapping into the past and expiring the key.
+func TestRedisExpireHuge(t *testing.T) {
+	c := newRESPClient(t, cache.New(nil))
+	c.expect("OK", "SET", "k", "v")
+	c.expect(int64(1), "EXPIRE", "k", "99999999999")
+	c.expect("v", "GET", "k")
+	c.expect(int64(1), "EXPIRE", "k", "-99999999999")
+	c.expect(nil, "GET", "k")
+}

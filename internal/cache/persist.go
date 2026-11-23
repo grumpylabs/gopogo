@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -36,7 +37,6 @@ func (c *Cache) Save(path string) error {
 	defer os.Remove(tmpPath) // clean up on failure
 
 	now := time.Now()
-	unixNow := now.Unix()
 	monoNow := now.UnixNano()
 
 	var buf []byte // accumulates raw entry data per shard
@@ -45,8 +45,8 @@ func (c *Cache) Save(path string) error {
 		shard := c.shards[i]
 		shard.mu.RLock()
 
-		// Write unix timestamp as first varint in block
-		buf = appendUvarint(buf, uint64(unixNow))
+		// Unix time in nanoseconds starts the block, as in pogocache's save.c.
+		buf = appendUvarint(buf, uint64(monoNow))
 
 		shard.m.iter(func(e *Entry) bool {
 			expires := atomic.LoadInt64(&e.expireAt)
@@ -149,7 +149,7 @@ func (c *Cache) LoadFromFile(path string) (stats *LoadStats, retErr error) {
 	defer f.Close()
 
 	stats = &LoadStats{}
-	unixNow := time.Now().Unix()
+	nowNs := time.Now().UnixNano()
 
 	for {
 		raw, clen, err := readBlock(f)
@@ -170,6 +170,13 @@ func (c *Cache) LoadFromFile(path string) (stats *LoadStats, retErr error) {
 			return stats, fmt.Errorf("bad unix timestamp")
 		}
 		p = p[n:]
+		savedNs := int64(unixTime)
+		if unixTime < 1e12 {
+			// shortcut: files from older gopogo wrote Unix seconds; no
+			// nanosecond time since 1970 is this small. Drop once those
+			// files are gone.
+			savedNs = int64(unixTime) * int64(time.Second)
+		}
 
 		for len(p) > 0 {
 			// kind
@@ -230,15 +237,17 @@ func (c *Cache) LoadFromFile(path string) (stats *LoadStats, retErr error) {
 			p = p[n:]
 
 			if ttl > 0 {
-				// Convert: the entry was saved with a TTL relative to unixTime.
-				// Check if it has already expired relative to now.
-				unixExpires := int64(unixTime) + int64(ttl)/int64(time.Second)
-				if unixExpires < unixNow {
+				// The TTL is relative to the block's save time. A remaining
+				// TTL of 0 would mean no expiry, so it counts as expired.
+				expiresNs := savedNs + int64(ttl)
+				if ttl > math.MaxInt64 || expiresNs < savedNs {
+					expiresNs = math.MaxInt64 // saturate, as pogocache's int64_add_clamp
+				}
+				remainingNs := expiresNs - nowNs
+				if remainingNs <= 0 {
 					stats.Expired++
 					continue
 				}
-				// Remaining TTL in nanoseconds
-				remainingNs := (unixExpires - unixNow) * int64(time.Second)
 				opts := &StoreOptions{
 					TTL:   time.Duration(remainingNs),
 					Flags: uint32(flags),

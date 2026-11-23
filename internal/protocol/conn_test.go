@@ -63,7 +63,7 @@ var splitInputs = []struct {
 		"*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n"},
 	{"memcache", TypeMemcache, "set k 5 0 5\r\nhello\r\n" +
 		"get k\r\ngets k\r\n" +
-		"append k 0 0 3\r\n abc\r\n" +
+		"append k 0 0 3\r\nabc\r\n" +
 		"add k 0 0 1\r\nx\r\n" +
 		"set n 0 0 2 noreply\r\n10\r\n" +
 		"incr n 5\r\ndecr n 100\r\n" +

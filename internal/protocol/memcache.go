@@ -83,23 +83,19 @@ func (h *MemcacheHandler) process(c *Conn, in, out []byte) (int, []byte, Action)
 		// auth it is skipped, n bytes and CRLF.
 		var data []byte
 		if n, ok := memcacheDataLen(cmd, parts, h.auth != ""); ok {
-			if len(in) < next+n {
+			if len(in) < next+n+2 {
 				break
+			}
+			// The block ends in CRLF exactly, as in pogocache: scanning on
+			// for a newline let a client grow the input without bound, and
+			// a wrong length swallowed the next pipelined command.
+			if in[next+n] != '\r' || in[next+n+1] != '\n' {
+				w.WriteString("CLIENT_ERROR bad data chunk\r\n")
+				return pos, w.b, Close
 			}
 			// The cache keeps the value, so it cannot share the input buffer.
 			data = bytes.Clone(in[next : next+n])
-			if h.auth != "" {
-				if len(in) < next+n+2 {
-					break
-				}
-				next += n + 2
-			} else {
-				j := bytes.IndexByte(in[next+n:], '\n')
-				if j < 0 {
-					break
-				}
-				next += n + j + 1
-			}
+			next += n + 2
 		}
 		pos = next
 
@@ -380,28 +376,14 @@ func (h *MemcacheHandler) handleStore(ctx context.Context, writer *outBuf, parts
 	
 	
 	span := h.startCacheSpan(ctx, "cache.store", []byte(key))
-	existing, _ := h.cache.Load([]byte(key))
-	
-	if addOnly && existing != nil {
-		endCacheStore(span, cache.NotStored)
-		if !noreply {
-			writer.WriteString("NOT_STORED\r\n")
-		}
-		return
-	}
-	
-	if replaceOnly && existing == nil {
-		endCacheStore(span, cache.NotStored)
-		if !noreply {
-			writer.WriteString("NOT_STORED\r\n")
-		}
-		return
-	}
-	
+	// add and replace are SET NX and XX, checked under the shard lock: a
+	// separate Load let two concurrent adds both store.
 	opts := &cache.StoreOptions{
 		Flags: uint32(flags),
+		NX:    addOnly,
+		XX:    replaceOnly,
 	}
-	
+
 	opts.TTL = memcacheTTL(exptime)
 	
 	ctr(TypeMemcache).cmdSet.Add(1)
@@ -417,10 +399,14 @@ func (h *MemcacheHandler) handleStore(ctx context.Context, writer *outBuf, parts
 		}
 		return
 	}
-	
-	if !noreply {
-		writer.WriteString("STORED\r\n")
+	if noreply {
+		return
 	}
+	if res == cache.NotStored {
+		writer.WriteString("NOT_STORED\r\n")
+		return
+	}
+	writer.WriteString("STORED\r\n")
 }
 
 func (h *MemcacheHandler) handleCAS(ctx context.Context, writer *outBuf, parts []string, data []byte) {

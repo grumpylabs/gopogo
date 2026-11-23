@@ -1549,3 +1549,60 @@ func BenchmarkIncrement(b *testing.B) {
 		}
 	})
 }
+// TestLoadKeepsSubSecondTTL checks that a TTL under a second survives a
+// save and load as a TTL. Whole-second timestamps turned it into 0, which
+// means no expiry, so the key never expired.
+func TestLoadKeepsSubSecondTTL(t *testing.T) {
+	c := New(&Options{NumShards: 1})
+	c.Store([]byte("k"), []byte("v"), &StoreOptions{TTL: 300 * time.Millisecond})
+	path := filepath.Join(t.TempDir(), "ttl.pogo")
+	if err := c.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	c2 := New(&Options{NumShards: 1})
+	if _, err := c2.LoadFromFile(path); err != nil {
+		t.Fatal(err)
+	}
+	e, ok := c2.Load([]byte("k"))
+	if !ok {
+		t.Fatal("key missing after load")
+	}
+	if left := time.Duration(e.ExpireAt() - time.Now().UnixNano()); left <= 0 || left > 300*time.Millisecond {
+		t.Fatalf("remaining TTL after load = %v, want (0, 300ms]", left)
+	}
+}
+
+// TestMaxMemoryIsCacheWide checks that the memory limit applies to the whole
+// cache, not maxMemory/numShards per shard.
+func TestMaxMemoryIsCacheWide(t *testing.T) {
+	c := New(&Options{NumShards: 256, MaxMemory: 1 << 20, NoEvict: true})
+	if _, err := c.Store([]byte("a"), make([]byte, 600<<10), nil); err != nil {
+		t.Fatalf("600KB value in an empty 1MB cache refused: %v", err)
+	}
+	if _, err := c.Store([]byte("b"), make([]byte, 600<<10), nil); err == nil {
+		t.Fatal("second 600KB value stored past the 1MB limit")
+	}
+
+	// With eviction, a write past the limit evicts rather than overshooting.
+	e := New(&Options{NumShards: 4, MaxMemory: 64 << 10})
+	for i := 0; i < 100; i++ {
+		e.Store([]byte(fmt.Sprintf("k%d", i)), make([]byte, 1<<10), nil)
+	}
+	if used := e.Stats()["mem_used"].(int64); used > 64<<10 {
+		t.Fatalf("mem_used %d over the %d limit", used, 64<<10)
+	}
+}
+
+// TestDeleteExpiredReportsNotFound checks that deleting an expired entry not
+// yet swept reports not found, as pogocache does, and still removes it.
+func TestDeleteExpiredReportsNotFound(t *testing.T) {
+	c := New(&Options{NumShards: 1})
+	c.Store([]byte("k"), []byte("v"), &StoreOptions{TTL: time.Millisecond})
+	time.Sleep(5 * time.Millisecond)
+	if c.Delete([]byte("k")) {
+		t.Fatal("Delete of an expired key reported success")
+	}
+	if n := c.Stats()["mem_used"].(int64); n != 0 {
+		t.Fatalf("expired entry not removed: mem_used %d", n)
+	}
+}
