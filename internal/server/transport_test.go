@@ -260,6 +260,9 @@ func TestTransportOtherProtocols(t *testing.T) {
 	c.send("SET", "shared", "value")
 	c.reply()
 
+	// Close the pooled keep-alive connection, which the server would count
+	// as open.
+	t.Cleanup(http.DefaultClient.CloseIdleConnections)
 	resp, err := http.Get("http://" + addr + "/shared")
 	if err != nil {
 		t.Fatal(err)
@@ -294,7 +297,10 @@ func TestTransportOtherProtocols(t *testing.T) {
 
 func TestTransportReleasesConnections(t *testing.T) {
 	addr := startServer(t)
-	before := protocol.ConnStats.Curr.Load()
+	// Every connection should be released, including earlier tests' and
+	// startServer's probe, which may still be closing: a baseline sampled
+	// now would count them and then see them drop below it.
+	const before = 0
 	for i := 0; i < 20; i++ {
 		c := dialRESP(t, addr)
 		c.send("PING")

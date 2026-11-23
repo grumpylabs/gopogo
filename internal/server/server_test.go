@@ -27,6 +27,11 @@ func TestPanicClosesOnlyTheConnection(t *testing.T) {
 
 	s := New(&Config{Redis: true, Cache: cache.New(nil)})
 	conn := &panicConn{}
+	// Admit first, as serve does: handleConnection releases the connection,
+	// and an unmatched release leaves the global open-connection count at -1.
+	if !s.admit(conn) {
+		t.Fatal("connection not admitted")
+	}
 	s.handleConnection(conn) // must return, not panic
 
 	if !conn.closed {
